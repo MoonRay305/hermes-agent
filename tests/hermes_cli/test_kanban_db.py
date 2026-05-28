@@ -1561,6 +1561,48 @@ def test_cleanup_workspace_removes_managed_scratch_dir(kanban_home):
     assert not ws.exists(), "Hermes-managed scratch dir should be cleaned up"
 
 
+def test_complete_task_stages_managed_scratch_artifacts_before_cleanup(kanban_home):
+    """Explicit artifacts in managed scratch survive post-completion cleanup.
+
+    Completion events are consumed asynchronously by the gateway. If the event
+    keeps pointing at a file inside the managed scratch workspace, cleanup can
+    delete it before the notifier uploads it. The DB layer should stage those
+    explicit artifacts into Hermes' durable document cache before cleanup and
+    persist the staged paths in both the run metadata and completed event.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="artifact handoff", assignee="worker1")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+
+        artifact = ws / "nested" / "report.txt"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text("durable payload", encoding="utf-8")
+
+        assert kb.complete_task(
+            conn,
+            t,
+            summary="attached report",
+            metadata={"artifacts": [str(artifact)]},
+        )
+
+        completed_events = [e for e in kb.list_events(conn, t) if e.kind == "completed"]
+        runs = kb.list_runs(conn, t, include_active=False)
+
+    assert not ws.exists(), "Hermes-managed scratch dir should still be cleaned up"
+    assert completed_events
+    staged_artifacts = completed_events[-1].payload["artifacts"]
+    assert len(staged_artifacts) == 1
+
+    staged = Path(staged_artifacts[0])
+    assert staged.exists(), "completion event should point at a durable staged file"
+    assert staged.read_text(encoding="utf-8") == "durable payload"
+    assert staged.is_relative_to(kanban_home / "cache" / "documents")
+    assert staged.name.endswith("report.txt")
+    assert runs[-1].metadata["artifacts"] == [str(staged)]
+
+
 def test_cleanup_workspace_refuses_path_outside_scratch_root(kanban_home, tmp_path):
     """A scratch task with a user path outside the workspaces root must NOT be deleted (#28818).
 
