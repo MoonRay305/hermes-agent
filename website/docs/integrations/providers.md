@@ -694,6 +694,26 @@ model:
   context_length: 64000   # See warning below
 ```
 
+:::caution Sensitive/private data is blocked from local routes by default
+Before Hermes sends a request to a local provider (Ollama, LM Studio, llama.cpp, localhost/private-IP custom endpoints), it scans the outbound request for sensitive classes such as client, legal, financial, trading, Doogie/private, production, and secrets. Sensitive requests are denied unless the current worker contract or `local_provider_sensitivity.approved_routes` explicitly approves that provider/model/base URL for the detected data classes.
+
+Example approval shape:
+
+```yaml
+worker_contract:
+  data_class: doogie
+  allowed_model_routes:
+    - provider: custom
+      base_url: http://localhost:11434/v1
+      model: qwen2.5-coder:32b
+      data_classes: [doogie, private]
+      approved: true
+      approval_id: landon-approved-local-doogie-route
+```
+
+Denials write only hashes, counts, host/model metadata, and class labels to `~/.hermes/logs/local_provider_sensitivity_gate.jsonl` and the central agent log. Raw prompts and secret values are not logged.
+:::
+
 :::caution Ollama defaults to very low context lengths
 Ollama does **not** use your model's full context window by default. Depending on your VRAM, the default is:
 
