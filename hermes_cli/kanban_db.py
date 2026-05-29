@@ -2979,9 +2979,15 @@ def _stage_completion_artifacts_from_managed_scratch(
         return metadata
 
     try:
-        from hermes_constants import get_hermes_dir
-
-        cache_root = get_hermes_dir("cache/documents", "document_cache")
+        # Stage into the shared Kanban root, not the completing worker's profile
+        # cache. Gateway notification delivery may run under a different
+        # profile, and gateway media filtering only trusts its own profile cache
+        # plus shared Kanban artifact roots. Keeping staged completion artifacts
+        # under ``kanban_home()`` preserves cross-profile delivery without
+        # weakening scratch workspace cleanup.
+        shared_home = kanban_home()
+        legacy_cache_root = shared_home / "document_cache"
+        cache_root = legacy_cache_root if legacy_cache_root.exists() else shared_home / "cache" / "documents"
         stage_root = cache_root / "kanban-artifacts" / task_id / f"{int(time.time())}-{secrets.token_hex(4)}"
     except Exception:
         return metadata
