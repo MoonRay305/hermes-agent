@@ -1251,6 +1251,48 @@ def run_conversation(
                 except Exception:
                     pass
 
+                # Pre-send sensitivity gate for local providers (BUI-370).
+                #
+                # Anchored after apply_llm_request_middleware() and the
+                # pre_api_request hook: both can rewrite api_kwargs, so this is
+                # the first point at which we can classify the bytes that
+                # actually leave the process.  Gating before them - where this
+                # branch originally placed the call, when the hook was the last
+                # step before the send - would let a middleware or plugin inject
+                # content past the gate.
+                request_messages = api_kwargs.get("messages")
+                if not isinstance(request_messages, list):
+                    request_messages = api_kwargs.get("input")
+                if not isinstance(request_messages, list):
+                    request_messages = api_messages
+
+                try:
+                    from agent.local_provider_sensitivity_gate import (
+                        LocalProviderSensitivityBlocked,
+                        assert_local_provider_request_allowed,
+                    )
+                    assert_local_provider_request_allowed(
+                        provider=agent.provider,
+                        base_url=agent.base_url,
+                        model=agent.model,
+                        messages=request_messages,
+                    )
+                except LocalProviderSensitivityBlocked as _sensitivity_exc:
+                    if thinking_spinner:
+                        thinking_spinner.stop("")
+                        thinking_spinner = None
+                    if agent.thinking_callback:
+                        agent.thinking_callback("")
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": str(_sensitivity_exc),
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "error": str(_sensitivity_exc),
+                    }
+
                 if env_var_enabled("HERMES_DUMP_REQUESTS"):
                     agent._dump_api_request_debug(api_kwargs, reason="preflight")
 
