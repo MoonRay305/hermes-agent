@@ -584,6 +584,190 @@ async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, m
 
 
 @pytest.mark.asyncio
+async def test_notifier_uploads_staged_scratch_artifact_from_document_cache_safe_root(
+    kanban_home, monkeypatch
+):
+    """Scratch artifacts are staged before cleanup and accepted via cache safe roots.
+
+    This intentionally avoids HERMES_MEDIA_ALLOW_DIRS and disables recency trust:
+    the upload must work because the completion event now points at Hermes'
+    document cache, not because the original scratch path was allowlisted.
+    """
+    import json as _json
+    import hermes_cli.kanban_db as kb
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+    from gateway.platforms import base as platform_base
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", "")
+    monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_FILES", "0")
+    monkeypatch.setattr(
+        platform_base,
+        "MEDIA_DELIVERY_SAFE_ROOTS",
+        (kanban_home / "cache" / "documents",),
+    )
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="scratch artifact", assignee="worker1")
+        task = kb.get_task(conn, tid)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, tid, ws)
+        artifact = ws / "report.pdf"
+        artifact.write_bytes(b"%PDF-staged-scratch")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    out = kt._handle_complete({
+        "summary": "scratch report rendered",
+        "artifacts": [str(artifact)],
+    })
+    assert _json.loads(out)["ok"] is True
+    assert not ws.exists()
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+
+    fake_adapter = MagicMock()
+    fake_adapter.name = "telegram"
+    sends: list = []
+    documents_uploaded: list = []
+
+    async def _send(chat_id, msg, metadata=None):
+        sends.append((chat_id, msg))
+        runner._running = False
+
+    async def _send_document(chat_id, file_path, metadata=None, **_kw):
+        documents_uploaded.append(file_path)
+
+    fake_adapter.send = AsyncMock(side_effect=_send)
+    fake_adapter.send_multiple_images = AsyncMock()
+    fake_adapter.send_document = AsyncMock(side_effect=_send_document)
+    fake_adapter.extract_local_files = platform_base.BasePlatformAdapter.extract_local_files
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+
+    async def _fast_sleep(_):
+        await _orig_sleep(0)
+
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    assert len(sends) == 1
+    assert len(documents_uploaded) == 1
+    uploaded = Path(documents_uploaded[0])
+    assert uploaded.is_relative_to(kanban_home / "cache" / "documents")
+    assert uploaded.read_bytes() == b"%PDF-staged-scratch"
+
+
+@pytest.mark.asyncio
+async def test_notifier_uploads_cross_profile_staged_scratch_artifact(
+    kanban_home, monkeypatch
+):
+    """Gateway profile can upload artifacts staged by a worker profile.
+
+    Managed scratch completion runs in the worker's profile, while the async
+    gateway notifier often runs under a different profile. With recency trust
+    disabled and no operator allowlist, the staged artifact must still land in
+    a shared Hermes safe root that the gateway profile accepts.
+    """
+    import importlib
+    import json as _json
+    import hermes_cli.kanban_db as kb
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+    from tools import kanban_tools as kt
+
+    shared_root = kanban_home
+    worker_home = shared_root / "profiles" / "worker"
+    gateway_home = shared_root / "profiles" / "gateway"
+    worker_home.mkdir(parents=True)
+    gateway_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(shared_root))
+    monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", "")
+    monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_FILES", "0")
+
+    monkeypatch.setenv("HERMES_HOME", str(worker_home))
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cross-profile scratch artifact", assignee="worker1")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, tid, ws)
+        artifact = ws / "nested" / "report.pdf"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_bytes(b"%PDF-cross-profile-staged-scratch")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    out = kt._handle_complete({
+        "summary": "cross-profile scratch report rendered",
+        "artifacts": [str(artifact)],
+    })
+    assert _json.loads(out)["ok"] is True
+    assert not ws.exists()
+
+    # The gateway process runs in a different profile. Reload the platform base
+    # module after switching HERMES_HOME so its module-level safe roots reflect
+    # the gateway profile rather than the worker profile.
+    monkeypatch.setenv("HERMES_HOME", str(gateway_home))
+    from gateway.platforms import base as platform_base
+    platform_base = importlib.reload(platform_base)
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+
+    fake_adapter = MagicMock()
+    fake_adapter.name = "telegram"
+    sends: list = []
+    documents_uploaded: list = []
+
+    async def _send(chat_id, msg, metadata=None):
+        sends.append((chat_id, msg))
+        runner._running = False
+
+    async def _send_document(chat_id, file_path, metadata=None, **_kw):
+        documents_uploaded.append(file_path)
+
+    fake_adapter.send = AsyncMock(side_effect=_send)
+    fake_adapter.send_multiple_images = AsyncMock()
+    fake_adapter.send_document = AsyncMock(side_effect=_send_document)
+    fake_adapter.extract_local_files = platform_base.BasePlatformAdapter.extract_local_files
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+
+    async def _fast_sleep(_):
+        await _orig_sleep(0)
+
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    assert len(sends) == 1
+    assert len(documents_uploaded) == 1
+    uploaded = Path(documents_uploaded[0])
+    assert uploaded.read_bytes() == b"%PDF-cross-profile-staged-scratch"
+    assert uploaded.is_relative_to(shared_root / "cache" / "documents")
+    assert not uploaded.is_relative_to(worker_home)
+    assert not uploaded.is_relative_to(gateway_home)
+
+
+@pytest.mark.asyncio
 async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_path, monkeypatch):
     """Missing artifact paths are silently skipped — they may have been
     referenced by name only. The notifier must not crash and must still

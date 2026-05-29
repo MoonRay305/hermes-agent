@@ -2942,6 +2942,87 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+def _stage_completion_artifacts_from_managed_scratch(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+) -> Optional[dict]:
+    """Copy explicit completion artifacts out of managed scratch workspaces.
+
+    Gateway notification delivery is asynchronous, while managed scratch
+    workspaces are deleted immediately after completion. If a worker completes
+    with ``metadata["artifacts"]`` pointing at files inside that scratch dir,
+    stage existing files into Hermes' durable document cache and return metadata
+    with those paths rewritten. Non-scratch paths, missing files, directories,
+    and malformed artifact entries are preserved so completion remains
+    best-effort and existing notifier skip behavior is unchanged.
+    """
+    if not isinstance(metadata, dict):
+        return metadata
+    artifacts = metadata.get("artifacts")
+    if not isinstance(artifacts, (list, tuple)):
+        return metadata
+    try:
+        row = conn.execute(
+            "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+    except Exception:
+        return metadata
+    if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
+        return metadata
+    try:
+        workspace = Path(row["workspace_path"]).expanduser().resolve(strict=False)
+    except OSError:
+        return metadata
+    if not _is_managed_scratch_path(workspace):
+        return metadata
+
+    try:
+        # Stage into the shared Kanban root, not the completing worker's profile
+        # cache. Gateway notification delivery may run under a different
+        # profile, and gateway media filtering only trusts its own profile cache
+        # plus shared Kanban artifact roots. Keeping staged completion artifacts
+        # under ``kanban_home()`` preserves cross-profile delivery without
+        # weakening scratch workspace cleanup.
+        shared_home = kanban_home()
+        legacy_cache_root = shared_home / "document_cache"
+        cache_root = legacy_cache_root if legacy_cache_root.exists() else shared_home / "cache" / "documents"
+        stage_root = cache_root / "kanban-artifacts" / task_id / f"{int(time.time())}-{secrets.token_hex(4)}"
+    except Exception:
+        return metadata
+
+    staged_any = False
+    staged_artifacts: list[Any] = []
+    for item in artifacts:
+        if not isinstance(item, str) or not item.strip():
+            staged_artifacts.append(item)
+            continue
+        original = item.strip()
+        try:
+            src = Path(original).expanduser()
+            if not src.is_absolute():
+                src = workspace / src
+            src_resolved = src.resolve(strict=False)
+            if not src_resolved.is_relative_to(workspace) or not src_resolved.is_file():
+                staged_artifacts.append(original)
+                continue
+            rel = src_resolved.relative_to(workspace)
+            dest = stage_root / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_resolved, dest)
+            staged_artifacts.append(str(dest))
+            staged_any = True
+        except Exception:
+            staged_artifacts.append(original)
+
+    if not staged_any:
+        return metadata
+    staged_metadata = dict(metadata)
+    staged_metadata["artifacts"] = staged_artifacts
+    return staged_metadata
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3043,6 +3124,9 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        metadata = _stage_completion_artifacts_from_managed_scratch(
+            conn, task_id, metadata
+        )
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
