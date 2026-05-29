@@ -47,16 +47,20 @@ DEFAULT_SENSITIVE_CLASSES = frozenset({
     "legal",
     "financial",
     "trading",
-    "doogie",
+    "personal_health",
     "production",
     "private",
     "secret",
 })
 
 _PUBLIC_CLASSES = frozenset({"public", "internal"})
-
+_CANONICAL_AUDIT_CLASSES = DEFAULT_SENSITIVE_CLASSES | _PUBLIC_CLASSES | frozenset({
+    "medical_private",
+    "private_subject",
+})
 _TRUTHY = {"1", "true", "yes", "on"}
 _FALSEY = {"0", "false", "no", "off"}
+
 
 
 @dataclass(frozen=True)
@@ -177,9 +181,9 @@ PATTERNS: tuple[PatternDef, ...] = (
         "[TRADING_TERM]",
     ),
     PatternDef(
-        "doogie",
-        re.compile(r"\b(?:doogie|veterinary|vet visit|medication|diagnosis|symptom|lab result|medical record)\b", re.I),
-        ("doogie", "private"),
+        "personal_health",
+        re.compile(r"\b(?:veterinary|vet visit|medication|diagnosis|symptom|lab result|medical record)\b", re.I),
+        ("personal_health", "private"),
         "[PRIVATE_TERM]",
     ),
     PatternDef(
@@ -299,8 +303,35 @@ def _normalize_class(value: Any) -> str:
         "secrets": "secret",
         "pii": "private",
         "personal": "private",
+        "health": "personal_health",
+        "medical": "personal_health",
+        "medical_record": "personal_health",
     }
     return aliases.get(normalized, normalized)
+
+
+def _sanitize_data_class(value: Any) -> str:
+    normalized = _normalize_class(value)
+    if not normalized:
+        return ""
+    if normalized in _CANONICAL_AUDIT_CLASSES:
+        return normalized
+    if any(token in normalized for token in ("health", "medical", "patient", "vet", "care")):
+        return "personal_health"
+    if any(token in normalized for token in ("subject", "person", "profile", "name", "lane")):
+        return "private_subject"
+    return "private_subject"
+
+
+def _sanitize_data_classes(values: Iterable[Any]) -> list[str]:
+    return sorted({sanitized for value in values if (sanitized := _sanitize_data_class(value))})
+
+
+def _sanitize_approval_id(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    return "sha256:" + hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()
 
 
 def _declared_data_class(config: dict[str, Any]) -> str | None:
@@ -393,6 +424,8 @@ def _matches_route(route: dict[str, Any], *, provider: str, base_url: str, model
     else:
         route_classes = set()
     route_classes = {v for v in route_classes if v}
+    if classes and not route_classes:
+        return False
     if route_classes and "*" not in route_classes and "all" not in route_classes:
         if not classes.issubset(route_classes):
             return False
@@ -448,6 +481,8 @@ def evaluate_local_provider_request(
     classes, _redacted, counts, request_hash = classify_request(messages, declared_data_class=declared)
     observed_classes = {_normalize_class(c) for c in classes if _normalize_class(c)}
     sensitive = observed_classes & _sensitive_classes(config)
+    audit_classes = _sanitize_data_classes(observed_classes)
+    audit_declared = _sanitize_data_class(declared) if declared else None
 
     if not _enabled(config):
         return SensitivityDecision(
@@ -456,8 +491,8 @@ def evaluate_local_provider_request(
             provider=provider_id,
             model=model_str,
             base_url_host=host,
-            data_classes=sorted(observed_classes),
-            declared_data_class=declared,
+            data_classes=audit_classes,
+            declared_data_class=audit_declared,
             reason="gate_disabled",
             request_sha256=request_hash,
             redaction_counts=counts,
@@ -470,8 +505,8 @@ def evaluate_local_provider_request(
             provider=provider_id,
             model=model_str,
             base_url_host=host,
-            data_classes=sorted(observed_classes),
-            declared_data_class=declared,
+            data_classes=audit_classes,
+            declared_data_class=audit_declared,
             reason="non_local_route",
             request_sha256=request_hash,
             redaction_counts=counts,
@@ -484,8 +519,8 @@ def evaluate_local_provider_request(
             provider=provider_id,
             model=model_str,
             base_url_host=host,
-            data_classes=sorted(observed_classes),
-            declared_data_class=declared,
+            data_classes=audit_classes,
+            declared_data_class=audit_declared,
             reason="no_sensitive_classes_detected",
             request_sha256=request_hash,
             redaction_counts=counts,
@@ -506,11 +541,11 @@ def evaluate_local_provider_request(
             provider=provider_id,
             model=model_str,
             base_url_host=host,
-            data_classes=sorted(observed_classes),
-            declared_data_class=declared,
+            data_classes=audit_classes,
+            declared_data_class=audit_declared,
             reason="approved_local_sensitive_route",
             approved_route=True,
-            route_approval_id=str(approved.get("approval_id") or approved.get("id") or "") or None,
+            route_approval_id=_sanitize_approval_id(approved.get("approval_id") or approved.get("id")),
             request_sha256=request_hash,
             redaction_counts=counts,
         )
@@ -521,8 +556,8 @@ def evaluate_local_provider_request(
         provider=provider_id,
         model=model_str,
         base_url_host=host,
-        data_classes=sorted(observed_classes),
-        declared_data_class=declared,
+        data_classes=audit_classes,
+        declared_data_class=audit_declared,
         reason="unapproved_sensitive_local_route",
         request_sha256=request_hash,
         redaction_counts=counts,
