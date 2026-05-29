@@ -1167,6 +1167,14 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         # turns so Anthropic-family providers don't 400 the summary call.
         api_messages = agent._drop_thinking_only_and_merge_users(api_messages)
 
+        from agent.local_provider_sensitivity_gate import assert_local_provider_request_allowed
+        assert_local_provider_request_allowed(
+            provider=agent.provider,
+            base_url=agent.base_url,
+            model=agent.model,
+            messages=api_messages,
+        )
+
         summary_extra_body = {}
         try:
             from agent.auxiliary_client import _fixed_temperature_for_model, OMIT_TEMPERATURE as _OMIT_TEMP
