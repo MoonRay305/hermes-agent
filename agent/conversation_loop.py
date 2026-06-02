@@ -1219,13 +1219,41 @@ def run_conversation(
                 if agent.api_mode == "codex_responses":
                     api_kwargs = agent._get_transport().preflight_kwargs(api_kwargs, allow_stream=False)
 
+                request_messages = api_kwargs.get("messages")
+                if not isinstance(request_messages, list):
+                    request_messages = api_kwargs.get("input")
+                if not isinstance(request_messages, list):
+                    request_messages = api_messages
+
+                try:
+                    from agent.local_provider_sensitivity_gate import (
+                        LocalProviderSensitivityBlocked,
+                        assert_local_provider_request_allowed,
+                    )
+                    assert_local_provider_request_allowed(
+                        provider=agent.provider,
+                        base_url=agent.base_url,
+                        model=agent.model,
+                        messages=request_messages,
+                    )
+                except LocalProviderSensitivityBlocked as _sensitivity_exc:
+                    if thinking_spinner:
+                        thinking_spinner.stop("")
+                        thinking_spinner = None
+                    if agent.thinking_callback:
+                        agent.thinking_callback("")
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": str(_sensitivity_exc),
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "error": str(_sensitivity_exc),
+                    }
+
                 try:
                     from hermes_cli.plugins import invoke_hook as _invoke_hook
-                    request_messages = api_kwargs.get("messages")
-                    if not isinstance(request_messages, list):
-                        request_messages = api_kwargs.get("input")
-                    if not isinstance(request_messages, list):
-                        request_messages = api_messages
                     # Shallow-copy the outer list so plugins that retain the
                     # reference for async snapshotting don't observe later
                     # mutations of api_messages.  The inner dicts are not
