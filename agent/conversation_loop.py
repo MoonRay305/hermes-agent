@@ -4400,6 +4400,17 @@ def run_conversation(
                     exc_info=True,
                 )
 
+    _gateway_response_truncated = False
+    _gateway_response_original_chars = len(final_response or "")
+    _gateway_response_limit_chars = 0
+    if final_response and not interrupted:
+        (
+            final_response,
+            _gateway_response_truncated,
+            _gateway_response_original_chars,
+            _gateway_response_limit_chars,
+        ) = agent._apply_gateway_final_response_guardrail(final_response, messages)
+
     # Determine if conversation completed successfully
     completed = (
         final_response is not None
@@ -4563,6 +4574,20 @@ def run_conversation(
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
 
+        # A plugin can expand a capped model answer again.  Re-apply the
+        # gateway cap before post-call hooks, external memory sync, and the
+        # final result returned to messaging platform adapters.
+        (
+            final_response,
+            _post_transform_truncated,
+            _post_transform_original_chars,
+            _post_transform_limit_chars,
+        ) = agent._apply_gateway_final_response_guardrail(final_response, messages)
+        if _post_transform_truncated:
+            _gateway_response_truncated = True
+            _gateway_response_original_chars = _post_transform_original_chars
+            _gateway_response_limit_chars = _post_transform_limit_chars
+
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can use this to persist conversation data (e.g. sync
@@ -4611,6 +4636,9 @@ def run_conversation(
         "partial": False,  # True only when stopped due to invalid tool calls
         "interrupted": interrupted,
         "response_transformed": _response_transformed,
+        "gateway_response_truncated": _gateway_response_truncated,
+        "gateway_response_original_chars": _gateway_response_original_chars,
+        "gateway_response_limit_chars": _gateway_response_limit_chars,
         "response_previewed": getattr(agent, "_response_was_previewed", False),
         "model": agent.model,
         "provider": agent.provider,

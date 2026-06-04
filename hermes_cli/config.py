@@ -1961,6 +1961,13 @@ DEFAULT_CONFIG = {
         # multi-tool agent turn. Bridged to HERMES_MEDIA_TRUST_RECENT_SECONDS.
         # Only consulted when ``strict`` is true.
         "trust_recent_files_seconds": 600,
+        # Maximum characters the gateway will deliver from one final assistant
+        # response before replacing the tail with a visible truncation notice.
+        # This protects chat bridges from runaway no-tool model loops that
+        # would otherwise fan out into hundreds of platform messages and bloat
+        # durable session history.  Set to 0 to disable; env override:
+        # HERMES_GATEWAY_MAX_FINAL_RESPONSE_CHARS.
+        "max_final_response_chars": 120_000,
     },
 
     # Session storage — controls automatic cleanup of ~/.hermes/state.db.
