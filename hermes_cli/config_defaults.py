@@ -2452,6 +2452,13 @@ DEFAULT_CONFIG = {
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
+        # Maximum characters the gateway will deliver from one final assistant
+        # response before replacing the tail with a visible truncation notice.
+        # This prevents runaway model turns from fanning out into hundreds of
+        # platform messages and bloating durable session history. Set to 0 to
+        # disable; env override: HERMES_GATEWAY_MAX_FINAL_RESPONSE_CHARS.
+        "max_final_response_chars": 120_000,
+
         # Durable delivery-obligation ledger: final agent responses are
         # recorded in state.db around the platform send, and a gateway that
         # died between finalize and platform ACK redelivers the stored

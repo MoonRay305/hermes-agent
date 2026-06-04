@@ -201,6 +201,19 @@ def finalize_turn(
         )
     )
 
+    # Bound gateway-visible and gateway-persisted final text before any
+    # trajectory/session write. CLI/TUI turns remain uncapped by default.
+    _gateway_response_truncated = False
+    _gateway_response_original_chars = len(final_response or "")
+    _gateway_response_limit_chars = 0
+    if final_response and not interrupted:
+        (
+            final_response,
+            _gateway_response_truncated,
+            _gateway_response_original_chars,
+            _gateway_response_limit_chars,
+        ) = agent._apply_gateway_final_response_guardrail(final_response, messages)
+
     # Preflight can seed the display count before the provider receives the
     # request. Roll that estimate back only when an interrupt wins the race
     # before any successful provider response. Compaction state remains owned
@@ -562,6 +575,19 @@ def finalize_turn(
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
 
+        # A plugin can expand a capped model answer again. Re-apply the cap
+        # before post-call hooks, external-memory sync, and gateway delivery.
+        (
+            final_response,
+            _post_transform_truncated,
+            _post_transform_original_chars,
+            _post_transform_limit_chars,
+        ) = agent._apply_gateway_final_response_guardrail(final_response, messages)
+        if _post_transform_truncated:
+            _gateway_response_truncated = True
+            _gateway_response_original_chars = _post_transform_original_chars
+            _gateway_response_limit_chars = _post_transform_limit_chars
+
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can use this to persist conversation data (e.g. sync
@@ -662,6 +688,9 @@ def finalize_turn(
             (getattr(agent, "request_overrides", {}) or {}).get("extra_body") or {}
         ).get("service_tier"),
         "session_id": agent.session_id,
+        "gateway_response_truncated": _gateway_response_truncated,
+        "gateway_response_original_chars": _gateway_response_original_chars,
+        "gateway_response_limit_chars": _gateway_response_limit_chars,
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
