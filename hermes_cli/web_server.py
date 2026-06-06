@@ -8101,10 +8101,14 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
 
     parsed = urllib.parse.urlparse(origin)
     if parsed.scheme not in {"http", "https"}:
-        # Non-web origin (packaged Electron: file://, null, app://). The
-        # upstream credential check is the real auth boundary; trust it.
-        # See _ws_host_origin_is_allowed for the full rationale.
-        return None
+        # Packaged/file-backed desktop shells can send non-web origins
+        # (commonly ``Origin: null`` or ``file://``).  Allow those only for a
+        # loopback-bound dashboard; public/Tailscale/LAN dashboard binds still
+        # require a normal same-host HTTP(S) Origin.
+        bound_lc = bound_host.lower()
+        if bound_lc in _LOOPBACK_HOST_VALUES:
+            return None
+        return f"origin_mismatch origin={origin} bound={bound_host}"
 
     if not parsed.netloc:
         return f"origin_mismatch origin={origin} bound={bound_host}"
