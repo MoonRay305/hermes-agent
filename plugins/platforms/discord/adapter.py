@@ -2020,7 +2020,38 @@ class DiscordAdapter(BasePlatformAdapter):
 
         if vc.is_playing():
             vc.stop()
-        vc.play(mixer, after=_after)
+
+        # discord.py validates the exact runtime ``discord.AudioSource`` type
+        # in VoiceClient.play().  In plugin-loaded/profile environments the
+        # mixer module can be imported through a different module path than the
+        # adapter, which leaves ``VoiceMixer`` with a compatible interface but
+        # outside the runtime AudioSource class identity.  Wrap it at the
+        # boundary so playback is accepted while keeping the logical mixer
+        # object available for play_speech()/ambient control.
+        audio_source_cls = getattr(discord, "AudioSource", None)
+        audio_source_base = audio_source_cls if isinstance(audio_source_cls, type) else object
+
+        class _MixerAudioSource(audio_source_base):  # type: ignore[reportGeneralTypeIssues]
+            def __init__(self, inner):
+                self._inner = inner
+
+            def read(self) -> bytes:
+                return self._inner.read()
+
+            def is_opus(self) -> bool:
+                return False
+
+            def cleanup(self) -> None:
+                cleanup = getattr(self._inner, "cleanup", None)
+                if callable(cleanup):
+                    cleanup()
+
+        source = (
+            mixer
+            if isinstance(audio_source_cls, type) and isinstance(mixer, audio_source_cls)
+            else _MixerAudioSource(mixer)
+        )
+        vc.play(source, after=_after)
         self._voice_mixers[guild_id] = mixer
         logger.info("Voice mixer installed (guild=%d, ambient=%s)", guild_id, bool(ambient))
 

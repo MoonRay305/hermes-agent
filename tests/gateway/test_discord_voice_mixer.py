@@ -174,6 +174,50 @@ class TestVoiceMixerActive:
         assert bare.voice_mixer_active(111) is False
 
 
+class TestInstallVoiceMixer:
+    @pytest.mark.asyncio
+    async def test_wraps_interface_compatible_mixer_when_not_runtime_audiosource(self):
+        from plugins.platforms.discord import adapter as discord_adapter
+
+        adapter = _make_adapter({
+            "enabled": True, "ambient_enabled": False, "ambient_path": "",
+            "ambient_gain": 0.18, "duck_gain": 0.06, "speech_gain": 1.0,
+            "ack_enabled": True, "ack_phrases": ["One moment."],
+        })
+        vc = MagicMock()
+        vc.is_playing.return_value = False
+
+        class _InterfaceOnlyMixer:
+            def read(self):
+                return vm.SILENCE_FRAME
+
+            def is_opus(self):
+                return False
+
+            def cleanup(self):
+                self.cleaned = True
+
+            def set_ambient(self, _ambient):
+                raise AssertionError("ambient should be disabled for this test")
+
+        created = _InterfaceOnlyMixer()
+
+        def _play(source, after=None):
+            audio_source_cls = getattr(discord_adapter.discord, "AudioSource", None)
+            if isinstance(audio_source_cls, type):
+                assert isinstance(source, audio_source_cls)
+            assert source.read() == vm.SILENCE_FRAME
+            if after:
+                after(None)
+
+        vc.play.side_effect = _play
+        with patch.object(vm, "VoiceMixer", return_value=created):
+            await adapter._install_voice_mixer(111, vc)
+
+        assert adapter._voice_mixers[111] is created
+        vc.play.assert_called_once()
+
+
 class TestPlayInVoiceChannelMixerPath:
     @pytest.mark.asyncio
     async def test_routes_through_mixer_when_present(self):
