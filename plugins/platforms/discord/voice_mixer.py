@@ -44,7 +44,14 @@ the mixer's output cannot echo back into transcription.
 
 import logging
 import threading
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
+
+try:  # keep module importable in non-Discord/test environments
+    import discord
+except Exception:  # pragma: no cover - exercised only without discord.py installed
+    discord = None
+
+_AudioSourceBase: Any = discord.AudioSource if discord is not None else object
 
 if TYPE_CHECKING:  # numpy is an optional ("voice" extra) dep — never import at runtime top-level
     import numpy as np
@@ -145,7 +152,7 @@ class MixerChild:
         return samples
 
 
-class VoiceMixer:
+class VoiceMixer(_AudioSourceBase):
     """A continuous ``discord.AudioSource`` that mixes N child streams.
 
     Use :meth:`set_ambient` to install/replace the looping idle bed and
