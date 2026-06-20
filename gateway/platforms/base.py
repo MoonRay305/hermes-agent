@@ -912,6 +912,21 @@ _MEDIA_DELIVERY_DENIED_HOME_SUBPATHS = (
 def _media_delivery_allowed_roots() -> List[Path]:
     """Return roots from which model-emitted local media may be delivered."""
     roots = [Path(root) for root in MEDIA_DELIVERY_SAFE_ROOTS]
+    try:
+        # Kanban completion artifacts from managed scratch workspaces are staged
+        # under the shared Kanban root so the async gateway notifier can upload
+        # them even when it runs under a different Hermes profile than the
+        # worker. Trust only the Kanban artifact staging subtrees, not the whole
+        # shared cache or Kanban home.
+        from hermes_cli.kanban_db import kanban_home as _kanban_home
+
+        shared_home = _kanban_home()
+        roots.append(shared_home / "cache" / "documents" / "kanban-artifacts")
+        legacy_doc_cache = shared_home / "document_cache"
+        if legacy_doc_cache.exists():
+            roots.append(legacy_doc_cache / "kanban-artifacts")
+    except Exception:
+        pass
     extra_roots = os.environ.get(MEDIA_DELIVERY_ALLOW_DIRS_ENV, "")
     for chunk in extra_roots.split(os.pathsep):
         for raw_root in chunk.split(","):
