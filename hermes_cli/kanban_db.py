@@ -449,6 +449,81 @@ def boards_root() -> Path:
     return kanban_home() / "kanban" / "boards"
 
 
+def dispatcher_heartbeat_path() -> Path:
+    """Path of the embedded dispatcher's atomic liveness heartbeat."""
+    return kanban_home() / "kanban" / ".dispatcher.heartbeat"
+
+
+def _current_boot_id() -> Optional[str]:
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+
+
+def write_dispatcher_heartbeat(tick: int, interval_seconds: float) -> None:
+    """Atomically stamp dispatcher liveness without risking the dispatch loop."""
+    import json as _json
+    import socket as _socket
+
+    payload = {
+        "pid": os.getpid(),
+        "boot_id": _current_boot_id(),
+        "host": _socket.gethostname() or "unknown",
+        "ts": int(time.time()),
+        "tick": int(tick),
+        "interval_seconds": float(interval_seconds),
+    }
+    try:
+        path = dispatcher_heartbeat_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+        tmp.write_text(_json.dumps(payload), encoding="utf-8")
+        os.replace(str(tmp), str(path))
+    except Exception:
+        logging.getLogger("gateway.run").debug(
+            "dispatcher heartbeat write failed", exc_info=True
+        )
+
+
+def read_dispatcher_heartbeat() -> "Optional[dict]":
+    """Read the dispatcher heartbeat and derive age, boot, and pid liveness."""
+    import json as _json
+
+    try:
+        rec = _json.loads(dispatcher_heartbeat_path().read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return None
+    if not isinstance(rec, dict):
+        return None
+    ts = int(rec.get("ts") or 0)
+    rec["age_seconds"] = max(0, int(time.time()) - ts) if ts else None
+    boot_now = _current_boot_id()
+    same_boot = None
+    if rec.get("boot_id") and boot_now:
+        same_boot = rec.get("boot_id") == boot_now
+    rec["same_boot"] = same_boot
+    pid = rec.get("pid")
+    pid_alive: Optional[bool] = None
+    if isinstance(pid, int) and same_boot is not False:
+        try:
+            import psutil as _psutil
+
+            pid_alive = bool(_psutil.pid_exists(pid))
+        except Exception:
+            pid_alive = None
+    rec["pid_alive"] = pid_alive
+    return rec
+
+
+def clear_dispatcher_heartbeat() -> None:
+    """Remove the heartbeat on clean dispatcher shutdown, best-effort."""
+    try:
+        dispatcher_heartbeat_path().unlink()
+    except (FileNotFoundError, OSError):
+        pass
+
+
 def current_board_path() -> Path:
     """Return the path to ``<root>/kanban/current``.
 
@@ -2878,6 +2953,36 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+KNOWN_PULL_LANES: "frozenset[str]" = frozenset({
+    "fable", "claude", "claude-code", "claudecode", "fable-cc",
+    "orion-cc", "orion-research",
+})
+
+
+def classify_assignee(assignee: Optional[str]) -> str:
+    """Classify an assignee as unassigned, profile, pull_lane, or unroutable."""
+    if assignee is None or not str(assignee).strip():
+        return "unassigned"
+    try:
+        canon = _canonical_assignee(assignee)
+    except ValueError:
+        return "unassigned"
+    if not canon:
+        return "unassigned"
+    if canon in KNOWN_PULL_LANES:
+        return "pull_lane"
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        return "profile"
+    return "profile" if profile_exists(canon) else "unroutable"
+
+
+def assignee_is_routable(assignee: Optional[str]) -> bool:
+    """Return false only for typoed or unregistered assignee names."""
+    return classify_assignee(assignee) != "unroutable"
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2906,6 +3011,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    validate_assignee: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2954,6 +3060,11 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    if validate_assignee and assignee and classify_assignee(assignee) == "unroutable":
+        raise ValueError(
+            f"assignee {assignee!r} is not routable: it is neither a Hermes "
+            f"profile nor a known pull lane ({', '.join(sorted(KNOWN_PULL_LANES))})"
+        )
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
@@ -6806,12 +6917,9 @@ class DispatchResult:
     operator can see when the dispatcher is acting on the fallback rule
     rather than on explicit per-task assignments."""
     skipped_nonspawnable: list[str] = field(default_factory=list)
-    """Ready task ids skipped because their assignee names a control-plane
-    lane (a Claude Code terminal like ``orion-cc``) rather than a Hermes
-    profile. Expected steady-state on multi-lane setups; NOT an
-    operator-actionable failure. Tracked separately so health telemetry
-    can distinguish "real stuck" (nothing spawned but spawnable work
-    available) from "correctly idle" (nothing spawnable in the queue)."""
+    """Ready task ids skipped because a known pull lane, not Hermes, owns them."""
+    skipped_unroutable: list[str] = field(default_factory=list)
+    """Ready task ids stranded behind an unknown profile or pull-lane name."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -8201,6 +8309,17 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def list_unroutable_ready(conn: sqlite3.Connection) -> "list[str]":
+    """Return ready/review task ids whose assignee has no routing path."""
+    rows = conn.execute(
+        "SELECT id, assignee FROM tasks "
+        "WHERE status IN ('ready', 'review') AND assignee IS NOT NULL "
+        "    AND assignee != '' AND claim_lock IS NULL "
+        "ORDER BY created_at ASC"
+    ).fetchall()
+    return [row["id"] for row in rows if classify_assignee(row["assignee"]) == "unroutable"]
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -8460,28 +8579,12 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
-        # Skip ready tasks whose assignee is not a real Hermes profile.
-        # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
-        # with "Profile 'X' does not exist" when the assignee names a
-        # control-plane lane (e.g. an interactive Claude Code terminal
-        # like ``orion-cc`` / ``orion-research``) rather than a Hermes
-        # profile. Those task lanes are pulled by terminals via
-        # ``claim_task`` directly and should NEVER auto-spawn — the
-        # subprocess would crash on startup, get reaped as a zombie,
-        # the task would loop back to ``ready`` on next tick, and we'd
-        # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
-        try:
-            from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row_assignee):
-            # Bucket separately from skipped_unassigned: the operator
-            # cannot fix this by assigning a profile (the assignee IS the
-            # intended owner — a terminal lane). Health telemetry uses
-            # this distinction to suppress spurious "stuck" warnings on
-            # multi-lane setups where the ready queue is steadily full
-            # of human-pulled work.
+        route = classify_assignee(row_assignee)
+        if route == "pull_lane":
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        if route == "unroutable":
+            result.skipped_unroutable.append(row["id"])
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at

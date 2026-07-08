@@ -2308,6 +2308,11 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Dispatch reliability controls. Defaults preserve legacy behavior.
+        "validate_assignee_on_create": False,
+        "dispatcher_takeover_enabled": False,
+        # 0 = auto (5× dispatch interval, minimum 60 seconds).
+        "dispatcher_takeover_stale_seconds": 0,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
