@@ -92,6 +92,22 @@ def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     return handle, "held"
 
 
+def _kb_clear_heartbeat_safe(_kb) -> None:
+    """Best-effort clear of the dispatcher heartbeat on shutdown/handover.
+
+    Removing the heartbeat on a CLEAN exit means a standby sees "no
+    heartbeat" (holder gone) rather than a frozen-but-stale stamp, so it
+    takes over immediately without waiting out the stale threshold. Guarded
+    so a missing/older kanban_db (no such function) never breaks shutdown.
+    """
+    try:
+        clear = getattr(_kb, "clear_dispatcher_heartbeat", None)
+        if callable(clear):
+            clear()
+    except Exception:
+        pass
+
+
 def _release_singleton_lock(handle) -> None:
     """Release a dispatcher singleton lock acquired via :func:`_acquire_singleton_lock`."""
     if handle is None:
@@ -640,6 +656,64 @@ class GatewayKanbanWatchersMixin:
                     path, exc,
                 )
 
+    async def _kanban_standby_until_takeover(
+        self, _kb, lock_path, interval: float, stale_seconds: float,
+    ) -> "tuple[Optional[object], str]":
+        """Hot-standby loop for a gateway that lost the dispatcher lock.
+
+        Only reached when ``kanban.dispatcher_takeover_enabled`` is armed.
+        Each cycle: (1) re-attempt the flock — if it frees (holder died /
+        was killed), we win it and return ``(handle, "held")`` so the caller
+        falls through into the normal dispatch loop; (2) otherwise read the
+        heartbeat and, if it is stale past ``stale_seconds`` while the holder
+        pid is still alive, log a CRITICAL "dispatcher appears HUNG" line
+        (rate-limited) so an operator knows to kill the wedged process — at
+        which point the next cycle takes over automatically. Never force-
+        kills the holder. Returns ``(None, "standby")`` if shutdown is
+        requested first.
+        """
+        logger.warning(
+            "kanban dispatcher: lock contended; entering armed STANDBY "
+            "(takeover on free, hang-surfacing every %.0fs).", interval,
+        )
+        last_hang_warn = 0.0
+        while self._running:
+            # Sleep one interval in 1s slices for snappy shutdown.
+            slept = 0.0
+            while slept < interval and self._running:
+                await asyncio.sleep(min(1.0, interval - slept))
+                slept += 1.0
+            if not self._running:
+                return None, "standby"
+            handle, state = _acquire_singleton_lock(lock_path)
+            if state == "held":
+                logger.critical(
+                    "kanban dispatcher: TOOK OVER dispatch — previous lock "
+                    "holder released the lock (died/was killed). This standby "
+                    "is now the active dispatcher.",
+                )
+                return handle, "held"
+            # Still contended — inspect the heartbeat to tell hung from healthy.
+            try:
+                hb = await asyncio.to_thread(_kb.read_dispatcher_heartbeat)
+            except Exception:
+                hb = None
+            age = hb.get("age_seconds") if isinstance(hb, dict) else None
+            alive = hb.get("pid_alive") if isinstance(hb, dict) else None
+            if age is not None and age >= stale_seconds and alive is not False:
+                now = time.time()
+                if now - last_hang_warn >= max(stale_seconds, 60.0):
+                    logger.critical(
+                        "kanban dispatcher: active holder pid=%s appears HUNG — "
+                        "heartbeat is %.0fs stale (threshold %.0fs) but the process "
+                        "is still alive, so the flock is not released and dispatch "
+                        "is STOPPED fleet-wide. Kill that pid to let this standby "
+                        "take over. (No auto-kill: surfacing only.)",
+                        (hb or {}).get("pid"), age, stale_seconds,
+                    )
+                    last_hang_warn = now
+        return None, "standby"
+
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
 
@@ -697,24 +771,6 @@ class GatewayKanbanWatchersMixin:
         # wal_autocheckpoint=0 — concurrent manual WAL checkpoints can corrupt
         # index pages. The lock lives at the machine-global kanban root
         # (shared across profiles by design), so it serialises ALL gateways.
-        self._kanban_dispatcher_lock_handle = None
-        _lock_path = _kb.kanban_home() / "kanban" / ".dispatcher.lock"
-        _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
-        if _lock_state == "contended":
-            logger.info(
-                "kanban dispatcher: another gateway already holds the dispatcher "
-                "lock (%s); this gateway will NOT dispatch.", _lock_path,
-            )
-            return
-        if _lock_state == "held":
-            self._kanban_dispatcher_lock_handle = _lock_handle  # hold for process lifetime
-            logger.info("kanban dispatcher: holding singleton dispatcher lock (%s)", _lock_path)
-        else:
-            logger.warning(
-                "kanban dispatcher: advisory lock unavailable at %s; proceeding "
-                "on config control alone.", _lock_path,
-            )
-
         try:
             interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
         except (ValueError, TypeError):
@@ -724,6 +780,57 @@ class GatewayKanbanWatchersMixin:
             )
             interval = 60.0
         interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
+
+        # Hung-dispatcher failover (gated; default OFF — inert until an
+        # operator arms it). systemd's Restart=always recovers a dispatcher
+        # that DIES (the flock frees, a standby re-acquires). It does NOT
+        # recover a dispatcher that HANGS: the flock is held for the whole
+        # process lifetime, so a wedged event loop stops dispatch fleet-wide
+        # with nothing to notice. When ``kanban.dispatcher_takeover_enabled``
+        # is true, a gateway that loses the lock becomes a hot STANDBY: it
+        # watches the heartbeat, loudly surfaces a hung holder, and takes
+        # over the moment the flock frees (holder killed by systemd/operator/
+        # OOM). It NEVER force-kills the holder — surfacing + automatic
+        # takeover-on-free only, per the surface-don't-act rule.
+        takeover_enabled = bool(kanban_cfg.get("dispatcher_takeover_enabled", False))
+        try:
+            takeover_stale_seconds = float(
+                kanban_cfg.get("dispatcher_takeover_stale_seconds", 0) or 0
+            )
+        except (ValueError, TypeError):
+            takeover_stale_seconds = 0.0
+        if takeover_stale_seconds <= 0:
+            # Default: five missed ticks. Long enough that a merely-slow tick
+            # (big board, WAL checkpoint) never trips it; short enough that a
+            # real hang is caught in minutes at the 60s default interval.
+            takeover_stale_seconds = max(interval * 5.0, 60.0)
+
+        self._kanban_dispatcher_lock_handle = None
+        _lock_path = _kb.kanban_home() / "kanban" / ".dispatcher.lock"
+        _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
+        if _lock_state == "contended":
+            if not takeover_enabled:
+                logger.info(
+                    "kanban dispatcher: another gateway already holds the dispatcher "
+                    "lock (%s); this gateway will NOT dispatch.", _lock_path,
+                )
+                return
+            # Armed standby: watch the heartbeat, surface a hang, take over
+            # when the lock frees. Returns "held" (fall through to dispatch)
+            # or None (shutdown requested while standing by).
+            _lock_handle, _lock_state = await self._kanban_standby_until_takeover(
+                _kb, _lock_path, interval, takeover_stale_seconds,
+            )
+            if _lock_state != "held":
+                return
+        if _lock_state == "held":
+            self._kanban_dispatcher_lock_handle = _lock_handle  # hold for process lifetime
+            logger.info("kanban dispatcher: holding singleton dispatcher lock (%s)", _lock_path)
+        else:
+            logger.warning(
+                "kanban dispatcher: advisory lock unavailable at %s; proceeding "
+                "on config control alone.", _lock_path,
+            )
 
         # Read max_spawn config to limit concurrent kanban tasks
         max_spawn = kanban_cfg.get("max_spawn", None)
@@ -1110,7 +1217,19 @@ class GatewayKanbanWatchersMixin:
         logger.info(
             "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval
         )
+        _tick_count = 0
+        _last_unroutable_warn = 0
         while self._running:
+            # Heartbeat FIRST, every tick: the liveness signal that makes a
+            # HUNG dispatcher (flock held, event loop wedged) detectable by a
+            # standby / the doctor CLI. Best-effort; never blocks the loop.
+            _tick_count += 1
+            try:
+                await asyncio.to_thread(
+                    _kb.write_dispatcher_heartbeat, _tick_count, interval,
+                )
+            except Exception:
+                logger.debug("kanban dispatcher: heartbeat write skipped", exc_info=True)
             try:
                 # Reap zombie children before per-board work so a board DB
                 # failure cannot block cleanup of unrelated workers.
@@ -1166,8 +1285,32 @@ class GatewayKanbanWatchersMixin:
                             bad_ticks,
                         )
                         last_warn_at = now
+                # Unroutable-assignee telemetry (assignee-validation fix): a
+                # ready task whose assignee is neither a profile nor a known
+                # pull lane can NEVER be worked and no terminal will claim it
+                # — the 55h-silent fable failure. dispatch_once surfaces these
+                # per board in ``skipped_unroutable``; aggregate and warn
+                # distinctly from the "0 spawned" case above (that one blames
+                # profile health; this one blames the task's assignee).
+                unroutable_ids: list[str] = []
+                for _slug, _res in (results or []):
+                    if _res is not None:
+                        unroutable_ids.extend(getattr(_res, "skipped_unroutable", []) or [])
+                if unroutable_ids:
+                    now = int(time.time())
+                    if now - _last_unroutable_warn >= 300:
+                        logger.warning(
+                            "kanban dispatcher STUCK (unroutable assignee): %d ready "
+                            "task(s) assigned to a name that is neither a Hermes "
+                            "profile nor a known pull lane — they will sit forever. "
+                            "ids=%s. Reassign to a real profile, register the lane, "
+                            "or run `hermes kanban doctor`.",
+                            len(unroutable_ids), unroutable_ids[:10],
+                        )
+                        _last_unroutable_warn = now
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
+                _kb_clear_heartbeat_safe(_kb)
                 _release_singleton_lock(self._kanban_dispatcher_lock_handle)
                 self._kanban_dispatcher_lock_handle = None
                 raise
@@ -1181,5 +1324,6 @@ class GatewayKanbanWatchersMixin:
                 await asyncio.sleep(min(1.0, interval - slept))
                 slept += 1.0
 
+        _kb_clear_heartbeat_safe(_kb)
         _release_singleton_lock(self._kanban_dispatcher_lock_handle)
         self._kanban_dispatcher_lock_handle = None

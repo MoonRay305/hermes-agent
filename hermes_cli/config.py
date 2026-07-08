@@ -2539,6 +2539,25 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # --- Dispatch-reliability fixes (all default OFF / inert) ----------
+        # Create-time assignee validation. When true, `hermes kanban create`
+        # (and create_task) REFUSE an assignee that is neither a Hermes
+        # profile nor a known pull lane, instead of silently filing a task
+        # that can never be worked. When false (default) an unroutable
+        # assignee still prints a warning but is accepted — no behavior
+        # change from before this flag existed.
+        "validate_assignee_on_create": False,
+        # Hung-dispatcher failover. The lock-holding gateway always writes a
+        # per-tick heartbeat (harmless), so a HUNG holder (flock held, loop
+        # wedged — which systemd's death-only restart cannot catch) is
+        # detectable. When this flag is true, a gateway that loses the lock
+        # becomes a hot STANDBY that surfaces a hung holder and takes over
+        # the instant the flock frees. It NEVER force-kills the holder.
+        # Default false = losing gateways exit as before.
+        "dispatcher_takeover_enabled": False,
+        # Heartbeat staleness threshold (seconds) before a standby calls the
+        # holder hung. 0 = auto (5×dispatch_interval_seconds, min 60).
+        "dispatcher_takeover_stale_seconds": 0,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

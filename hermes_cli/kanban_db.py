@@ -363,6 +363,132 @@ def boards_root() -> Path:
     return kanban_home() / "kanban" / "boards"
 
 
+# ---------------------------------------------------------------------------
+# Dispatcher heartbeat (hung-dispatcher failover fix)
+#
+# The single embedded dispatcher holds ``.dispatcher.lock`` (an flock) for
+# its whole process lifetime. An flock is released by the OS only when the
+# process dies — so systemd's Restart=always recovers a dispatcher that
+# CRASHES, but a dispatcher that HANGS (event loop wedged, blocked on a
+# stuck syscall, livelocked) keeps the flock and dispatch stops fleet-wide
+# with nothing to notice. This heartbeat is the liveness signal that makes
+# a hang detectable: the lock holder rewrites it every tick, and any other
+# gateway / the doctor CLI can read its age. A fresh flock with a STALE
+# heartbeat == the holder is hung (vs. absent flock == cleanly dead, which
+# systemd already handles).
+# ---------------------------------------------------------------------------
+
+def dispatcher_heartbeat_path() -> Path:
+    """Path of the dispatcher heartbeat file (sibling of the lock)."""
+    return kanban_home() / "kanban" / ".dispatcher.heartbeat"
+
+
+def _current_boot_id() -> Optional[str]:
+    """Linux boot id — lets a reader tell a live pid from a post-reboot
+    pid reuse. ``None`` off Linux / when unreadable (age check still works).
+    """
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except Exception:
+        return None
+
+
+def write_dispatcher_heartbeat(tick: int, interval_seconds: float) -> None:
+    """Atomically stamp the dispatcher heartbeat for the current process.
+
+    Called by the lock-holding gateway once per dispatch tick. Best-effort:
+    any failure is swallowed (a heartbeat write must never take down the
+    dispatcher). Written to a temp file + ``os.replace`` so a reader never
+    sees a half-written record.
+    """
+    import json as _json
+    import socket as _socket
+
+    payload = {
+        "pid": os.getpid(),
+        "boot_id": _current_boot_id(),
+        "host": (_socket.gethostname() or "unknown"),
+        "ts": int(time.time()),
+        "tick": int(tick),
+        "interval_seconds": float(interval_seconds),
+    }
+    try:
+        path = dispatcher_heartbeat_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+        tmp.write_text(_json.dumps(payload), encoding="utf-8")
+        os.replace(str(tmp), str(path))
+    except Exception:
+        logger_hb = logging.getLogger("gateway.run")
+        logger_hb.debug("dispatcher heartbeat write failed", exc_info=True)
+
+
+def read_dispatcher_heartbeat() -> "Optional[dict]":
+    """Read + interpret the dispatcher heartbeat. Read-only.
+
+    Returns ``None`` when no heartbeat file exists (no new-code dispatcher
+    has run yet — the expected pre-arm state). Otherwise a dict with the
+    stored fields plus derived liveness:
+      ``age_seconds``   — wall-clock age of the stamp.
+      ``pid_alive``     — whether the recorded pid currently exists
+                          (only trusted when ``boot_id`` matches this boot;
+                          ``None`` if it can't be determined).
+      ``same_boot``     — recorded boot_id matches the current boot.
+    Interpretation (done by callers, not here): fresh age == healthy;
+    stale age + ``pid_alive`` True == HUNG; stale age + pid gone ==
+    cleanly dead (flock already free, normal re-acquire works).
+    """
+    import json as _json
+
+    path = dispatcher_heartbeat_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+    try:
+        rec = _json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(rec, dict):
+        return None
+    now = int(time.time())
+    ts = int(rec.get("ts") or 0)
+    rec["age_seconds"] = max(0, now - ts) if ts else None
+    same_boot = None
+    boot_now = _current_boot_id()
+    if rec.get("boot_id") and boot_now:
+        same_boot = (rec.get("boot_id") == boot_now)
+    rec["same_boot"] = same_boot
+    pid = rec.get("pid")
+    pid_alive: Optional[bool] = None
+    # Only trust a pid liveness probe when we know it's the same boot — a
+    # reused pid from before a reboot would be a false positive.
+    if isinstance(pid, int) and same_boot is not False:
+        try:
+            os.kill(pid, 0)
+            pid_alive = True
+        except ProcessLookupError:
+            pid_alive = False
+        except PermissionError:
+            pid_alive = True  # exists, not ours to signal
+        except Exception:
+            pid_alive = None
+    rec["pid_alive"] = pid_alive
+    return rec
+
+
+def clear_dispatcher_heartbeat() -> None:
+    """Remove the heartbeat file (on clean dispatcher shutdown). Best-effort."""
+    try:
+        dispatcher_heartbeat_path().unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
 def current_board_path() -> Path:
     """Return the path to ``<root>/kanban/current``.
 
@@ -2304,6 +2430,77 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+# ---------------------------------------------------------------------------
+# Assignee routing classification (assignee-validation reliability fix)
+#
+# An assignee names either a spawnable Hermes profile, a KNOWN pull lane
+# (a terminal/agent that claims tasks itself via ``claim_task`` and must
+# never auto-spawn), or nothing recognisable. The last case is the silent
+# failure this classifier exists to expose: a task assigned to a name that
+# is neither a profile nor a known lane sits in ``ready`` forever, and the
+# dispatcher's own health telemetry historically reported it as "correctly
+# idle" (indistinguishable from a legitimately-idle pull lane). That is
+# what stranded the two ``fable`` client-portal cards for 55h.
+#
+# Registry, NOT profile dirs: pull lanes deliberately have no profile on
+# disk (a ``fable`` profile would make the dispatcher spawn a Hermes LLM
+# worker impersonating Claude Code). They are enumerated here so the
+# dispatcher can tell "correctly idle pull lane" from "typo'd / unroutable
+# assignee". Add new terminal lanes here, lowercase.
+KNOWN_PULL_LANES: "frozenset[str]" = frozenset({
+    "fable", "claude", "claude-code", "claudecode", "fable-cc",
+    "orion-cc", "orion-research",
+})
+
+
+def classify_assignee(assignee: Optional[str]) -> str:
+    """Classify a task assignee into a routing category.
+
+    Returns one of:
+      ``"unassigned"``  — no assignee (needs routing).
+      ``"profile"``     — a real Hermes profile the dispatcher can spawn.
+      ``"pull_lane"``   — a known terminal/agent lane (fable, orion-cc, …)
+                          that claims work itself; correctly never spawned.
+      ``"unroutable"``  — a name that is neither: a typo or a lane nobody
+                          registered. A task here is STUCK, not idle.
+
+    Read-only and dependency-light (only imports ``profile_exists``); safe
+    to call from health telemetry, the dispatcher, and the doctor CLI.
+    """
+    if assignee is None or not str(assignee).strip():
+        return "unassigned"
+    try:
+        canon = _canonical_assignee(assignee)
+    except ValueError:
+        # normalize_profile_name rejects malformed names — treat as
+        # unassigned rather than raising through a read-only classifier.
+        return "unassigned"
+    if not canon:
+        return "unassigned"
+    if canon in KNOWN_PULL_LANES:
+        return "pull_lane"
+    try:
+        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
+    except Exception:
+        # Can't introspect profiles — assume routable so we never wrongly
+        # reject in a degraded/partial install. Matches the legacy
+        # fail-open posture of has_spawnable_ready().
+        return "profile"
+    if profile_exists(canon):
+        return "profile"
+    return "unroutable"
+
+
+def assignee_is_routable(assignee: Optional[str]) -> bool:
+    """True unless the assignee is an unroutable (typo/unregistered) name.
+
+    Unassigned, profile, and known-pull-lane assignees are all routable
+    (they have a legitimate path to being worked). Only ``"unroutable"``
+    returns False — the create-time validation gate keys on this.
+    """
+    return classify_assignee(assignee) != "unroutable"
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2328,8 +2525,18 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    validate_assignee: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
+
+    ``validate_assignee`` (default ``False`` — inert, preserves legacy
+    behavior) is the create-time routing gate. When ``True`` and the
+    assignee classifies as ``"unroutable"`` (neither a Hermes profile nor
+    a :data:`KNOWN_PULL_LANES` entry), creation is refused with a
+    ``ValueError`` instead of silently filing a task that can never be
+    picked up. Callers wire this to the ``kanban.validate_assignee_on_create``
+    config flag so the strict behavior only turns on when an operator arms
+    it. A ``None``/empty assignee is always allowed (routing happens later).
 
     Returns the new task id.  Status is ``ready`` when there are no
     parents (or all parents already ``done``), otherwise ``todo``.
@@ -2355,6 +2562,14 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    if validate_assignee and assignee and classify_assignee(assignee) == "unroutable":
+        raise ValueError(
+            f"assignee {assignee!r} is not routable: it is neither a Hermes "
+            f"profile nor a known pull lane ({', '.join(sorted(KNOWN_PULL_LANES))}). "
+            "A task filed to it would sit in 'ready' forever. Assign a real "
+            "profile, register the lane in KNOWN_PULL_LANES, or leave the "
+            "assignee empty for later routing."
+        )
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
@@ -5625,12 +5840,23 @@ class DispatchResult:
     operator can see when the dispatcher is acting on the fallback rule
     rather than on explicit per-task assignments."""
     skipped_nonspawnable: list[str] = field(default_factory=list)
-    """Ready task ids skipped because their assignee names a control-plane
-    lane (a Claude Code terminal like ``orion-cc``) rather than a Hermes
-    profile. Expected steady-state on multi-lane setups; NOT an
-    operator-actionable failure. Tracked separately so health telemetry
-    can distinguish "real stuck" (nothing spawned but spawnable work
-    available) from "correctly idle" (nothing spawnable in the queue)."""
+    """Ready task ids skipped because their assignee names a KNOWN
+    control-plane / pull lane (a Claude Code terminal like ``orion-cc`` or
+    ``fable``) rather than a Hermes profile. Expected steady-state on
+    multi-lane setups; NOT a dispatcher failure — the lane's terminal
+    claims these via ``claim_task``. Tracked separately so health
+    telemetry can distinguish "real stuck" from "correctly idle". NOTE:
+    a pull-lane task that ages without being claimed is still surfaced by
+    the stale-task auditor (kanban_doctor) — "correctly idle" for the
+    dispatcher is not the same as "nobody needs to look at it"."""
+    skipped_unroutable: list[str] = field(default_factory=list)
+    """Ready task ids skipped because their assignee is neither a Hermes
+    profile NOR a :data:`KNOWN_PULL_LANES` entry — a typo'd or
+    unregistered name. Unlike ``skipped_nonspawnable`` this IS an
+    operator-actionable failure: the task can never be worked and no
+    terminal will claim it (it sat silently for 55h in the ``fable``
+    incident before ``fable`` was registered as a lane). Health telemetry
+    treats a non-empty bucket as STUCK, not idle."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -6850,6 +7076,29 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def list_unroutable_ready(conn: sqlite3.Connection) -> "list[str]":
+    """Return ids of ready/review tasks whose assignee is UNROUTABLE.
+
+    Unroutable = assigned, unclaimed, but the assignee is neither a Hermes
+    profile nor a :data:`KNOWN_PULL_LANES` entry. These are the silently
+    stranded tasks: the dispatcher can't spawn them and no terminal will
+    claim them. Read-only; used by the gateway health telemetry (to fire a
+    STUCK warning instead of the old false "correctly idle") and by the
+    doctor CLI. Ordered oldest-first so the report leads with the worst.
+    """
+    rows = conn.execute(
+        "SELECT id, assignee FROM tasks "
+        "WHERE status IN ('ready', 'review') AND assignee IS NOT NULL "
+        "    AND assignee != '' AND claim_lock IS NULL "
+        "ORDER BY created_at ASC"
+    ).fetchall()
+    stuck: list[str] = []
+    for row in rows:
+        if classify_assignee(row["assignee"]) == "unroutable":
+            stuck.append(row["id"])
+    return stuck
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -7120,13 +7369,19 @@ def _dispatch_once_locked(
         except Exception:
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row_assignee):
-            # Bucket separately from skipped_unassigned: the operator
-            # cannot fix this by assigning a profile (the assignee IS the
-            # intended owner — a terminal lane). Health telemetry uses
-            # this distinction to suppress spurious "stuck" warnings on
-            # multi-lane setups where the ready queue is steadily full
-            # of human-pulled work.
-            result.skipped_nonspawnable.append(row["id"])
+            # Non-profile assignee: split the two very different cases that
+            # used to collapse into one silent "correctly idle" bucket.
+            #   - KNOWN pull lane (orion-cc / fable / …): the lane's
+            #     terminal claims it via claim_task; never a dispatcher
+            #     failure. → skipped_nonspawnable (steady-state).
+            #   - Anything else: a typo'd / unregistered assignee. The task
+            #     can NEVER be worked and no terminal will claim it — the
+            #     exact 55h-silent failure of the fable cards. → surfaced as
+            #     skipped_unroutable so health telemetry flags it STUCK.
+            if _canonical_assignee(row_assignee) in KNOWN_PULL_LANES:
+                result.skipped_nonspawnable.append(row["id"])
+            else:
+                result.skipped_unroutable.append(row["id"])
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at

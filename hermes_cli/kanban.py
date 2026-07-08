@@ -859,6 +859,23 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_gc.add_argument("--log-retention-days", type=int, default=30,
                       help="Delete worker log files older than N days (default: 30)")
 
+    # --- doctor (read-only reliability audit) ---
+    p_doctor = sub.add_parser(
+        "doctor",
+        help="Read-only reliability audit: unroutable assignees, dispatcher "
+             "hang/heartbeat, and stalled tasks. Never writes.",
+    )
+    p_doctor.add_argument("--json", action="store_true",
+                          help="Emit the structured report as JSON")
+    p_doctor.add_argument("--ready-days", type=float, default=2.0,
+                          help="Flag ready tasks unspawned longer than this (default: 2)")
+    p_doctor.add_argument("--todo-days", type=float, default=7.0,
+                          help="Flag dependency-deadlocked todos older than this (default: 7)")
+    p_doctor.add_argument("--pull-lane-hours", type=float, default=6.0,
+                          help="Flag pull-lane tasks unclaimed longer than this (default: 6)")
+    p_doctor.add_argument("--stale-seconds", type=float, default=0.0,
+                          help="Heartbeat staleness threshold; 0 = auto (5×interval, min 60)")
+
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
 
@@ -974,6 +991,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
             "gc":       _cmd_gc,
+            "doctor":   _cmd_doctor,
         }
         handler = handlers.get(action)
         if not handler:
@@ -1325,30 +1343,64 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    with kb.connect_closing() as conn:
-        task_id = kb.create_task(
-            conn,
-            title=args.title,
-            body=args.body,
-            assignee=args.assignee,
-            created_by=args.created_by or _profile_author(),
-            workspace_kind=ws_kind,
-            workspace_path=ws_path,
-            branch_name=branch_name,
-            project_id=getattr(args, "project", None),
-            tenant=args.tenant,
-            priority=args.priority,
-            parents=tuple(args.parent or ()),
-            triage=bool(getattr(args, "triage", False)),
-            idempotency_key=getattr(args, "idempotency_key", None),
-            max_runtime_seconds=max_runtime,
-            skills=getattr(args, "skills", None) or None,
-            max_retries=max_retries,
-            goal_mode=bool(getattr(args, "goal_mode", False)),
-            goal_max_turns=getattr(args, "goal_max_turns", None),
-            initial_status=getattr(args, "initial_status", "running"),
+
+    # Assignee routing gate (reliability fix). Two layers:
+    #   (a) Always-on WARNING — if the assignee is unroutable (neither a
+    #       Hermes profile nor a known pull lane) print a loud heads-up.
+    #       Non-fatal: preserves every existing workflow, just ends the
+    #       silent-strand failure by making it visible at create time.
+    #   (b) Config-gated REJECT — when kanban.validate_assignee_on_create
+    #       is true, refuse outright (create_task raises → exit 2). Default
+    #       off, so arming is a deliberate operator choice.
+    _strict_assignee = False
+    try:
+        from hermes_cli.config import load_config as _load_cfg
+        _cfg = _load_cfg()
+        _kcfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
+        _strict_assignee = bool(_kcfg.get("validate_assignee_on_create", False))
+    except Exception:
+        _strict_assignee = False
+    if args.assignee and kb.classify_assignee(args.assignee) == "unroutable":
+        print(
+            f"⚠  kanban: assignee {args.assignee!r} is not routable — neither a "
+            f"Hermes profile nor a known pull lane. A task filed to it will sit "
+            f"in 'ready' forever (no worker spawns, no terminal claims it). "
+            f"Assign a real profile or register the lane.",
+            file=sys.stderr,
         )
-        task = kb.get_task(conn, task_id)
+
+    try:
+        with kb.connect_closing() as conn:
+            task_id = kb.create_task(
+                conn,
+                title=args.title,
+                body=args.body,
+                assignee=args.assignee,
+                validate_assignee=_strict_assignee,
+                created_by=args.created_by or _profile_author(),
+                workspace_kind=ws_kind,
+                workspace_path=ws_path,
+                branch_name=branch_name,
+                project_id=getattr(args, "project", None),
+                tenant=args.tenant,
+                priority=args.priority,
+                parents=tuple(args.parent or ()),
+                triage=bool(getattr(args, "triage", False)),
+                idempotency_key=getattr(args, "idempotency_key", None),
+                max_runtime_seconds=max_runtime,
+                skills=getattr(args, "skills", None) or None,
+                max_retries=max_retries,
+                goal_mode=bool(getattr(args, "goal_mode", False)),
+                goal_max_turns=getattr(args, "goal_max_turns", None),
+                initial_status=getattr(args, "initial_status", "running"),
+            )
+            task = kb.get_task(conn, task_id)
+    except ValueError as exc:
+        # Armed create-time validation (kanban.validate_assignee_on_create)
+        # refused an unroutable assignee — surface and exit non-zero rather
+        # than filing a task that could never be worked.
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
@@ -2697,6 +2749,28 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
     if not all_flag:
         return 0 if ok_count == 1 else 1
     return 0 if (ok_count > 0 or not ids) else 1
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    """Read-only reliability audit. Exit 0 = healthy, 1 = findings.
+
+    Never writes to any board — safe to run against the live fleet at any
+    time, including as the dry-run check for the three staged reliability
+    fixes before any of them is armed.
+    """
+    from hermes_cli import kanban_doctor as _doc
+
+    report = _doc.run_doctor(
+        ready_days=getattr(args, "ready_days", 2.0),
+        todo_days=getattr(args, "todo_days", 7.0),
+        pull_lane_stale_hours=getattr(args, "pull_lane_hours", 6.0),
+        stale_seconds=getattr(args, "stale_seconds", 0.0),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        print(_doc.render_text(report))
+    return 0 if report["ok"] else 1
 
 
 def _cmd_gc(args: argparse.Namespace) -> int:
