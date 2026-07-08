@@ -171,3 +171,73 @@ def test_auditor_is_read_only(kanban_home):
     doc.run_doctor()  # full audit
     after = db_path.stat().st_mtime_ns
     assert before == after, "doctor must not write to the board"
+
+
+# ---------------------------------------------------------------------------
+# CLI exit-code propagation — cron/schedulers must see unhealthy boards
+# ---------------------------------------------------------------------------
+
+
+def test_main_propagates_kanban_doctor_findings_exit_code(kanban_home):
+    """`hermes kanban doctor` must exit non-zero when findings are present.
+
+    The doctor already returns 1 on findings; this catches the top-level CLI
+    dispatch layer swallowing that return code and making cron health checks
+    falsely green.
+    """
+    import os
+    import subprocess
+    import sys
+
+    with kb.connect(board="default") as conn:
+        kb.create_task(
+            conn,
+            title="stranded typo",
+            assignee="nonesuch-typo",
+            created_by="test",
+        )
+
+    env = os.environ.copy()
+    result = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "kanban", "doctor", "--json"],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert payload["assignees"]["unroutable"][0]["assignee"] == "nonesuch-typo"
+
+
+def test_main_propagates_armed_create_gate_refusal_exit_code(kanban_home):
+    """The config-armed create gate must fail the process, not just stderr."""
+    import os
+    import subprocess
+    import sys
+
+    (kanban_home / "config.yaml").write_text(
+        'kanban:\n  validate_assignee_on_create: true\n',
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "kanban",
+            "create",
+            "blocked typo",
+            "--assignee",
+            "nonesuch-typo",
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "not routable" in result.stderr
