@@ -1360,7 +1360,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
         _strict_assignee = bool(_kcfg.get("validate_assignee_on_create", False))
     except Exception:
         _strict_assignee = False
-    if args.assignee and kb.classify_assignee(args.assignee) == "unroutable":
+    if (
+        args.assignee
+        and not getattr(args, "json", False)
+        and kb.classify_assignee(args.assignee) == "unroutable"
+    ):
         print(
             f"⚠  kanban: assignee {args.assignee!r} is not routable — neither a "
             f"Hermes profile nor a known pull lane. A task filed to it will sit "

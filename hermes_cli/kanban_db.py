@@ -388,7 +388,7 @@ def _current_boot_id() -> Optional[str]:
     pid reuse. ``None`` off Linux / when unreadable (age check still works).
     """
     try:
-        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
     except Exception:
         return None
 
@@ -467,12 +467,9 @@ def read_dispatcher_heartbeat() -> "Optional[dict]":
     # reused pid from before a reboot would be a false positive.
     if isinstance(pid, int) and same_boot is not False:
         try:
-            os.kill(pid, 0)
-            pid_alive = True
-        except ProcessLookupError:
-            pid_alive = False
-        except PermissionError:
-            pid_alive = True  # exists, not ours to signal
+            import psutil as _psutil
+
+            pid_alive = bool(_psutil.pid_exists(pid))
         except Exception:
             pid_alive = None
     rec["pid_alive"] = pid_alive
