@@ -14067,13 +14067,13 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
     parsed = urllib.parse.urlparse(origin)
     if parsed.scheme not in {"http", "https"}:
         # Packaged/file-backed desktop shells can send non-web origins
-        # (commonly ``Origin: null`` or ``file://``).  Allow those only for a
-        # loopback-bound dashboard; public/Tailscale/LAN dashboard binds still
-        # require a normal same-host HTTP(S) Origin.
-        bound_lc = bound_host.lower()
-        if bound_lc in _LOOPBACK_HOST_VALUES:
-            return None
-        return f"origin_mismatch origin={origin} bound={bound_host}"
+        # (commonly ``Origin: null`` / ``file://`` / ``app://``).  At this
+        # point Host has already matched the configured bind and the WS route
+        # checks the session token / OAuth ticket before calling this guard.
+        # DNS-rebinding attackers are web pages and can only present http(s)
+        # origins, so keep non-web desktop origins allowed for loopback,
+        # explicit LAN/Tailscale binds, and OAuth-gated hosted gateways.
+        return None
 
     if not parsed.netloc:
         return f"origin_mismatch origin={origin} bound={bound_host}"
