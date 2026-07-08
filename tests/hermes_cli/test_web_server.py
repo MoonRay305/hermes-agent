@@ -6155,12 +6155,16 @@ class TestDashboardWebSocketOriginGuard:
             self._fake_ws("localhost:9120", "file://")
         )
 
-    def test_rejects_null_origin_for_non_loopback_bound_dashboard(self, monkeypatch):
+    def test_allows_desktop_null_origin_on_non_loopback_bound_dashboard(self, monkeypatch):
         import hermes_cli.web_server as ws
 
         monkeypatch.setattr(ws.app.state, "bound_host", "100.67.239.114", raising=False)
 
-        assert not ws._ws_host_origin_is_allowed(
+        # Non-web desktop origins (``null`` / ``file://`` / ``app://``) are
+        # not browser DNS-rebinding origins. Host validation still has to
+        # match the explicit LAN/Tailscale bind, and the WebSocket route checks
+        # the session token / OAuth ticket before applying this guard.
+        assert ws._ws_host_origin_is_allowed(
             self._fake_ws("100.67.239.114:9119", "null")
         )
 

@@ -14632,12 +14632,16 @@ def main():
         cmd_chat(args)
         return
 
-    # Execute the command
+    # Execute the command. Subcommands conventionally return process exit
+    # codes; preserve that signal so automation (cron/health checks) can
+    # detect findings instead of treating every command as success.
     if hasattr(args, "func"):
-        args.func(args)
+        rc = args.func(args)
+        return rc if isinstance(rc, int) and not isinstance(rc, bool) else 0
     else:
         parser.print_help()
+        return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
