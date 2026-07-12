@@ -2618,7 +2618,9 @@ def create_task(
     parents (or all parents already ``done``), otherwise ``todo``.
     If ``triage=True``, status is forced to ``triage`` regardless of
     parents — a specifier/triager is expected to promote the task to
-    ``todo`` once the spec is fleshed out.
+    ``todo`` once the spec is fleshed out. ``initial_status="blocked"``
+    creates a fail-closed human-release gate and records a sticky ``blocked``
+    event; only an explicit :func:`unblock_task` may release it.
 
     If ``idempotency_key`` is provided and a non-archived task with the
     same key already exists, returns the existing task's id instead of
@@ -2892,6 +2894,20 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                     },
                 )
+                if task_status == "blocked":
+                    # ``initial_status=blocked`` is a deliberate human-release
+                    # gate, not a dependency wait. Persist the same sticky event
+                    # that ``block_task`` emits so ``recompute_ready`` cannot
+                    # silently promote the card on the next dispatcher tick.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": "created with initial_status=blocked",
+                            "source": "create_task",
+                        },
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -3452,92 +3468,27 @@ def _synthesize_ended_run(
 # Dependency resolution (todo -> ready)
 # ---------------------------------------------------------------------------
 
-def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return True when ``task_id`` is sticky-blocked by an explicit
-    worker/operator ``kanban_block`` call (#28712).
-
-    A ``blocked`` status can come from two very different sources:
-
-    * **Worker- or operator-initiated** — a worker called
-      ``kanban_block(reason="review-required: ...")`` (or somebody ran
-      ``hermes kanban block <id>``).  This is a deliberate handoff that
-      should stay blocked until an operator unblocks it.  The block tool
-      emits a ``"blocked"`` event row in ``task_events``.
-
-    * **Circuit-breaker** — ``_record_task_failure`` tripped after
-      repeated crashes / spawn failures / timeouts.  This emits
-      ``"gave_up"``, *not* ``"blocked"``, and is meant to recover
-      automatically once the underlying conditions change (e.g. parents
-      finish, transient infra error clears).
-
-    The cheapest signal that distinguishes the two is the most recent
-    ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
-    recent one is ``"blocked"`` (or there is a ``"blocked"`` event and
-    no ``"unblocked"`` event has fired since), the task is sticky and
-    ``recompute_ready`` must *not* auto-promote it.
-
-    Returns ``False`` when there is no such event at all (e.g. the task
-    was set to ``status='blocked'`` by the circuit breaker or by direct
-    DB manipulation) — preserves the pre-#28712 auto-recover semantics
-    for that path.
-    """
-    row = conn.execute(
-        "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
-        "ORDER BY id DESC LIMIT 1",
-        (task_id,),
-    ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
-
-
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
-    """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
+    """Promote ``todo`` tasks when every parent is done or archived.
 
-    Returns the number of tasks promoted.  Safe to call inside or outside
-    an existing transaction; it opens its own IMMEDIATE txn.
+    ``blocked`` is a fail-closed human-release gate and is deliberately not
+    scanned here. Dependency waits use ``todo``; a blocked task can re-enter
+    dependency resolution only through an explicit :func:`unblock_task`, which
+    emits ``unblocked`` and moves it to ``ready`` or ``todo`` as appropriate.
 
-    ``blocked`` tasks are also considered for promotion (so a task
-    blocked purely by a parent dependency unblocks itself when the
-    parent completes), *except* in two cases:
-
-    1. The most recent block event was a worker-initiated
-       ``kanban_block`` — those stay blocked until an explicit
-       ``kanban_unblock`` (#28712).
-
-    2. The task's ``consecutive_failures`` has reached the effective
-       failure limit.  This prevents infinite retry loops when a task
-       repeatedly exhausts its iteration budget: without this guard the
-       counter would reset on every recovery cycle and the circuit
-       breaker could never trip (#35072).
-
-    The effective failure limit resolves in the same order as the
-    circuit breaker in ``_record_task_failure`` so the two never
-    disagree about when a task is permanently blocked:
-
-      1. per-task ``max_retries`` if set
-      2. caller-supplied ``failure_limit`` (the dispatcher passes the
-         ``kanban.failure_limit`` config value through ``dispatch_once``)
-      3. ``DEFAULT_FAILURE_LIMIT``
+    ``failure_limit`` remains in the public signature for compatibility with
+    existing dispatcher callers. Circuit-breaker cards that reached blocked
+    state now also require an explicit unblock, matching fail-closed behavior.
     """
-    if failure_limit is None:
-        failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+            "SELECT id FROM tasks WHERE status = 'todo'"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
-            cur_status = row["status"]
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Worker / operator asked for human review — do not
-                # silently auto-recover.  ``unblock_task`` is the only
-                # legitimate exit (it emits ``"unblocked"`` which flips
-                # this predicate back).
-                continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
@@ -3545,35 +3496,14 @@ def recompute_ready(
                 (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
-                if cur_status == "blocked":
-                    # Don't auto-recover tasks that have hit the
-                    # circuit-breaker failure limit.  Without this
-                    # guard, a task that repeatedly exhausts its
-                    # iteration budget would cycle forever:
-                    # block → auto-recover → respawn → budget
-                    # exhausted → block → …  The counter must also
-                    # be preserved so the breaker can accumulate
-                    # across recovery cycles.
-                    failures = int(row["consecutive_failures"] or 0)
-                    task_limit = row["max_retries"]
-                    effective_limit = (
-                        int(task_limit) if task_limit is not None
-                        else int(failure_limit)
-                    )
-                    if failures >= effective_limit:
-                        continue
-                    conn.execute(
-                        "UPDATE tasks SET status = 'ready' "
-                        "WHERE id = ? AND status = 'blocked'",
-                        (task_id,),
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
-                        (task_id,),
-                    )
-                _append_event(conn, task_id, "promoted", None)
-                promoted += 1
+                cur = conn.execute(
+                    "UPDATE tasks SET status = 'ready' "
+                    "WHERE id = ? AND status = 'todo'",
+                    (task_id,),
+                )
+                if cur.rowcount == 1:
+                    _append_event(conn, task_id, "promoted", None)
+                    promoted += 1
     return promoted
 
 
