@@ -2755,6 +2755,50 @@ DEFAULT_CONFIG = {
         # Heartbeat staleness threshold (seconds) before a standby calls the
         # holder hung. 0 = auto (5×dispatch_interval_seconds, min 60).
         "dispatcher_takeover_stale_seconds": 0,
+        # --- Linear -> Kanban bridge (dry-run stage; inert by default) -----
+        # Mirrors Linear issues assigned to a MAPPED Hermes agent onto the
+        # kanban board so fleet work can be driven from Linear. Runs inside
+        # the dispatcher tick loop, so only the dispatcher-lock-holding
+        # gateway ever polls (same gating as dispatch itself).
+        "linear_bridge": {
+            # Master switch. False = the tick loop never touches Linear.
+            "enabled": False,
+            # Dry-run: report "WOULD CREATE Kanban card: ..." and create
+            # NOTHING. This stage of the bridge implements ONLY dry-run —
+            # the create path deliberately does not exist yet, so flipping
+            # this to False logs a refusal instead of acting.
+            "dry_run": True,
+            # Seconds between Linear polls (enforced across dispatch ticks).
+            "poll_interval_seconds": 300,
+            # Linear team keys to watch (e.g. BUI = Build Ops).
+            "team_keys": ["BUI"],
+            # Linear workflow-state *types* that make an issue bridgeable.
+            # "unstarted" == Todo. Started/backlog/completed are ignored.
+            "status_types": ["unstarted"],
+            # Env var holding the Linear GraphQL API key. Resolved from the
+            # process env FIRST, then from the shared ~/.hermes/.env — so a
+            # standby gateway that wins the dispatcher lock can still poll
+            # (the key must be an intentional dispatcher-role grant, not an
+            # accident of one gateway's process env).
+            "api_key_env": "LINEAR_API_KEY",
+            # Linear user -> Hermes assignee (profile or KNOWN_PULL_LANES
+            # lane). Keys are matched (lowercase) against BOTH the Linear
+            # user's email and display name — emails for humans, display
+            # names for OAuth-app agent users whose emails are machine-
+            # generated. Only mappings verified against the live workspace
+            # belong here. A Linear assignee in neither this map nor
+            # human_assignees is UNROUTABLE: surfaced loudly, never silently
+            # dropped, never guessed (same rule as
+            # kanban.validate_assignee_on_create / PR #4).
+            # As of 2026-07-12 the squiddy-lab workspace has NO agent users
+            # (only Landon + the Codex/Linear OAuth apps), so this ships
+            # empty. Add entries like: "fable@2rook.ai": "fable".
+            "assignee_map": {},
+            # Linear users who are HUMANS: issues assigned to them are
+            # intentionally NOT bridged to the fleet (skipped silently with
+            # a counter, not an unroutable error).
+            "human_assignees": ["lray24@gmail.com"],
+        },
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
