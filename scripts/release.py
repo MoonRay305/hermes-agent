@@ -47,6 +47,7 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
 AUTHOR_MAP = {
 
     "lray24@gmail.com": "MoonRay305",  # PR #4 Double Rook kanban dispatch reliability fixes
+    "landon@2rook.ai": "MoonRay305",  # BUI-885 Linear routing-label bridge follow-up
 
     "164521089+rainbowgits@users.noreply.github.com": "rainbowgore",  # PR #59405 salvage (mcp: bound stdio initialize handshake to stop subprocess/FD leak; #59349)
     "sage@Sages-Mac-mini.local": "thestudionorth",  # PR #60015 salvage (mcp: parent-death watchdog for stdio children; commit under unlinked local identity)
