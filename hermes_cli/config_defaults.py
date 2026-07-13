@@ -2313,6 +2313,16 @@ DEFAULT_CONFIG = {
         "dispatcher_takeover_enabled": False,
         # 0 = auto (5× dispatch interval, minimum 60 seconds).
         "dispatcher_takeover_stale_seconds": 0,
+        # Linear -> Kanban bridge; inert unless explicitly enabled.
+        "linear_bridge": {
+            "enabled": False,
+            "dry_run": True,
+            "poll_interval_seconds": 300,
+            "team_keys": ["BUI"],
+            "status_types": ["unstarted"],
+            "api_key_env": "LINEAR_API_KEY",
+            "routing_label_prefix": "agent:",
+        },
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
