@@ -2756,10 +2756,11 @@ DEFAULT_CONFIG = {
         # holder hung. 0 = auto (5×dispatch_interval_seconds, min 60).
         "dispatcher_takeover_stale_seconds": 0,
         # --- Linear -> Kanban bridge (dry-run stage; inert by default) -----
-        # Mirrors Linear issues assigned to a MAPPED Hermes agent onto the
-        # kanban board so fleet work can be driven from Linear. Runs inside
-        # the dispatcher tick loop, so only the dispatcher-lock-holding
-        # gateway ever polls (same gating as dispatch itself).
+        # Mirrors Linear issues carrying an explicit agent:<profile> routing
+        # label onto the kanban board so Linear stays the reference plane and
+        # Kanban remains the sole execution-authority plane. Runs inside the
+        # dispatcher tick loop, so only the dispatcher-lock-holding gateway
+        # ever polls (same gating as dispatch itself).
         "linear_bridge": {
             # Master switch. False = the tick loop never touches Linear.
             "enabled": False,
@@ -2781,23 +2782,14 @@ DEFAULT_CONFIG = {
             # (the key must be an intentional dispatcher-role grant, not an
             # accident of one gateway's process env).
             "api_key_env": "LINEAR_API_KEY",
-            # Linear user -> Hermes assignee (profile or KNOWN_PULL_LANES
-            # lane). Keys are matched (lowercase) against BOTH the Linear
-            # user's email and display name — emails for humans, display
-            # names for OAuth-app agent users whose emails are machine-
-            # generated. Only mappings verified against the live workspace
-            # belong here. A Linear assignee in neither this map nor
-            # human_assignees is UNROUTABLE: surfaced loudly, never silently
-            # dropped, never guessed (same rule as
-            # kanban.validate_assignee_on_create / PR #4).
-            # As of 2026-07-12 the squiddy-lab workspace has NO agent users
-            # (only Landon + the Codex/Linear OAuth apps), so this ships
-            # empty. Add entries like: "fable@2rook.ai": "fable".
-            "assignee_map": {},
-            # Linear users who are HUMANS: issues assigned to them are
-            # intentionally NOT bridged to the fleet (skipped silently with
-            # a counter, not an unroutable error).
-            "human_assignees": ["lray24@gmail.com"],
+            # Routing reference convention. A Linear issue with exactly one
+            # label named agent:<profile> is routed to that Hermes profile.
+            # No matching label is skipped (not an error). An unknown profile,
+            # empty suffix, or multiple routing labels is UNROUTABLE and
+            # surfaced loudly every poll until corrected. Other Linear labels
+            # are ignored. Example labels: agent:ghost, agent:peewee,
+            # agent:patch, agent:squiddy.
+            "routing_label_prefix": "agent:",
         },
     },
 

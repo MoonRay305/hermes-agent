@@ -1,9 +1,10 @@
 """Linear -> Kanban bridge (DRY-RUN stage).
 
-Mirrors Linear issues that are assigned to a MAPPED Hermes agent onto the
-kanban board, so project work assigned in Linear flows to the fleet without a
-human re-keying cards. This module is the polling/classification half; it is
-called from the gateway's embedded dispatcher tick loop
+Mirrors Linear issues that carry an explicit ``agent:<profile>`` routing label
+onto the kanban board, so Linear remains the reference plane while Kanban stays
+the fleet's single execution-authority plane. This module is the polling and
+reference-classification half; it is called from the gateway's embedded
+dispatcher tick loop
 (``gateway/kanban_watchers.py``), which means:
 
   * Only the dispatcher-LOCK-HOLDING gateway ever polls Linear — the exact
@@ -21,13 +22,10 @@ before letting it act. The create path arrives in a later stage, and will use
 ``idempotency_key="linear:<identifier>"`` for DB-level dedup on top of the
 seen-store here.
 
-Assignee routing follows the PR #4 validation pattern exactly: a Linear
-assignee resolves to ``mapped`` (bridge it), ``human`` (intentionally not
-bridged), ``unassigned``, or ``UNROUTABLE`` — and unroutable is FAIL-LOUD
-(warning log + report bucket), never a silent drop and never a guess. Even a
-*mapped* entry whose Hermes-side target fails ``kanban_db.classify_assignee``
-(neither a profile nor a known pull lane) is demoted to unroutable, so a typo
-in the map itself cannot silently strand work.
+Routing is reference-based, never assignee-based. Exactly one
+``agent:<profile>`` label resolves to a real Hermes profile; no routing label
+is skipped without error. Unknown, empty, or conflicting routing labels are
+``UNROUTABLE`` and FAIL LOUD every poll, never silently dropped or marked seen.
 """
 
 from __future__ import annotations
@@ -61,7 +59,7 @@ query BridgeIssues($teamKeys: [String!]!, $after: String) {
       url
       priority
       state { name type }
-      assignee { name email }
+      labels { nodes { name } }
       team { key }
     }
   }
@@ -120,60 +118,49 @@ def resolve_linear_api_key(bcfg: Optional[dict] = None) -> "tuple[Optional[str],
 
 
 # ---------------------------------------------------------------------------
-# Assignee classification (PR #4 pattern, applied to Linear users)
+# Reference-label classification
 # ---------------------------------------------------------------------------
 
-def classify_linear_assignee(
-    assignee_email: Optional[str],
-    assignee_name: Optional[str],
+def classify_linear_labels(
+    label_names: "list[str]",
     bcfg: dict,
-) -> "tuple[str, Optional[str]]":
-    """Classify a Linear issue's assignee for bridging.
+) -> "tuple[str, Optional[str], list[str]]":
+    """Resolve an ``agent:<profile>`` Linear label to a Hermes profile.
 
-    Returns ``(disposition, hermes_assignee)`` with disposition one of:
-      ``"mapped"``      — bridge it; ``hermes_assignee`` is the kanban
-                          assignee (validated: profile or known pull lane).
-      ``"human"``       — a human's issue; intentionally NOT bridged.
-      ``"unassigned"``  — no assignee; nothing to route yet.
-      ``"unroutable"``  — assignee is in neither the map nor the human list,
-                          OR the map's own target fails Hermes-side
-                          validation. FAIL-LOUD; never silently dropped.
+    Returns ``(disposition, hermes_profile, routing_labels)`` where disposition
+    is ``mapped``, ``unlabeled``, or ``unroutable``. A routing label is only
+    valid when exactly one is present and its suffix names a real Hermes
+    profile. Unknown and conflicting references stay unroutable every tick.
     """
-    email = (assignee_email or "").strip().lower()
-    name = (assignee_name or "").strip().lower()
-    if not email and not name:
-        return "unassigned", None
+    prefix = str(bcfg.get("routing_label_prefix") or "agent:").strip()
+    if not prefix:
+        prefix = "agent:"
+    folded_prefix = prefix.casefold()
+    routing_labels = [
+        str(name).strip()
+        for name in (label_names or [])
+        if str(name).strip().casefold().startswith(folded_prefix)
+    ]
+    if not routing_labels:
+        return "unlabeled", None, []
+    if len(routing_labels) != 1:
+        return "unroutable", None, routing_labels
 
-    # Match config keys against BOTH the email and the display name: emails
-    # are the stable primary key for humans, but Linear OAuth-app users
-    # (agents) carry machine-generated emails, so their natural key is the
-    # display name. Both are workspace-controlled identities.
-    idents = {v for v in (email, name) if v}
-
-    humans = {str(h).strip().lower() for h in (bcfg.get("human_assignees") or [])}
-    if idents & humans:
-        return "human", None
-
-    amap = bcfg.get("assignee_map") or {}
-    target = None
-    for k, v in amap.items():
-        if str(k).strip().lower() in idents:
-            target = str(v).strip()
-            break
-    if target is None:
-        return "unroutable", None
-
-    # A map entry is only as good as its Hermes-side target: validate it with
-    # the same classifier the dispatcher uses (PR #4). A typo'd target must
-    # surface as unroutable here, not strand a card later.
+    target = routing_labels[0][len(prefix):].strip().casefold()
+    if not target:
+        return "unroutable", None, routing_labels
     try:
         from hermes_cli.kanban_db import classify_assignee
 
-        if classify_assignee(target) == "unroutable":
-            return "unroutable", None
+        if classify_assignee(target) != "profile":
+            return "unroutable", None, routing_labels
     except Exception:
-        logger.debug("linear bridge: hermes-side target validation unavailable", exc_info=True)
-    return "mapped", target
+        logger.warning(
+            "linear bridge: Hermes profile validation failed for routing label",
+            exc_info=True,
+        )
+        return "unroutable", None, routing_labels
+    return "mapped", target, routing_labels
 
 
 # ---------------------------------------------------------------------------
@@ -262,15 +249,15 @@ def run_bridge_tick(
 
     Report shape:
       {"ok": bool, "would_create": [...], "unroutable": [...],
-       "skipped_human": int, "skipped_unassigned": int,
-       "skipped_status": int, "already_seen": int, "error": str|None}
+       "skipped_unlabeled": int, "skipped_status": int,
+       "already_seen": int, "error": str|None}
     """
     bcfg = bcfg if bcfg is not None else bridge_config()
     now = int(now if now is not None else time.time())
     report: dict[str, Any] = {
         "ok": True, "would_create": [], "unroutable": [],
-        "skipped_human": 0, "skipped_unassigned": 0,
-        "skipped_status": 0, "already_seen": 0, "error": None,
+        "skipped_unlabeled": 0, "skipped_status": 0,
+        "already_seen": 0, "error": None,
     }
 
     if not bool(bcfg.get("dry_run", True)):
@@ -319,33 +306,34 @@ def run_bridge_tick(
         if state_type not in wanted_status:
             report["skipped_status"] += 1
             continue
-        assignee = issue.get("assignee") or {}
-        disposition, hermes_assignee = classify_linear_assignee(
-            assignee.get("email"), assignee.get("name"), bcfg,
+        label_nodes = ((issue.get("labels") or {}).get("nodes") or [])
+        label_names = [
+            str(label.get("name") or "")
+            for label in label_nodes
+            if isinstance(label, dict)
+        ]
+        disposition, hermes_assignee, routing_labels = classify_linear_labels(
+            label_names, bcfg,
         )
-        if disposition == "unassigned":
-            report["skipped_unassigned"] += 1
-            continue
-        if disposition == "human":
-            report["skipped_human"] += 1
+        if disposition == "unlabeled":
+            report["skipped_unlabeled"] += 1
             continue
         ident = str(issue.get("identifier") or issue.get("id") or "?")
         if disposition == "unroutable":
             entry = {
                 "identifier": ident,
                 "title": str(issue.get("title") or "")[:80],
-                "linear_assignee": assignee.get("email") or assignee.get("name"),
+                "routing_labels": routing_labels,
             }
             report["unroutable"].append(entry)
             logger.warning(
-                "linear bridge UNROUTABLE: %s (%r) is assigned to %r — in "
-                "neither kanban.linear_bridge.assignee_map nor "
-                "human_assignees. It will NOT be bridged until mapped. "
-                "(fail-loud per the PR #4 assignee-validation rule)",
-                ident, entry["title"], entry["linear_assignee"],
+                "linear bridge UNROUTABLE: %s (%r) has routing label(s) %r, "
+                "but they do not resolve to exactly one valid Hermes profile. "
+                "It will NOT be bridged until the label is corrected. "
+                "(fail-loud every poll)",
+                ident, entry["title"], routing_labels,
             )
             continue
-        # mapped
         issue_id = str(issue.get("id") or ident)
         if issue_id in seen:
             report["already_seen"] += 1
@@ -356,7 +344,7 @@ def run_bridge_tick(
             "title": str(issue.get("title") or "")[:200],
             "url": issue.get("url"),
             "hermes_assignee": hermes_assignee,
-            "linear_assignee": assignee.get("email") or assignee.get("name"),
+            "routing_label": routing_labels[0],
             "state": (issue.get("state") or {}).get("name"),
             "priority": issue.get("priority"),
             # The future create stage keys DB-level dedup on this:
@@ -366,8 +354,9 @@ def run_bridge_tick(
         new_seen_entries[issue_id] = {"identifier": ident, "first_seen": now, "dry_run": True}
         logger.info(
             "linear bridge DRY-RUN: WOULD CREATE Kanban card: %s %r -> "
-            "assignee=%s (idempotency_key=%s). No card was created.",
-            ident, card["title"][:60], hermes_assignee, card["planned_idempotency_key"],
+            "assignee=%s via label=%s (idempotency_key=%s). No card was created.",
+            ident, card["title"][:60], hermes_assignee,
+            card["routing_label"], card["planned_idempotency_key"],
         )
 
     if new_seen_entries:

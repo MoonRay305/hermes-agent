@@ -3,8 +3,8 @@
 Everything runs against injected issue fixtures and a temp kanban home — no
 network, no live board. The load-bearing assertions:
 
-  * assignee classification follows the PR #4 fail-loud pattern (unknown ->
-    UNROUTABLE, never silently dropped; a typo'd map target is unroutable);
+  * reference-label classification is explicit and fail-loud (no label skips;
+    unknown/conflicting agent labels are UNROUTABLE every tick);
   * dedup on Linear issue id across ticks;
   * the dry-run tick NEVER writes a kanban card (board row count unchanged),
     and the module contains no task-creation call at all;
@@ -27,6 +27,7 @@ from hermes_cli import kanban_db as kb
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
+    (home / "profiles" / "ghost").mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
@@ -41,15 +42,11 @@ BCFG = {
     "team_keys": ["BUI"],
     "status_types": ["unstarted"],
     "api_key_env": "LINEAR_API_KEY",
-    "assignee_map": {
-        "fable@2rook.ai": "fable",          # valid pull lane
-        "typo@2rook.ai": "no-such-agent",   # map target itself invalid
-    },
-    "human_assignees": ["lray24@gmail.com"],
+    "routing_label_prefix": "agent:",
 }
 
 
-def _issue(ident, title, email, name=None, state_type="unstarted", iid=None):
+def _issue(ident, title, labels=None, state_type="unstarted", iid=None):
     return {
         "id": iid or f"uuid-{ident}",
         "identifier": ident,
@@ -57,48 +54,57 @@ def _issue(ident, title, email, name=None, state_type="unstarted", iid=None):
         "url": f"https://linear.app/x/issue/{ident}",
         "priority": 2,
         "state": {"name": "Todo", "type": state_type},
-        "assignee": ({"email": email, "name": name or email} if (email or name) else None),
+        "labels": {"nodes": [{"name": name} for name in (labels or [])]},
         "team": {"key": "BUI"},
     }
 
 
-def test_classify_dispositions(kanban_home):
-    # mapped -> validated hermes assignee (fable is a KNOWN_PULL_LANES entry)
-    assert lb.classify_linear_assignee("fable@2rook.ai", "Fable", BCFG) == ("mapped", "fable")
-    assert lb.classify_linear_assignee("FABLE@2rook.ai", None, BCFG) == ("mapped", "fable")
-    # human -> intentionally not bridged
-    assert lb.classify_linear_assignee("lray24@gmail.com", "Landon Ray", BCFG) == ("human", None)
-    # unassigned
-    assert lb.classify_linear_assignee(None, None, BCFG) == ("unassigned", None)
-    assert lb.classify_linear_assignee("", "  ", BCFG) == ("unassigned", None)
-    # unknown -> UNROUTABLE (fail loud), never a guess
-    assert lb.classify_linear_assignee("codex@oauthapp.linear.app", "Codex", BCFG)[0] == "unroutable"
-    # a map entry whose TARGET fails Hermes-side validation is unroutable too
-    assert lb.classify_linear_assignee("typo@2rook.ai", None, BCFG)[0] == "unroutable"
-    # display-name keys work too (OAuth-app agent users have machine emails)
-    cfg = dict(BCFG, assignee_map={"fable agent": "fable"})
-    assert lb.classify_linear_assignee("weird@oauthapp.linear.app", "Fable Agent", cfg) == ("mapped", "fable")
-    # ...and a name-keyed human
-    cfg2 = dict(BCFG, human_assignees=["landon ray"])
-    assert lb.classify_linear_assignee(None, "Landon Ray", cfg2) == ("human", None)
+def test_classify_routing_labels(kanban_home):
+    assert lb.classify_linear_labels(["agent:ghost"], BCFG) == (
+        "mapped", "ghost", ["agent:ghost"]
+    )
+    # Matching is case-insensitive; non-routing labels are ignored.
+    assert lb.classify_linear_labels(
+        ["Bug", "Agent:Ghost"], BCFG
+    ) == ("mapped", "ghost", ["Agent:Ghost"])
+    # No routing reference means skip, not error.
+    assert lb.classify_linear_labels([], BCFG) == ("unlabeled", None, [])
+    assert lb.classify_linear_labels(["Bug"], BCFG) == ("unlabeled", None, [])
+    # Unknown profile and conflicting references stay loudly unroutable.
+    assert lb.classify_linear_labels(
+        ["agent:no-such-agent"], BCFG
+    )[0] == "unroutable"
+    # A known pull lane is not a Hermes profile and is invalid for agent labels.
+    assert lb.classify_linear_labels(["agent:fable"], BCFG)[0] == "unroutable"
+    assert lb.classify_linear_labels(["agent:"], BCFG)[0] == "unroutable"
+    assert lb.classify_linear_labels(["agentish:ghost"], BCFG) == (
+        "unlabeled", None, []
+    )
+    assert lb.classify_linear_labels(
+        ["agent:ghost", "agent:patch"], BCFG
+    )[0] == "unroutable"
 
 
 def test_tick_buckets_and_dedup(kanban_home):
     issues = [
-        _issue("BUI-1", "bridge me", "fable@2rook.ai"),
-        _issue("BUI-2", "human task", "lray24@gmail.com"),
-        _issue("BUI-3", "no assignee", None),
-        _issue("BUI-4", "unknown agent", "codex@oauthapp.linear.app"),
-        _issue("BUI-5", "already started", "fable@2rook.ai", state_type="started"),
+        _issue("BUI-1", "bridge me", ["agent:ghost"]),
+        _issue("BUI-2", "no routing label"),
+        _issue("BUI-3", "ordinary label only", ["Bug"]),
+        _issue("BUI-4", "unknown agent", ["agent:no-such-agent"]),
+        _issue(
+            "BUI-5", "already started", ["agent:ghost"],
+            state_type="started",
+        ),
+        _issue("BUI-6", "conflicting routes", ["agent:ghost", "agent:patch"]),
     ]
     r1 = lb.run_bridge_tick(BCFG, issues=issues, now=int(time.time()))
     assert r1["ok"] is True
     assert [c["identifier"] for c in r1["would_create"]] == ["BUI-1"]
-    assert r1["would_create"][0]["hermes_assignee"] == "fable"
+    assert r1["would_create"][0]["hermes_assignee"] == "ghost"
+    assert r1["would_create"][0]["routing_label"] == "agent:ghost"
     assert r1["would_create"][0]["planned_idempotency_key"] == "linear:BUI-1"
-    assert [u["identifier"] for u in r1["unroutable"]] == ["BUI-4"]
-    assert r1["skipped_human"] == 1
-    assert r1["skipped_unassigned"] == 1
+    assert [u["identifier"] for u in r1["unroutable"]] == ["BUI-4", "BUI-6"]
+    assert r1["skipped_unlabeled"] == 2
     assert r1["skipped_status"] == 1
     assert r1["already_seen"] == 0
 
@@ -107,7 +113,26 @@ def test_tick_buckets_and_dedup(kanban_home):
     assert r2["would_create"] == []
     assert r2["already_seen"] == 1
     # Unroutable stays loud every tick until fixed — it must not "dedup away".
-    assert [u["identifier"] for u in r2["unroutable"]] == ["BUI-4"]
+    assert [u["identifier"] for u in r2["unroutable"]] == ["BUI-4", "BUI-6"]
+
+
+def test_linear_query_reads_labels_not_assignee():
+    assert "labels { nodes { name } }" in lb._ISSUES_QUERY
+    assert "assignee" not in lb._ISSUES_QUERY.casefold()
+
+
+def test_dedup_uses_linear_issue_id(kanban_home):
+    first = _issue(
+        "BUI-10", "first title", ["agent:ghost"], iid="linear-uuid-stable"
+    )
+    renamed = _issue(
+        "BUI-999", "renamed issue", ["agent:ghost"], iid="linear-uuid-stable"
+    )
+    r1 = lb.run_bridge_tick(BCFG, issues=[first], now=1)
+    assert [card["identifier"] for card in r1["would_create"]] == ["BUI-10"]
+    r2 = lb.run_bridge_tick(BCFG, issues=[renamed], now=2)
+    assert r2["would_create"] == []
+    assert r2["already_seen"] == 1
 
 
 def test_dry_run_creates_no_kanban_cards(kanban_home):
@@ -115,7 +140,11 @@ def test_dry_run_creates_no_kanban_cards(kanban_home):
     before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
     conn.close()
 
-    lb.run_bridge_tick(BCFG, issues=[_issue("BUI-9", "would-be card", "fable@2rook.ai")])
+    report = lb.run_bridge_tick(
+        BCFG,
+        issues=[_issue("BUI-9", "would-be card", ["agent:ghost"])],
+    )
+    assert report["would_create"][0]["hermes_assignee"] == "ghost"
 
     conn = kb.connect(board="default")
     after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
@@ -150,7 +179,9 @@ def test_key_resolution_order(kanban_home, monkeypatch, tmp_path):
 
 def test_non_dry_run_refuses(kanban_home):
     cfg = dict(BCFG, dry_run=False)
-    report = lb.run_bridge_tick(cfg, issues=[_issue("BUI-1", "x", "fable@2rook.ai")])
+    report = lb.run_bridge_tick(
+        cfg, issues=[_issue("BUI-1", "x", ["agent:ghost"])]
+    )
     assert report["ok"] is False
     assert "not implemented" in report["error"]
     assert report["would_create"] == []
