@@ -1318,11 +1318,11 @@ class GatewayKanbanWatchersMixin:
         logger.info(
             "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval
         )
-        # Linear -> Kanban bridge (dry-run stage). Read once at watcher start
-        # like the rest of kanban_cfg. Living INSIDE this loop is the gating:
-        # only the dispatcher-lock-holding gateway runs the tick loop, so
-        # only the lock holder ever polls Linear — and a standby that takes
-        # over the lock starts polling on its next tick automatically.
+        # Linear -> Kanban bridge. Read once at watcher start like the rest of
+        # kanban_cfg. Living INSIDE this loop is the gating: only the
+        # dispatcher-lock-holding gateway runs the tick loop, so only the lock
+        # holder ever polls Linear — and a standby that takes over the lock
+        # starts polling on its next tick automatically.
         _lb_cfg = kanban_cfg.get("linear_bridge", {}) if isinstance(kanban_cfg, dict) else {}
         _lb_enabled = bool(_lb_cfg.get("enabled", False)) if isinstance(_lb_cfg, dict) else False
         try:
@@ -1421,10 +1421,10 @@ class GatewayKanbanWatchersMixin:
                             len(unroutable_ids), unroutable_ids[:10],
                         )
                         _last_unroutable_warn = now
-                # Linear -> Kanban bridge poll (dry-run stage). Best-effort:
-                # a bridge failure must never break dispatch. In this stage
-                # the bridge only REPORTS what it would create — the module
-                # contains no card-creation call at all.
+                # Linear -> Kanban bridge poll. Best-effort: a bridge failure
+                # must never break dispatch. With dry_run=true it only reports
+                # would-create cards; with dry_run=false it creates cards via
+                # the bridge's Linear idempotency key.
                 if _lb_enabled:
                     _lb_now = time.time()
                     if _lb_now - _lb_last_poll >= _lb_poll_every:
@@ -1435,13 +1435,19 @@ class GatewayKanbanWatchersMixin:
                             _lb_report = await asyncio.to_thread(
                                 _lb.run_bridge_tick, _lb_cfg,
                             )
-                            if _lb_report.get("would_create") or _lb_report.get("unroutable"):
+                            if (
+                                _lb_report.get("would_create")
+                                or _lb_report.get("created")
+                                or _lb_report.get("unroutable")
+                            ):
                                 logger.info(
-                                    "linear bridge tick: would_create=%d unroutable=%d "
-                                    "already_seen=%d (dry-run; nothing was created)",
+                                    "linear bridge tick: would_create=%d created=%d "
+                                    "unroutable=%d already_seen=%d dry_run=%s",
                                     len(_lb_report.get("would_create") or []),
+                                    len(_lb_report.get("created") or []),
                                     len(_lb_report.get("unroutable") or []),
                                     _lb_report.get("already_seen", 0),
+                                    bool(_lb_cfg.get("dry_run", True)),
                                 )
                         except Exception:
                             logger.warning(

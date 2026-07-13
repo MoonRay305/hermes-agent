@@ -1,15 +1,14 @@
-"""Tests for the Linear -> Kanban bridge (dry-run stage).
+"""Tests for the Linear -> Kanban bridge.
 
 Everything runs against injected issue fixtures and a temp kanban home — no
 network, no live board. The load-bearing assertions:
 
   * reference-label classification is explicit and fail-loud (no label skips;
     unknown/conflicting agent labels are UNROUTABLE every tick);
-  * dedup on Linear issue id across ticks;
-  * the dry-run tick NEVER writes a kanban card (board row count unchanged),
-    and the module contains no task-creation call at all;
-  * key resolution: process env, then ~/.hermes/.env, else fail loud;
-  * dry_run=false refuses (this stage has no action path to fall through to).
+  * dry-run dedup on Linear issue id across ticks without writing cards;
+  * dry_run=false creates Kanban cards with DB-level idempotency;
+  * dry-run seen entries do not suppress a later live create;
+  * key resolution: process env, then ~/.hermes/.env, else fail loud.
 """
 
 from __future__ import annotations
@@ -135,10 +134,19 @@ def test_dedup_uses_linear_issue_id(kanban_home):
     assert r2["already_seen"] == 1
 
 
-def test_dry_run_creates_no_kanban_cards(kanban_home):
+def _all_tasks():
     conn = kb.connect(board="default")
-    before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
-    conn.close()
+    try:
+        return conn.execute(
+            "SELECT id, title, body, assignee, status, idempotency_key "
+            "FROM tasks ORDER BY created_at, id"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def test_dry_run_creates_no_kanban_cards(kanban_home):
+    before = len(_all_tasks())
 
     report = lb.run_bridge_tick(
         BCFG,
@@ -146,17 +154,8 @@ def test_dry_run_creates_no_kanban_cards(kanban_home):
     )
     assert report["would_create"][0]["hermes_assignee"] == "ghost"
 
-    conn = kb.connect(board="default")
-    after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
-    conn.close()
+    after = len(_all_tasks())
     assert before == after == 0, "dry-run must not create kanban cards"
-
-    # Structural guarantee: no task-creation call exists in the module.
-    src = Path(lb.__file__).read_text(encoding="utf-8")
-    body = "\n".join(
-        line for line in src.splitlines() if not line.lstrip().startswith(("#", '"', "'"))
-    )
-    assert "create_task" not in body.replace("``create_task``", "")
 
 
 def test_key_resolution_order(kanban_home, monkeypatch, tmp_path):
@@ -177,11 +176,56 @@ def test_key_resolution_order(kanban_home, monkeypatch, tmp_path):
     assert "key missing" in report["error"]
 
 
-def test_non_dry_run_refuses(kanban_home):
+def test_non_dry_run_creates_kanban_card_once(kanban_home):
     cfg = dict(BCFG, dry_run=False)
-    report = lb.run_bridge_tick(
-        cfg, issues=[_issue("BUI-1", "x", ["agent:ghost"])]
-    )
-    assert report["ok"] is False
-    assert "not implemented" in report["error"]
+    issue = _issue("BUI-1", "ship live bridge", ["agent:ghost"])
+
+    report = lb.run_bridge_tick(cfg, issues=[issue], now=11)
+
+    assert report["ok"] is True
     assert report["would_create"] == []
+    assert report["created"] == [
+        {
+            "identifier": "BUI-1",
+            "linear_issue_id": "uuid-BUI-1",
+            "kanban_task_id": report["created"][0]["kanban_task_id"],
+            "title": "ship live bridge",
+            "hermes_assignee": "ghost",
+            "routing_label": "agent:ghost",
+            "idempotency_key": "linear:BUI-1",
+        }
+    ]
+
+    tasks = _all_tasks()
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert task["title"] == "ship live bridge"
+    assert task["assignee"] == "ghost"
+    assert task["status"] == "ready"
+    assert task["idempotency_key"] == "linear:BUI-1"
+    assert "Linear: BUI-1" in task["body"]
+    assert "https://linear.app/x/issue/BUI-1" in task["body"]
+
+    second = lb.run_bridge_tick(cfg, issues=[issue], now=12)
+    assert second["created"] == []
+    assert second["already_seen"] == 1
+    assert len(_all_tasks()) == 1
+
+    # Even if the JSON seen-store is lost, the Kanban DB idempotency key is
+    # the final duplicate-creation guard.
+    lb.save_seen({})
+    third = lb.run_bridge_tick(cfg, issues=[issue], now=13)
+    assert third["created"][0]["kanban_task_id"] == task["id"]
+    assert len(_all_tasks()) == 1
+
+
+def test_dry_run_seen_entry_does_not_suppress_later_live_create(kanban_home):
+    issue = _issue("BUI-2", "dry then live", ["agent:ghost"])
+    dry = lb.run_bridge_tick(BCFG, issues=[issue], now=21)
+    assert [card["identifier"] for card in dry["would_create"]] == ["BUI-2"]
+    assert len(_all_tasks()) == 0
+
+    live = lb.run_bridge_tick(dict(BCFG, dry_run=False), issues=[issue], now=22)
+    assert [card["identifier"] for card in live["created"]] == ["BUI-2"]
+    assert live["already_seen"] == 0
+    assert len(_all_tasks()) == 1
