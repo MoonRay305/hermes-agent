@@ -2766,7 +2766,7 @@ DEFAULT_CONFIG = {
             "enabled": False,
             # Safety switch. True = report "WOULD CREATE Kanban card: ..." and
             # create nothing. False = create/reretrieve Kanban cards using
-            # idempotency_key="linear:<identifier>" for DB-level dedup.
+            # idempotency_key="linear:<Linear UUID>" for DB-level dedup.
             "dry_run": True,
             # Seconds between Linear polls (enforced across dispatch ticks).
             "poll_interval_seconds": 300,
@@ -2795,9 +2795,8 @@ DEFAULT_CONFIG = {
             "allowed_profiles": [],
             # Safe live-mode blast-radius cap per poll/dispatch tick. Dry-run
             # is intentionally uncapped so operators can see all candidates.
-            # Live bridge defaults to at most three card creates unless an
-            # explicit issue_id_allowlist names the Linear issues/UUIDs to pull.
-            "max_creates_per_tick": 3,
+            # Live bridge defaults to at most one card create.
+            "max_creates_per_tick": 1,
             "issue_id_allowlist": [],
         },
     },

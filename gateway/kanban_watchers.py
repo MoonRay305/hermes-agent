@@ -1318,17 +1318,34 @@ class GatewayKanbanWatchersMixin:
         logger.info(
             "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval
         )
-        # Linear -> Kanban bridge. Read once at watcher start like the rest of
-        # kanban_cfg. Living INSIDE this loop is the gating: only the
-        # dispatcher-lock-holding gateway runs the tick loop, so only the lock
-        # holder ever polls Linear — and a standby that takes over the lock
-        # starts polling on its next tick automatically.
-        _lb_cfg = kanban_cfg.get("linear_bridge", {}) if isinstance(kanban_cfg, dict) else {}
-        _lb_enabled = bool(_lb_cfg.get("enabled", False)) if isinstance(_lb_cfg, dict) else False
-        try:
-            _lb_poll_every = float(_lb_cfg.get("poll_interval_seconds", 300) or 300)
-        except (TypeError, ValueError):
-            _lb_poll_every = 300.0
+        # Linear -> Kanban bridge. Re-read the settings every dispatcher tick.
+        # ``enabled`` is an emergency rollback switch for a card-creating path;
+        # a live true -> false flip must take effect on the next tick without a
+        # gateway restart. Any config read/shape error therefore fails closed.
+        def _read_linear_bridge_settings() -> tuple[dict, bool, float]:
+            try:
+                fresh_config = _load_config()
+                fresh_kanban = fresh_config.get("kanban", {})
+                if not isinstance(fresh_kanban, dict):
+                    raise TypeError("kanban config must be a mapping")
+                fresh_bridge = fresh_kanban.get("linear_bridge", {})
+                if not isinstance(fresh_bridge, dict):
+                    raise TypeError("kanban.linear_bridge must be a mapping")
+                enabled = bool(fresh_bridge.get("enabled", False))
+                try:
+                    poll_every = float(
+                        fresh_bridge.get("poll_interval_seconds", 300) or 300
+                    )
+                except (TypeError, ValueError):
+                    poll_every = 300.0
+                return fresh_bridge, enabled, max(poll_every, 0.0)
+            except Exception:
+                logger.exception(
+                    "linear bridge: config reload failed; disabling live bridge "
+                    "for this dispatcher tick"
+                )
+                return {}, False, 300.0
+
         _lb_last_poll = 0.0
         _tick_count = 0
         _last_unroutable_warn = 0
@@ -1342,7 +1359,9 @@ class GatewayKanbanWatchersMixin:
                     _kb.write_dispatcher_heartbeat, _tick_count, interval,
                 )
             except Exception:
-                logger.debug("kanban dispatcher: heartbeat write skipped", exc_info=True)
+                logger.debug(
+                    "kanban dispatcher: heartbeat write skipped", exc_info=True
+                )
             try:
                 # Reap zombie children before per-board work so a board DB
                 # failure cannot block cleanup of unrelated workers.
@@ -1366,6 +1385,9 @@ class GatewayKanbanWatchersMixin:
                 # Linear -> Kanban bridge poll. Best-effort: a bridge failure
                 # must never break dispatch. Run before normal dispatch so
                 # newly created Kanban cards can be claimed in the same tick.
+                _lb_cfg, _lb_enabled, _lb_poll_every = (
+                    _read_linear_bridge_settings()
+                )
                 if _lb_enabled:
                     _lb_now = time.time()
                     if _lb_now - _lb_last_poll >= _lb_poll_every:
@@ -1395,6 +1417,11 @@ class GatewayKanbanWatchersMixin:
                                 "linear bridge tick failed (dispatch unaffected)",
                                 exc_info=True,
                             )
+                else:
+                    # Re-enable should poll immediately; more importantly, a
+                    # live true -> false rollback must stop before this tick's
+                    # normal dispatcher work begins.
+                    _lb_last_poll = 0.0
                 results = await asyncio.to_thread(_tick_once)
                 any_spawned = False
                 for slug, res in (results or []):

@@ -134,6 +134,48 @@ def test_dispatcher_watcher_does_not_poll_linear_when_bridge_disabled(monkeypatc
     mock_linear_tick.assert_not_called()
 
 
+def test_dispatcher_watcher_live_disable_flip_stops_next_tick(monkeypatch):
+    """A true -> false config flip stops bridge polling without a restart."""
+    runner = _make_runner()
+    sleep_calls = []
+    config_reads = 0
+
+    def changing_config():
+        nonlocal config_reads
+        config_reads += 1
+        return _dispatcher_config(linear_enabled=(config_reads == 1))
+
+    async def fake_sleep(delay):
+        sleep_calls.append(delay)
+        if len(sleep_calls) >= 2:
+            runner._running = False
+
+    async def fake_to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    import hermes_cli.kanban_db as _kb
+
+    with patch("hermes_cli.config.load_config", side_effect=changing_config):
+        with patch(
+            "gateway.kanban_watchers._acquire_singleton_lock",
+            return_value=(None, "unavailable"),
+        ):
+            with patch.object(_kb, "list_boards", return_value=[]):
+                with patch.object(_kb, "write_dispatcher_heartbeat"):
+                    with patch.object(_kb, "reap_worker_zombies", return_value=[]):
+                        with patch(
+                            "gateway.linear_bridge.run_bridge_tick"
+                        ) as mock_linear_tick:
+                            with patch("asyncio.sleep", side_effect=fake_sleep):
+                                with patch(
+                                    "asyncio.to_thread", side_effect=fake_to_thread
+                                ):
+                                    asyncio.run(runner._kanban_dispatcher_watcher())
+
+    assert config_reads >= 2
+    mock_linear_tick.assert_not_called()
+
+
 def test_dispatcher_tick_runs_linear_bridge_best_effort_before_dispatch(tmp_path):
     """A lock-owning dispatcher tick polls Linear before normal dispatch.
 
