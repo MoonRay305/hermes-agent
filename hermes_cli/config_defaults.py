@@ -2322,6 +2322,9 @@ DEFAULT_CONFIG = {
             "status_types": ["unstarted"],
             "api_key_env": "LINEAR_API_KEY",
             "routing_label_prefix": "agent:",
+            "allowed_profiles": [],
+            "max_creates_per_tick": 1,
+            "issue_id_allowlist": [],
         },
     },
 
