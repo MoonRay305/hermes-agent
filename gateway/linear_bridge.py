@@ -1,11 +1,10 @@
-"""Linear -> Kanban bridge (DRY-RUN stage).
+"""Linear -> Kanban bridge.
 
 Mirrors Linear issues that carry an explicit ``agent:<profile>`` routing label
 onto the kanban board, so Linear remains the reference plane while Kanban stays
-the fleet's single execution-authority plane. This module is the polling and
-reference-classification half; it is called from the gateway's embedded
-dispatcher tick loop
-(``gateway/kanban_watchers.py``), which means:
+the fleet's single execution-authority plane. This module is called from the
+gateway's embedded dispatcher tick loop (``gateway/kanban_watchers.py``), which
+means:
 
   * Only the dispatcher-LOCK-HOLDING gateway ever polls Linear — the exact
     same single-poller gating kanban dispatch itself relies on. A standby
@@ -13,14 +12,13 @@ dispatcher tick loop
   * A bridge failure must never break dispatch: the caller wraps the tick in
     a broad try/except, and everything here is best-effort with loud logs.
 
-THIS STAGE IS DRY-RUN BY CONSTRUCTION. The module reports the kanban cards it
-WOULD create and creates none: there is intentionally NO import of, or call
-to, any task-creation API anywhere in this file (grep for ``create_task`` —
-absent). Setting ``kanban.linear_bridge.dry_run`` to false does not unlock an
-action path; it logs a refusal, because proving the mapping correct comes
-before letting it act. The create path arrives in a later stage, and will use
-``idempotency_key="linear:<identifier>"`` for DB-level dedup on top of the
-seen-store here.
+``kanban.linear_bridge.dry_run`` defaults true and only reports cards it WOULD
+create. When set false, mapped issues create Kanban cards via ``create_task``
+with ``idempotency_key="linear:<issue-uuid>"`` so a retried poll cannot create
+duplicates. Live mode has a safe default cap of one create per tick. The
+optional ``issue_id_allowlist`` is Linear UUID-only and filters candidates; it
+never bypasses the live cap. The seen-store remains a cheap poll-level skip,
+while DB-level idempotency is the final safety rail.
 
 Routing is reference-based, never assignee-based. Exactly one
 ``agent:<profile>`` label resolves to a real Hermes profile; no routing label
@@ -37,6 +35,7 @@ import time
 import urllib.request
 from pathlib import Path
 from typing import Any, Optional
+from uuid import UUID
 
 logger = logging.getLogger("gateway.linear_bridge")
 
@@ -149,6 +148,18 @@ def classify_linear_labels(
     target = routing_labels[0][len(prefix):].strip().casefold()
     if not target:
         return "unroutable", None, routing_labels
+    allowed_profiles_raw = bcfg.get("allowed_profiles")
+    if allowed_profiles_raw:
+        try:
+            allowed_profiles = {
+                str(profile).strip().casefold()
+                for profile in allowed_profiles_raw
+                if str(profile).strip()
+            }
+        except TypeError:
+            return "unroutable", None, routing_labels
+        if target not in allowed_profiles:
+            return "unroutable", None, routing_labels
     try:
         from hermes_cli.kanban_db import classify_assignee
 
@@ -197,6 +208,142 @@ def save_seen(seen: "dict[str, dict]") -> None:
         logger.warning("linear bridge: seen-store write failed", exc_info=True)
 
 
+def _task_body_for_linear_issue(issue: dict, routing_label: str) -> str:
+    ident = str(issue.get("identifier") or issue.get("id") or "?")
+    issue_uuid = _linear_issue_uuid(issue)
+    title = str(issue.get("title") or "").strip()
+    url = str(issue.get("url") or "").strip()
+    state = (issue.get("state") or {}) if isinstance(issue.get("state"), dict) else {}
+    state_name = str(state.get("name") or "").strip()
+    state_type = str(state.get("type") or "").strip()
+    team = (issue.get("team") or {}) if isinstance(issue.get("team"), dict) else {}
+    team_key = str(team.get("key") or "").strip()
+    priority = issue.get("priority")
+    lines = [
+        f"Linear: {ident}",
+        f"Linear UUID: {issue_uuid}",
+        f"Title: {title}" if title else None,
+        f"URL: {url}" if url else None,
+        f"Team: {team_key}" if team_key else None,
+        f"State: {state_name} ({state_type})" if state_name or state_type else None,
+        f"Priority: {priority}" if priority is not None else None,
+        f"Routing label: {routing_label}",
+        "",
+        "This Kanban card was created automatically from Linear by the Linear -> Kanban bridge.",
+    ]
+    return "\n".join(line for line in lines if line is not None)
+
+
+def _linear_issue_uuid(issue: dict) -> str:
+    """Return the canonical Linear UUID for an issue, or fail loud."""
+    raw_id = str(issue.get("id") or "").strip()
+    if not raw_id:
+        raise ValueError("missing Linear issue UUID")
+    try:
+        return str(UUID(raw_id))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid Linear issue UUID: {raw_id!r}") from exc
+
+
+def _linear_issue_idempotency_key(issue: dict) -> str:
+    """Stable Kanban idempotency key for a Linear issue.
+
+    Linear identifiers like ``BUI-123`` can change if an issue is moved between
+    teams. The issue UUID is stable, so it is the DB-level duplicate guard.
+    """
+    return f"linear:{_linear_issue_uuid(issue)}"
+
+
+def _parse_issue_id_allowlist(raw_allowlist: Any) -> "tuple[Optional[set[str]], Optional[str]]":
+    if raw_allowlist in (None, ""):
+        raw_allowlist = []
+    if isinstance(raw_allowlist, str):
+        allowlist_values = [item.strip() for item in raw_allowlist.split(",")]
+    elif isinstance(raw_allowlist, (list, tuple, set)):
+        allowlist_values = [str(item).strip() for item in raw_allowlist]
+    else:
+        return None, "invalid issue_id_allowlist"
+
+    issue_id_allowlist: set[str] = set()
+    for item in allowlist_values:
+        if not item:
+            continue
+        try:
+            issue_id_allowlist.add(str(UUID(item)))
+        except (TypeError, ValueError):
+            return None, "invalid issue_id_allowlist"
+    return issue_id_allowlist, None
+
+
+def _parse_live_create_cap(bcfg: dict) -> "tuple[Optional[int], Optional[str]]":
+    if "max_creates_per_tick" not in bcfg:
+        return 1, None
+    raw_cap = bcfg.get("max_creates_per_tick")
+    if isinstance(raw_cap, bool) or raw_cap is None:
+        return None, "invalid max_creates_per_tick"
+    if isinstance(raw_cap, int):
+        cap = raw_cap
+    elif isinstance(raw_cap, str):
+        stripped = raw_cap.strip()
+        if not stripped.isdecimal():
+            return None, "invalid max_creates_per_tick"
+        cap = int(stripped)
+    else:
+        return None, "invalid max_creates_per_tick"
+    if cap < 1:
+        return None, "invalid max_creates_per_tick"
+    return cap, None
+
+
+def _existing_kanban_task_id(conn: Any, idempotency_key: str) -> Optional[str]:
+    row = conn.execute(
+        "SELECT id FROM tasks WHERE idempotency_key = ? "
+        "AND status != 'archived' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (idempotency_key,),
+    ).fetchone()
+    return str(row["id"]) if row else None
+
+
+def _create_kanban_card_for_issue(
+    issue: dict,
+    *,
+    assignee: str,
+    routing_label: str,
+    bcfg: dict,
+) -> "tuple[str, bool]":
+    """Create (or idempotently retrieve) the Kanban task for a Linear issue.
+
+    Returns ``(task_id, duplicate)``. ``duplicate`` is true when the Kanban DB
+    already had a non-archived task for this Linear UUID before this tick.
+    """
+    from hermes_cli import kanban_db as kb
+
+    ident = str(issue.get("identifier") or issue.get("id") or "?")
+    title = str(issue.get("title") or ident).strip() or ident
+    idempotency_key = _linear_issue_idempotency_key(issue)
+    board = bcfg.get("board")
+    board = str(board).strip() if board else None
+    conn = kb.connect(board=board)
+    try:
+        existing_task_id = _existing_kanban_task_id(conn, idempotency_key)
+        if existing_task_id:
+            return existing_task_id, True
+        task_id = kb.create_task(
+            conn,
+            title=title,
+            body=_task_body_for_linear_issue(issue, routing_label),
+            assignee=assignee,
+            created_by="linear_bridge",
+            idempotency_key=idempotency_key,
+            validate_assignee=True,
+            board=board,
+        )
+        return task_id, False
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Linear fetch (read-only)
 # ---------------------------------------------------------------------------
@@ -233,7 +380,7 @@ def fetch_issues(api_key: str, team_keys: "list[str]") -> "list[dict]":
 
 
 # ---------------------------------------------------------------------------
-# The tick (DRY-RUN ONLY in this stage)
+# The tick
 # ---------------------------------------------------------------------------
 
 def run_bridge_tick(
@@ -242,35 +389,46 @@ def run_bridge_tick(
     issues: "Optional[list[dict]]" = None,
     now: Optional[int] = None,
 ) -> dict:
-    """Run one bridge poll and return a structured report. CREATES NOTHING.
+    """Run one bridge poll and return a structured report.
 
     ``issues`` may be injected (tests / offline dry-runs against pre-fetched
     Linear data); otherwise they are fetched live with the resolved key.
 
     Report shape:
-      {"ok": bool, "would_create": [...], "unroutable": [...],
-       "skipped_unlabeled": int, "skipped_status": int,
-       "already_seen": int, "error": str|None}
+      {"ok": bool, "would_create": [...], "created": [...],
+       "duplicates": [...], "unroutable": [...], "skipped_unlabeled": int,
+       "skipped_status": int, "skipped_allowlist": int, "skipped_cap": int,
+       "already_seen": int, "invalid_issue_ids": [...], "error": str|None}
     """
     bcfg = bcfg if bcfg is not None else bridge_config()
+    dry_run = bool(bcfg.get("dry_run", True))
     now = int(now if now is not None else time.time())
     report: dict[str, Any] = {
-        "ok": True, "would_create": [], "unroutable": [],
-        "skipped_unlabeled": 0, "skipped_status": 0,
-        "already_seen": 0, "error": None,
+        "ok": True, "would_create": [], "created": [], "duplicates": [],
+        "unroutable": [], "skipped_unlabeled": 0, "skipped_status": 0,
+        "skipped_allowlist": 0, "skipped_cap": 0, "already_seen": 0,
+        "invalid_issue_ids": [], "disabled": False, "error": None,
     }
 
-    if not bool(bcfg.get("dry_run", True)):
-        # This stage implements ONLY dry-run. Refuse loudly rather than act:
-        # there is no action path in this module to fall through to.
-        logger.critical(
-            "linear bridge: dry_run=false requested but this build implements "
-            "DRY-RUN ONLY — no card is created. Leave dry_run=true until the "
-            "create stage ships."
-        )
-        report["ok"] = False
-        report["error"] = "non-dry-run not implemented in this stage"
+    if not bool(bcfg.get("enabled", False)):
+        report["disabled"] = True
         return report
+
+    issue_id_allowlist, allowlist_error = _parse_issue_id_allowlist(
+        bcfg.get("issue_id_allowlist", [])
+    )
+    if allowlist_error is not None or issue_id_allowlist is None:
+        report["ok"] = False
+        report["error"] = allowlist_error or "invalid issue_id_allowlist"
+        return report
+
+    max_creates_per_tick: Optional[int] = None
+    if not dry_run:
+        max_creates_per_tick, cap_error = _parse_live_create_cap(bcfg)
+        if cap_error is not None or max_creates_per_tick is None:
+            report["ok"] = False
+            report["error"] = cap_error or "invalid max_creates_per_tick"
+            return report
 
     if issues is None:
         key, source = resolve_linear_api_key(bcfg)
@@ -334,29 +492,112 @@ def run_bridge_tick(
                 ident, entry["title"], routing_labels,
             )
             continue
-        issue_id = str(issue.get("id") or ident)
-        if issue_id in seen:
+        try:
+            issue_id = _linear_issue_uuid(issue)
+        except ValueError as exc:
+            entry = {
+                "identifier": ident,
+                "title": str(issue.get("title") or "")[:80],
+                "error": str(exc),
+            }
+            report["invalid_issue_ids"].append(entry)
+            report["ok"] = False
+            msg = f"invalid Linear issue UUID for {ident}: {exc}"
+            report["error"] = msg if not report["error"] else f"{report['error']}; {msg}"
+            logger.warning(
+                "linear bridge: %s has no valid Linear UUID; it will NOT be "
+                "bridged or marked seen until Linear returns a stable UUID. "
+                "(fail-loud every poll)",
+                ident,
+            )
+            continue
+        if issue_id_allowlist and issue_id not in issue_id_allowlist:
+            report["skipped_allowlist"] += 1
+            continue
+        seen_entry = seen.get(issue_id)
+        if dry_run:
+            if seen_entry:
+                report["already_seen"] += 1
+                continue
+        elif seen_entry and not bool(seen_entry.get("dry_run", False)):
             report["already_seen"] += 1
             continue
+        idempotency_key = _linear_issue_idempotency_key(issue)
         card = {
             "identifier": ident,
             "linear_id": issue_id,
             "title": str(issue.get("title") or "")[:200],
             "url": issue.get("url"),
             "hermes_assignee": hermes_assignee,
+
             "routing_label": routing_labels[0],
             "state": (issue.get("state") or {}).get("name"),
             "priority": issue.get("priority"),
-            # The future create stage keys DB-level dedup on this:
-            "planned_idempotency_key": f"linear:{ident}",
+            "planned_idempotency_key": idempotency_key,
         }
-        report["would_create"].append(card)
-        new_seen_entries[issue_id] = {"identifier": ident, "first_seen": now, "dry_run": True}
+        if dry_run:
+            report["would_create"].append(card)
+            new_seen_entries[issue_id] = {
+                "identifier": ident,
+                "first_seen": now,
+                "dry_run": True,
+            }
+            logger.info(
+                "linear bridge DRY-RUN: WOULD CREATE Kanban card: %s %r -> "
+                "assignee=%s via label=%s (idempotency_key=%s). No card was created.",
+                ident, card["title"][:60], hermes_assignee,
+                card["routing_label"], idempotency_key,
+            )
+            continue
+
+        if max_creates_per_tick is not None and len(report["created"]) >= max_creates_per_tick:
+            report["skipped_cap"] += 1
+            continue
+
+        try:
+            task_id, duplicate = _create_kanban_card_for_issue(
+                issue,
+                assignee=str(hermes_assignee),
+                routing_label=routing_labels[0],
+                bcfg=bcfg,
+            )
+        except Exception as exc:
+            logger.warning(
+                "linear bridge: failed to create Kanban card for %s: %s",
+                ident, exc,
+                exc_info=True,
+            )
+            report["ok"] = False
+            msg = f"create failed for {ident}: {exc}"
+            report["error"] = msg if not report["error"] else f"{report['error']}; {msg}"
+            continue
+
+        created_card = {
+            "identifier": ident,
+            "linear_issue_id": issue_id,
+            "kanban_task_id": task_id,
+            "title": card["title"],
+            "hermes_assignee": hermes_assignee,
+            "routing_label": routing_labels[0],
+            "idempotency_key": idempotency_key,
+        }
+        if duplicate:
+            report["duplicates"].append(created_card)
+        else:
+            report["created"].append(created_card)
+        new_seen_entries[issue_id] = {
+            "identifier": ident,
+            "first_seen": (seen_entry or {}).get("first_seen", now),
+            "bridged_at": now,
+            "dry_run": False,
+            "kanban_task_id": task_id,
+            "idempotency_key": idempotency_key,
+        }
         logger.info(
-            "linear bridge DRY-RUN: WOULD CREATE Kanban card: %s %r -> "
-            "assignee=%s via label=%s (idempotency_key=%s). No card was created.",
-            ident, card["title"][:60], hermes_assignee,
-            card["routing_label"], card["planned_idempotency_key"],
+            "linear bridge: ensured Kanban card: %s %r -> task=%s assignee=%s "
+            "via label=%s (idempotency_key=%s).",
+            ident, card["title"][:60], task_id, hermes_assignee,
+            routing_labels[0], idempotency_key,
         )
 
     if new_seen_entries:

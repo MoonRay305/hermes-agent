@@ -2755,7 +2755,7 @@ DEFAULT_CONFIG = {
         # Heartbeat staleness threshold (seconds) before a standby calls the
         # holder hung. 0 = auto (5×dispatch_interval_seconds, min 60).
         "dispatcher_takeover_stale_seconds": 0,
-        # --- Linear -> Kanban bridge (dry-run stage; inert by default) -----
+        # --- Linear -> Kanban bridge (inert by default) -------------------
         # Mirrors Linear issues carrying an explicit agent:<profile> routing
         # label onto the kanban board so Linear stays the reference plane and
         # Kanban remains the sole execution-authority plane. Runs inside the
@@ -2764,10 +2764,9 @@ DEFAULT_CONFIG = {
         "linear_bridge": {
             # Master switch. False = the tick loop never touches Linear.
             "enabled": False,
-            # Dry-run: report "WOULD CREATE Kanban card: ..." and create
-            # NOTHING. This stage of the bridge implements ONLY dry-run —
-            # the create path deliberately does not exist yet, so flipping
-            # this to False logs a refusal instead of acting.
+            # Safety switch. True = report "WOULD CREATE Kanban card: ..." and
+            # create nothing. False = create/reretrieve Kanban cards using
+            # idempotency_key="linear:<Linear UUID>" for DB-level dedup.
             "dry_run": True,
             # Seconds between Linear polls (enforced across dispatch ticks).
             "poll_interval_seconds": 300,
@@ -2790,6 +2789,15 @@ DEFAULT_CONFIG = {
             # are ignored. Example labels: agent:ghost, agent:peewee,
             # agent:patch, agent:squiddy.
             "routing_label_prefix": "agent:",
+            # Optional safety allowlist. When non-empty, agent:<profile> labels
+            # only route if <profile> is listed here; otherwise all valid
+            # Hermes profiles are accepted.
+            "allowed_profiles": [],
+            # Safe live-mode blast-radius cap per poll/dispatch tick. Dry-run
+            # is intentionally uncapped so operators can see all candidates.
+            # Live bridge defaults to at most one card create.
+            "max_creates_per_tick": 1,
+            "issue_id_allowlist": [],
         },
     },
 
