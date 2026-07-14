@@ -125,9 +125,14 @@ Before any mutation, verify all metadata against live sources:
 3. Query Linear labels and require an exact existing `agent:<profile>` label before applying it.
 4. Run `hermes profile list` and require the exact profile to exist.
 5. Inspect the current `kanban.linear_bridge` configuration with `hermes config` or the current runtime config source. Confirm:
+   - `enabled` is `true`;
+   - `dry_run` is `false` for actual dispatch (dry-run mode is not live routing);
    - `routing_label_prefix` accepts `agent:`;
    - `team_keys` includes `BUI` or is intentionally unrestricted;
-   - the selected immediate-execution state type appears in `status_types` (currently `unstarted`).
+   - the selected immediate-execution state type appears in `status_types` (currently `unstarted`);
+   - `allowed_profiles` is empty/unrestricted or contains the exact requested profile;
+   - `issue_id_allowlist` is empty for a newly created issue; and
+   - `max_creates_per_tick` is a positive integer.
 6. If any routing check fails, apply no agent label and write this in the issue body:
 
 ```text
@@ -199,7 +204,7 @@ Include expected outcomes, not commands alone:
 Use exactly one of:
 
 ```text
-ROUTING VERIFIED: agent:<profile> — Linear label exists; Hermes profile exists; bridge prefix/team/state contract verified.
+ROUTING VERIFIED: agent:<profile> — Linear label exists; Hermes profile exists; live bridge is enabled and non-dry-run; prefix/team/state/profile-allowlist/issue-allowlist/capacity gates verified.
 ```
 
 ```text
@@ -218,7 +223,7 @@ Record only non-blocking unknowns.
 
 - **Team:** Build Ops / `BUI` unless the operator explicitly specifies another verified team.
 - **Project:** only when identified and verified; never invent one.
-- **Initial state:** backlog/triage by default. Use an `unstarted` state only when the operator explicitly wants immediate bridge eligibility and the state type is accepted by the live bridge.
+- **Initial state:** backlog/triage by default. Use an `unstarted` state only when the operator explicitly wants immediate bridge eligibility and every live bridge gate in Step 7 passes.
 - **Priority:** unset unless the operator specified it or urgency was established.
 - **Labels:** verified before applying.
 - **Assignee:** none unless explicitly requested and identity mapping is verified.
@@ -246,7 +251,11 @@ For an issue to flow through the live Linear → Kanban bridge, all of these mus
 | Linear team | `BUI` |
 | Routing label | one exact, existing `agent:<profile>` label |
 | Hermes executor | exact profile exists and bridge can resolve it |
+| Bridge mode | `enabled: true` and `dry_run: false` |
+| Profile allowlist | empty/unrestricted, or contains the exact requested profile |
 | Workflow state | state `type` accepted by `kanban.linear_bridge.status_types`—currently `unstarted` |
+| Issue allowlist | empty for a newly created issue; otherwise `/spec` must not claim immediate flow |
+| Bridge capacity | `max_creates_per_tick` is a positive integer |
 | Risk gate | no unresolved gate requiring operator/specialist approval |
 
 A packet that should wait for operator approval stays in a non-accepted state such as `backlog` or `triage` deliberately. Report that it is gated; never describe it as queued for the bridge.

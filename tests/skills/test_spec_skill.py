@@ -61,8 +61,13 @@ def test_spec_skill_bridge_contract_is_complete_and_fail_closed() -> None:
         "Build Ops / `BUI`",
         "agent:<profile>",
         "hermes profile list",
+        "`enabled` is `true`",
+        "`dry_run` is `false`",
         "routing_label_prefix",
         "status_types",
+        "allowed_profiles",
+        "issue_id_allowlist",
+        "max_creates_per_tick",
         "currently `unstarted`",
         "backlog/triage by default",
     ):
