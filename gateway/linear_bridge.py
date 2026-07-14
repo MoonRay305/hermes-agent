@@ -14,9 +14,11 @@ means:
 
 ``kanban.linear_bridge.dry_run`` defaults true and only reports cards it WOULD
 create. When set false, mapped issues create Kanban cards via ``create_task``
-with ``idempotency_key="linear:<identifier>"`` so a retried poll cannot create
-duplicates. The seen-store remains a cheap poll-level skip, while DB-level
-idempotency is the final safety rail.
+with ``idempotency_key="linear:<issue-uuid>"`` so a retried poll cannot create
+duplicates. Live mode has a safe default cap of three creates per tick; use an
+explicit ``issue_id_allowlist`` to bypass that default for named Linear issue
+identifiers/UUIDs only. The seen-store remains a cheap poll-level skip, while
+DB-level idempotency is the final safety rail.
 
 Routing is reference-based, never assignee-based. Exactly one
 ``agent:<profile>`` label resolves to a real Hermes profile; no routing label
@@ -145,6 +147,18 @@ def classify_linear_labels(
     target = routing_labels[0][len(prefix):].strip().casefold()
     if not target:
         return "unroutable", None, routing_labels
+    allowed_profiles_raw = bcfg.get("allowed_profiles")
+    if allowed_profiles_raw:
+        try:
+            allowed_profiles = {
+                str(profile).strip().casefold()
+                for profile in allowed_profiles_raw
+                if str(profile).strip()
+            }
+        except TypeError:
+            return "unroutable", None, routing_labels
+        if target not in allowed_profiles:
+            return "unroutable", None, routing_labels
     try:
         from hermes_cli.kanban_db import classify_assignee
 
@@ -217,24 +231,54 @@ def _task_body_for_linear_issue(issue: dict, routing_label: str) -> str:
     return "\n".join(line for line in lines if line is not None)
 
 
+def _linear_issue_idempotency_key(issue: dict) -> str:
+    """Stable Kanban idempotency key for a Linear issue.
+
+    Linear identifiers like ``BUI-123`` can change if an issue is moved between
+    teams. The issue UUID is stable, so it is the DB-level duplicate guard.
+    """
+    issue_id = str(issue.get("id") or "").strip()
+    if issue_id:
+        return f"linear:{issue_id}"
+    ident = str(issue.get("identifier") or "?").strip() or "?"
+    return f"linear:{ident}"
+
+
+def _existing_kanban_task_id(conn: Any, idempotency_key: str) -> Optional[str]:
+    row = conn.execute(
+        "SELECT id FROM tasks WHERE idempotency_key = ? "
+        "AND status != 'archived' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (idempotency_key,),
+    ).fetchone()
+    return str(row["id"]) if row else None
+
+
 def _create_kanban_card_for_issue(
     issue: dict,
     *,
     assignee: str,
     routing_label: str,
     bcfg: dict,
-) -> str:
-    """Create (or idempotently retrieve) the Kanban task for a Linear issue."""
+) -> "tuple[str, bool]":
+    """Create (or idempotently retrieve) the Kanban task for a Linear issue.
+
+    Returns ``(task_id, duplicate)``. ``duplicate`` is true when the Kanban DB
+    already had a non-archived task for this Linear UUID before this tick.
+    """
     from hermes_cli import kanban_db as kb
 
     ident = str(issue.get("identifier") or issue.get("id") or "?")
     title = str(issue.get("title") or ident).strip() or ident
-    idempotency_key = f"linear:{ident}"
+    idempotency_key = _linear_issue_idempotency_key(issue)
     board = bcfg.get("board")
     board = str(board).strip() if board else None
     conn = kb.connect(board=board)
     try:
-        return kb.create_task(
+        existing_task_id = _existing_kanban_task_id(conn, idempotency_key)
+        if existing_task_id:
+            return existing_task_id, True
+        task_id = kb.create_task(
             conn,
             title=title,
             body=_task_body_for_linear_issue(issue, routing_label),
@@ -244,6 +288,7 @@ def _create_kanban_card_for_issue(
             validate_assignee=True,
             board=board,
         )
+        return task_id, False
     finally:
         conn.close()
 
@@ -300,17 +345,59 @@ def run_bridge_tick(
 
     Report shape:
       {"ok": bool, "would_create": [...], "created": [...],
-       "unroutable": [...], "skipped_unlabeled": int,
-       "skipped_status": int, "already_seen": int, "error": str|None}
+       "duplicates": [...], "unroutable": [...], "skipped_unlabeled": int,
+       "skipped_status": int, "skipped_allowlist": int, "skipped_cap": int,
+       "already_seen": int, "error": str|None}
     """
     bcfg = bcfg if bcfg is not None else bridge_config()
     dry_run = bool(bcfg.get("dry_run", True))
     now = int(now if now is not None else time.time())
     report: dict[str, Any] = {
-        "ok": True, "would_create": [], "created": [], "unroutable": [],
-        "skipped_unlabeled": 0, "skipped_status": 0,
-        "already_seen": 0, "error": None,
+        "ok": True, "would_create": [], "created": [], "duplicates": [],
+        "unroutable": [], "skipped_unlabeled": 0, "skipped_status": 0,
+        "skipped_allowlist": 0, "skipped_cap": 0, "already_seen": 0,
+        "error": None,
     }
+
+    raw_allowlist = bcfg.get("issue_id_allowlist") or []
+    if isinstance(raw_allowlist, str):
+        allowlist_values = [item.strip() for item in raw_allowlist.split(",")]
+    elif isinstance(raw_allowlist, (list, tuple, set)):
+        allowlist_values = [str(item).strip() for item in raw_allowlist]
+    else:
+        report["ok"] = False
+        report["error"] = "invalid issue_id_allowlist"
+        return report
+    issue_id_allowlist = {item.casefold() for item in allowlist_values if item}
+
+    max_creates_per_tick: Optional[int] = None
+    if not dry_run:
+        raw_cap = bcfg.get("max_creates_per_tick")
+        if raw_cap is None:
+            parsed_cap: Optional[int] = None
+        else:
+            try:
+                parsed_cap = int(raw_cap)
+            except (TypeError, ValueError):
+                report["ok"] = False
+                report["error"] = "invalid max_creates_per_tick"
+                return report
+            if parsed_cap < 0:
+                report["ok"] = False
+                report["error"] = "invalid max_creates_per_tick"
+                return report
+
+        if issue_id_allowlist:
+            # A merged default config includes max_creates_per_tick=3. Treat
+            # that shipped default as bypassed when an explicit issue allowlist
+            # is present; any non-default cap remains intentional and honored.
+            if parsed_cap is not None and parsed_cap != 3:
+                max_creates_per_tick = parsed_cap
+        else:
+            # Without an explicit issue allowlist, never let live mode create
+            # more than three cards per dispatcher tick, even if config drifts
+            # or an old profile still has a larger cap value.
+            max_creates_per_tick = min(parsed_cap if parsed_cap is not None else 3, 3)
 
     if issues is None:
         key, source = resolve_linear_api_key(bcfg)
@@ -375,6 +462,12 @@ def run_bridge_tick(
             )
             continue
         issue_id = str(issue.get("id") or ident)
+        if issue_id_allowlist and (
+            issue_id.casefold() not in issue_id_allowlist
+            and ident.casefold() not in issue_id_allowlist
+        ):
+            report["skipped_allowlist"] += 1
+            continue
         seen_entry = seen.get(issue_id)
         if dry_run:
             if seen_entry:
@@ -383,13 +476,14 @@ def run_bridge_tick(
         elif seen_entry and not bool(seen_entry.get("dry_run", False)):
             report["already_seen"] += 1
             continue
-        idempotency_key = f"linear:{ident}"
+        idempotency_key = _linear_issue_idempotency_key(issue)
         card = {
             "identifier": ident,
             "linear_id": issue_id,
             "title": str(issue.get("title") or "")[:200],
             "url": issue.get("url"),
             "hermes_assignee": hermes_assignee,
+
             "routing_label": routing_labels[0],
             "state": (issue.get("state") or {}).get("name"),
             "priority": issue.get("priority"),
@@ -410,8 +504,12 @@ def run_bridge_tick(
             )
             continue
 
+        if max_creates_per_tick is not None and len(report["created"]) >= max_creates_per_tick:
+            report["skipped_cap"] += 1
+            continue
+
         try:
-            task_id = _create_kanban_card_for_issue(
+            task_id, duplicate = _create_kanban_card_for_issue(
                 issue,
                 assignee=str(hermes_assignee),
                 routing_label=routing_labels[0],
@@ -437,7 +535,10 @@ def run_bridge_tick(
             "routing_label": routing_labels[0],
             "idempotency_key": idempotency_key,
         }
-        report["created"].append(created_card)
+        if duplicate:
+            report["duplicates"].append(created_card)
+        else:
+            report["created"].append(created_card)
         new_seen_entries[issue_id] = {
             "identifier": ident,
             "first_seen": (seen_entry or {}).get("first_seen", now),

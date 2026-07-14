@@ -6,8 +6,13 @@ network, no live board. The load-bearing assertions:
   * reference-label classification is explicit and fail-loud (no label skips;
     unknown/conflicting agent labels are UNROUTABLE every tick);
   * dry-run dedup on Linear issue id across ticks without writing cards;
-  * dry_run=false creates Kanban cards with DB-level idempotency;
+  * dry_run=false creates Kanban cards with DB-level UUID idempotency;
   * dry-run seen entries do not suppress a later live create;
+  * live creation is capped to a safe default and invalid caps fail closed;
+  * explicit issue-id allowlists filter live creates and can bypass the safe
+    default cap for those named issues only;
+  * routing labels can be restricted by an explicit allowed profile list;
+  * duplicate DB idempotency hits are reported separately from new creations;
   * key resolution: process env, then ~/.hermes/.env, else fail loud.
 """
 
@@ -84,6 +89,16 @@ def test_classify_routing_labels(kanban_home):
     )[0] == "unroutable"
 
 
+def test_classify_routing_labels_enforces_allowed_profiles(kanban_home):
+    (kanban_home / "profiles" / "patch").mkdir(parents=True)
+    cfg = dict(BCFG, allowed_profiles=["patch"])
+
+    assert lb.classify_linear_labels(["agent:patch"], cfg) == (
+        "mapped", "patch", ["agent:patch"]
+    )
+    assert lb.classify_linear_labels(["agent:ghost"], cfg)[0] == "unroutable"
+
+
 def test_tick_buckets_and_dedup(kanban_home):
     issues = [
         _issue("BUI-1", "bridge me", ["agent:ghost"]),
@@ -101,7 +116,7 @@ def test_tick_buckets_and_dedup(kanban_home):
     assert [c["identifier"] for c in r1["would_create"]] == ["BUI-1"]
     assert r1["would_create"][0]["hermes_assignee"] == "ghost"
     assert r1["would_create"][0]["routing_label"] == "agent:ghost"
-    assert r1["would_create"][0]["planned_idempotency_key"] == "linear:BUI-1"
+    assert r1["would_create"][0]["planned_idempotency_key"] == "linear:uuid-BUI-1"
     assert [u["identifier"] for u in r1["unroutable"]] == ["BUI-4", "BUI-6"]
     assert r1["skipped_unlabeled"] == 2
     assert r1["skipped_status"] == 1
@@ -184,6 +199,7 @@ def test_non_dry_run_creates_kanban_card_once(kanban_home):
 
     assert report["ok"] is True
     assert report["would_create"] == []
+    assert report["duplicates"] == []
     assert report["created"] == [
         {
             "identifier": "BUI-1",
@@ -192,7 +208,7 @@ def test_non_dry_run_creates_kanban_card_once(kanban_home):
             "title": "ship live bridge",
             "hermes_assignee": "ghost",
             "routing_label": "agent:ghost",
-            "idempotency_key": "linear:BUI-1",
+            "idempotency_key": "linear:uuid-BUI-1",
         }
     ]
 
@@ -202,21 +218,35 @@ def test_non_dry_run_creates_kanban_card_once(kanban_home):
     assert task["title"] == "ship live bridge"
     assert task["assignee"] == "ghost"
     assert task["status"] == "ready"
-    assert task["idempotency_key"] == "linear:BUI-1"
+    assert task["idempotency_key"] == "linear:uuid-BUI-1"
     assert "Linear: BUI-1" in task["body"]
     assert "https://linear.app/x/issue/BUI-1" in task["body"]
 
     second = lb.run_bridge_tick(cfg, issues=[issue], now=12)
     assert second["created"] == []
+    assert second["duplicates"] == []
     assert second["already_seen"] == 1
     assert len(_all_tasks()) == 1
 
     # Even if the JSON seen-store is lost, the Kanban DB idempotency key is
-    # the final duplicate-creation guard.
+    # the final duplicate-creation guard, and the report must not inflate the
+    # new-created count.
     lb.save_seen({})
     third = lb.run_bridge_tick(cfg, issues=[issue], now=13)
-    assert third["created"][0]["kanban_task_id"] == task["id"]
+    assert third["created"] == []
+    assert third["duplicates"] == [
+        {
+            "identifier": "BUI-1",
+            "linear_issue_id": "uuid-BUI-1",
+            "kanban_task_id": task["id"],
+            "title": "ship live bridge",
+            "hermes_assignee": "ghost",
+            "routing_label": "agent:ghost",
+            "idempotency_key": "linear:uuid-BUI-1",
+        }
+    ]
     assert len(_all_tasks()) == 1
+
 
 
 def test_dry_run_seen_entry_does_not_suppress_later_live_create(kanban_home):
@@ -229,3 +259,100 @@ def test_dry_run_seen_entry_does_not_suppress_later_live_create(kanban_home):
     assert [card["identifier"] for card in live["created"]] == ["BUI-2"]
     assert live["already_seen"] == 0
     assert len(_all_tasks()) == 1
+
+
+def test_live_create_respects_max_create_cap(kanban_home):
+    cfg = dict(BCFG, dry_run=False, max_creates_per_tick=2)
+    issues = [
+        _issue("BUI-20", "first", ["agent:ghost"]),
+        _issue("BUI-21", "second", ["agent:ghost"]),
+        _issue("BUI-22", "third", ["agent:ghost"]),
+    ]
+
+    report = lb.run_bridge_tick(cfg, issues=issues, now=31)
+
+    assert report["ok"] is True
+    assert [card["identifier"] for card in report["created"]] == ["BUI-20", "BUI-21"]
+    assert report["skipped_cap"] == 1
+    assert len(_all_tasks()) == 2
+
+
+def test_live_create_defaults_to_three_without_issue_allowlist(kanban_home):
+    cfg = dict(BCFG, dry_run=False)
+    issues = [
+        _issue("BUI-40", "first", ["agent:ghost"]),
+        _issue("BUI-41", "second", ["agent:ghost"]),
+        _issue("BUI-42", "third", ["agent:ghost"]),
+        _issue("BUI-43", "fourth", ["agent:ghost"]),
+    ]
+
+    report = lb.run_bridge_tick(cfg, issues=issues, now=51)
+
+    assert report["ok"] is True
+    assert [card["identifier"] for card in report["created"]] == [
+        "BUI-40", "BUI-41", "BUI-42"
+    ]
+    assert report["skipped_cap"] == 1
+    assert len(_all_tasks()) == 3
+
+
+def test_live_create_issue_id_allowlist_filters_and_bypasses_default_cap(kanban_home):
+    cfg = dict(
+        BCFG,
+        dry_run=False,
+        max_creates_per_tick=3,
+        issue_id_allowlist=["BUI-50", "uuid-BUI-51", "BUI-52", "BUI-53"],
+    )
+    issues = [
+        _issue("BUI-50", "first allowed by identifier", ["agent:ghost"]),
+        _issue("BUI-51", "second allowed by uuid", ["agent:ghost"]),
+        _issue("BUI-52", "third allowed", ["agent:ghost"]),
+        _issue("BUI-53", "fourth allowed", ["agent:ghost"]),
+        _issue("BUI-54", "not allowlisted", ["agent:ghost"]),
+    ]
+
+    report = lb.run_bridge_tick(cfg, issues=issues, now=61)
+
+    assert report["ok"] is True
+    assert [card["identifier"] for card in report["created"]] == [
+        "BUI-50", "BUI-51", "BUI-52", "BUI-53"
+    ]
+    assert report["skipped_allowlist"] == 1
+    assert report["skipped_cap"] == 0
+    assert len(_all_tasks()) == 4
+
+
+def test_live_create_overlarge_cap_without_issue_allowlist_clamps_to_three(kanban_home):
+    cfg = dict(BCFG, dry_run=False, max_creates_per_tick=10)
+    issues = [
+        _issue("BUI-70", "first", ["agent:ghost"]),
+        _issue("BUI-71", "second", ["agent:ghost"]),
+        _issue("BUI-72", "third", ["agent:ghost"]),
+        _issue("BUI-73", "fourth", ["agent:ghost"]),
+    ]
+
+    report = lb.run_bridge_tick(cfg, issues=issues, now=71)
+
+    assert report["ok"] is True
+    assert [card["identifier"] for card in report["created"]] == [
+        "BUI-70", "BUI-71", "BUI-72"
+    ]
+    assert report["skipped_cap"] == 1
+    assert len(_all_tasks()) == 3
+
+
+
+def test_live_create_invalid_max_create_cap_fails_closed(kanban_home):
+    cfg = dict(BCFG, dry_run=False, max_creates_per_tick="not-an-int")
+
+    report = lb.run_bridge_tick(
+        cfg,
+        issues=[_issue("BUI-30", "must not create", ["agent:ghost"])],
+        now=41,
+    )
+
+    assert report["ok"] is False
+    assert report["created"] == []
+    assert report["duplicates"] == []
+    assert "max_creates_per_tick" in report["error"]
+    assert len(_all_tasks()) == 0

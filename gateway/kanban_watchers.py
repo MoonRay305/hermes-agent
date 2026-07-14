@@ -1363,6 +1363,38 @@ class GatewayKanbanWatchersMixin:
                 _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
                 if _ad_enabled:
                     await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
+                # Linear -> Kanban bridge poll. Best-effort: a bridge failure
+                # must never break dispatch. Run before normal dispatch so
+                # newly created Kanban cards can be claimed in the same tick.
+                if _lb_enabled:
+                    _lb_now = time.time()
+                    if _lb_now - _lb_last_poll >= _lb_poll_every:
+                        _lb_last_poll = _lb_now
+                        try:
+                            from gateway import linear_bridge as _lb
+
+                            _lb_report = await asyncio.to_thread(
+                                _lb.run_bridge_tick, _lb_cfg,
+                            )
+                            if (
+                                _lb_report.get("would_create")
+                                or _lb_report.get("created")
+                                or _lb_report.get("unroutable")
+                            ):
+                                logger.info(
+                                    "linear bridge tick: would_create=%d created=%d "
+                                    "unroutable=%d already_seen=%d dry_run=%s",
+                                    len(_lb_report.get("would_create") or []),
+                                    len(_lb_report.get("created") or []),
+                                    len(_lb_report.get("unroutable") or []),
+                                    _lb_report.get("already_seen", 0),
+                                    bool(_lb_cfg.get("dry_run", True)),
+                                )
+                        except Exception:
+                            logger.warning(
+                                "linear bridge tick failed (dispatch unaffected)",
+                                exc_info=True,
+                            )
                 results = await asyncio.to_thread(_tick_once)
                 any_spawned = False
                 for slug, res in (results or []):
@@ -1421,39 +1453,6 @@ class GatewayKanbanWatchersMixin:
                             len(unroutable_ids), unroutable_ids[:10],
                         )
                         _last_unroutable_warn = now
-                # Linear -> Kanban bridge poll. Best-effort: a bridge failure
-                # must never break dispatch. With dry_run=true it only reports
-                # would-create cards; with dry_run=false it creates cards via
-                # the bridge's Linear idempotency key.
-                if _lb_enabled:
-                    _lb_now = time.time()
-                    if _lb_now - _lb_last_poll >= _lb_poll_every:
-                        _lb_last_poll = _lb_now
-                        try:
-                            from gateway import linear_bridge as _lb
-
-                            _lb_report = await asyncio.to_thread(
-                                _lb.run_bridge_tick, _lb_cfg,
-                            )
-                            if (
-                                _lb_report.get("would_create")
-                                or _lb_report.get("created")
-                                or _lb_report.get("unroutable")
-                            ):
-                                logger.info(
-                                    "linear bridge tick: would_create=%d created=%d "
-                                    "unroutable=%d already_seen=%d dry_run=%s",
-                                    len(_lb_report.get("would_create") or []),
-                                    len(_lb_report.get("created") or []),
-                                    len(_lb_report.get("unroutable") or []),
-                                    _lb_report.get("already_seen", 0),
-                                    bool(_lb_cfg.get("dry_run", True)),
-                                )
-                        except Exception:
-                            logger.warning(
-                                "linear bridge tick failed (dispatch unaffected)",
-                                exc_info=True,
-                            )
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
                 _kb_clear_heartbeat_safe(_kb)

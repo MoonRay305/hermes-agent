@@ -2789,6 +2789,16 @@ DEFAULT_CONFIG = {
             # are ignored. Example labels: agent:ghost, agent:peewee,
             # agent:patch, agent:squiddy.
             "routing_label_prefix": "agent:",
+            # Optional safety allowlist. When non-empty, agent:<profile> labels
+            # only route if <profile> is listed here; otherwise all valid
+            # Hermes profiles are accepted.
+            "allowed_profiles": [],
+            # Safe live-mode blast-radius cap per poll/dispatch tick. Dry-run
+            # is intentionally uncapped so operators can see all candidates.
+            # Live bridge defaults to at most three card creates unless an
+            # explicit issue_id_allowlist names the Linear issues/UUIDs to pull.
+            "max_creates_per_tick": 3,
+            "issue_id_allowlist": [],
         },
     },
 
