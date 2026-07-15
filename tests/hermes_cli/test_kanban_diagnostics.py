@@ -575,6 +575,59 @@ def test_stranded_in_ready_falls_back_to_created_at():
     assert stranded[0].data["age_seconds"] == 4 * 3600
 
 
+def test_respawn_guard_stranded_ready_fires_for_persistent_guard():
+    """A task repeatedly skipped by ``check_respawn_guard`` gets a specific
+    diagnostic instead of only the generic stranded-ready warning."""
+    now = 100_000
+    task = _task(status="ready", assignee="ghost", claim_lock=None)
+    events = [
+        _event("created", ts=now - 3 * 3600),
+        _event("respawn_guarded", ts=now - 90 * 60, reason="blocker_auth"),
+        _event("respawn_guarded", ts=now - 60, reason="blocker_auth"),
+    ]
+
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+
+    guarded = [d for d in diags if d.kind == "respawn_guard_stranded_ready"]
+    assert len(guarded) == 1
+    assert guarded[0].severity == "error"
+    assert guarded[0].data["latest_reason"] == "blocker_auth"
+    assert guarded[0].data["guard_age_seconds"] == 90 * 60
+    assert guarded[0].data["guard_count"] == 2
+    assert [d for d in diags if d.kind == "stranded_in_ready"] == []
+
+
+def test_respawn_guard_stranded_ready_waits_for_guard_age_threshold():
+    now = 100_000
+    task = _task(status="ready", assignee="ghost", claim_lock=None)
+    events = [
+        _event("created", ts=now - 3 * 3600),
+        _event("respawn_guarded", ts=now - 5 * 60, reason="active_pr"),
+    ]
+
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+
+    assert [d for d in diags if d.kind == "respawn_guard_stranded_ready"] == []
+    # The ready stint is still old, so the generic stranded signal remains
+    # visible until the guard itself has persisted long enough to own it.
+    assert [d for d in diags if d.kind == "stranded_in_ready"]
+
+
+def test_respawn_guard_stranded_ready_ignores_prior_ready_stints():
+    now = 100_000
+    task = _task(status="ready", assignee="ghost", claim_lock=None)
+    events = [
+        _event("created", ts=now - 4 * 3600),
+        _event("respawn_guarded", ts=now - 3 * 3600, reason="blocker_auth"),
+        _event("reclaimed", ts=now - 10 * 60),
+    ]
+
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+
+    assert [d for d in diags if d.kind == "respawn_guard_stranded_ready"] == []
+    assert [d for d in diags if d.kind == "stranded_in_ready"] == []
+
+
 def test_stranded_in_ready_works_on_real_db_row(kanban_home):
     """Round-trip through real kanban_db.connect() — confirms the rule
     works on sqlite3.Row objects, not just dicts."""

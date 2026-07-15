@@ -851,6 +851,173 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
     )]
 
 
+READY_TRANSITION_KINDS = {
+    "created", "promoted", "reclaimed", "unblocked",
+}
+
+
+def _ready_since_timestamp(task: Any, events: Iterable[Any]) -> int:
+    """Return the newest event timestamp that put ``task`` into ready.
+
+    Falls back to ``task.created_at`` for old/pruned event histories so stale
+    ready tasks do not become invisible just because their original ``created``
+    event is gone.
+    """
+    last_ready_ts = 0
+    for ev in events:
+        if _event_kind(ev) in READY_TRANSITION_KINDS:
+            last_ready_ts = max(last_ready_ts, _event_ts(ev))
+    if last_ready_ts == 0:
+        last_ready_ts = int(_task_field(task, "created_at", default=0) or 0)
+    return last_ready_ts
+
+
+def _respawn_guard_events_since(
+    events: Iterable[Any],
+    ready_since_ts: int,
+) -> list[Any]:
+    """Return ``respawn_guarded`` events for the current ready stint."""
+    return [
+        ev for ev in events
+        if _event_kind(ev) == "respawn_guarded"
+        and _event_ts(ev) >= ready_since_ts
+    ]
+
+
+def _duration_label(age_seconds: float) -> str:
+    """Format age in the largest sensible unit for diagnostic copy."""
+    if age_seconds >= 24 * 3600:
+        return f"{age_seconds / (24 * 3600):.1f}d"
+    if age_seconds >= 3600:
+        return f"{age_seconds / 3600:.1f}h"
+    return f"{int(age_seconds / 60)}m"
+
+
+def _rule_respawn_guard_stranded_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Ready task has been repeatedly skipped by the respawn guard.
+
+    The dispatcher intentionally leaves guarded tasks in ``ready`` so transient
+    conditions (rate-limit cooldowns, active PRs, recent successful runs) can
+    clear without a manual unblock. That makes the fast path safe, but it also
+    means a persistent guard condition can strand an otherwise spawnable task
+    while every dispatch tick only records ``respawn_guarded`` and moves on.
+    """
+    if _task_field(task, "status") != "ready":
+        return []
+    if _task_field(task, "claim_lock"):
+        return []
+    assignee = (_task_field(task, "assignee") or "").strip()
+    if not assignee:
+        return []
+
+    ready_since = _ready_since_timestamp(task, events)
+    if ready_since == 0:
+        return []
+    guard_events = _respawn_guard_events_since(events, ready_since)
+    if not guard_events:
+        return []
+
+    first_guard_ts = min(_event_ts(ev) for ev in guard_events)
+    last_guard_ts = max(_event_ts(ev) for ev in guard_events)
+    guard_age_seconds = now - first_guard_ts
+    threshold_seconds = float(cfg.get(
+        "respawn_guard_stranded_threshold_seconds",
+        cfg.get("stranded_threshold_seconds", 30 * 60),
+    ))
+    if guard_age_seconds < threshold_seconds:
+        return []
+
+    reason_counts: dict[str, int] = {}
+    latest_reason = "unknown"
+    latest_reason_ts = -1
+    for ev in guard_events:
+        reason = str(_parse_payload(ev).get("reason") or "unknown")
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        ts = _event_ts(ev)
+        if ts >= latest_reason_ts:
+            latest_reason = reason
+            latest_reason_ts = ts
+
+    if guard_age_seconds >= threshold_seconds * 6:
+        severity = "critical"
+    elif guard_age_seconds >= threshold_seconds * 2:
+        severity = "error"
+    else:
+        severity = "warning"
+
+    task_id = _task_field(task, "id") or "<task_id>"
+    actions: list[DiagnosticAction] = []
+    if latest_reason == "blocker_auth":
+        actions.append(DiagnosticAction(
+            kind="cli_hint",
+            label=f"Check profile health: hermes -p {assignee} doctor",
+            payload={"command": f"hermes -p {assignee} doctor"},
+            suggested=True,
+        ))
+        actions.append(DiagnosticAction(
+            kind="cli_hint",
+            label=f"Refresh profile auth: hermes -p {assignee} auth",
+            payload={"command": f"hermes -p {assignee} auth"},
+        ))
+    elif latest_reason == "active_pr":
+        actions.append(DiagnosticAction(
+            kind="comment",
+            label="Resolve the active PR, then complete or reassign the task",
+            suggested=True,
+        ))
+    elif latest_reason == "rate_limit_cooldown":
+        actions.append(DiagnosticAction(
+            kind="cli_hint",
+            label="Check recent worker failures and provider limits",
+            payload={"command": f"hermes kanban log {task_id}"},
+            suggested=True,
+        ))
+    else:
+        actions.append(DiagnosticAction(
+            kind="cli_hint",
+            label=f"Inspect task events: hermes kanban events {task_id}",
+            payload={"command": f"hermes kanban events {task_id}"},
+            suggested=True,
+        ))
+    actions.append(DiagnosticAction(
+        kind="reassign",
+        label="Reassign to a different worker",
+        payload={"current_assignee": assignee},
+    ))
+
+    age_str = _duration_label(guard_age_seconds)
+    return [Diagnostic(
+        kind="respawn_guard_stranded_ready",
+        severity=severity,
+        title=f"Respawn guard has deferred this ready task for {age_str}",
+        detail=(
+            f"This task is still ready, but the dispatcher has repeatedly "
+            f"skipped spawning it because check_respawn_guard returned "
+            f"{latest_reason!r} (latest reason). Guarding is intentional for "
+            f"short-lived conditions, but after {age_str} it is now an "
+            f"operator-visible stall. Clear the guard condition, complete the "
+            f"task if prior work already succeeded, or reassign it."
+        ),
+        actions=actions,
+        first_seen_at=first_guard_ts,
+        last_seen_at=last_guard_ts,
+        count=len(guard_events),
+        data={
+            "task_id": task_id,
+            "assignee": assignee,
+            "ready_since": ready_since,
+            "first_guarded_at": first_guard_ts,
+            "last_guarded_at": last_guard_ts,
+            "guard_age_seconds": int(guard_age_seconds),
+            "guard_count": len(guard_events),
+            "latest_reason": latest_reason,
+            "guard_reasons": sorted(reason_counts),
+            "reason_counts": reason_counts,
+            "threshold_seconds": int(threshold_seconds),
+        },
+    )]
+
+
 def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Task has been in ``ready`` status for too long without any worker
     claiming it.
@@ -896,24 +1063,7 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
         # double-flag the same condition.
         return []
 
-    # Find the most recent event that put this task into ready.
-    # ``created`` covers tasks born ready; ``promoted`` covers parent-
-    # done auto-promotion; ``reclaimed`` covers TTL/crash recovery;
-    # ``unblocked`` covers human-driven resumes.
-    READY_TRANSITION_KINDS = {
-        "created", "promoted", "reclaimed", "unblocked",
-    }
-    last_ready_ts = 0
-    for ev in events:
-        if _event_kind(ev) in READY_TRANSITION_KINDS:
-            t = _event_ts(ev)
-            last_ready_ts = max(last_ready_ts, t)
-
-    # Fallback: if no qualifying event exists (very old task or events
-    # truncated), fall back to ``created_at`` on the task row. Better
-    # to occasionally over-flag an ancient task than miss a stranded one.
-    if last_ready_ts == 0:
-        last_ready_ts = int(_task_field(task, "created_at", default=0) or 0)
+    last_ready_ts = _ready_since_timestamp(task, events)
     if last_ready_ts == 0:
         return []
 
@@ -921,11 +1071,20 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     if age_seconds < threshold_seconds:
         return []
 
-    # Format the age in the largest sensible unit.
-    if age_seconds >= 3600:
-        age_str = f"{age_seconds / 3600:.1f}h"
-    else:
-        age_str = f"{int(age_seconds / 60)}m"
+    # If this ready stint is specifically stuck because the dispatcher keeps
+    # returning ``respawn_guarded``, let the guard-specific rule own the signal
+    # and copy. Otherwise operators see two diagnostics for the same stall.
+    guard_threshold_seconds = float(cfg.get(
+        "respawn_guard_stranded_threshold_seconds",
+        threshold_seconds,
+    ))
+    guard_events = _respawn_guard_events_since(events, last_ready_ts)
+    if guard_events:
+        first_guard_ts = min(_event_ts(ev) for ev in guard_events)
+        if now - first_guard_ts >= guard_threshold_seconds:
+            return []
+
+    age_str = _duration_label(age_seconds)
 
     # Severity escalates with age. Below 2x threshold = warning;
     # 2x – 6x = error; beyond 6x = critical (something is clearly
@@ -984,6 +1143,7 @@ _RULES: list[RuleFn] = [
     _rule_repeated_crashes,
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
+    _rule_respawn_guard_stranded_ready,
     _rule_stranded_in_ready,
 ]
 
@@ -998,6 +1158,7 @@ DIAGNOSTIC_KINDS = (
     "repeated_crashes",
     "stuck_in_blocked",
     "block_unblock_cycling",
+    "respawn_guard_stranded_ready",
     "stranded_in_ready",
 )
 
@@ -1014,6 +1175,11 @@ DEFAULT_CONFIG = {
     # signal is dominated by tasks that are about to be claimed on the
     # next dispatcher tick (default 60s) and would just be noise.
     "stranded_threshold_seconds": 30 * 60,
+    # Respawn-guard-specific stranded threshold. Defaults to the generic
+    # stranded threshold, but can be lowered/raised independently by operators
+    # that want faster visibility into guard loops without changing all ready
+    # aging diagnostics.
+    "respawn_guard_stranded_threshold_seconds": 30 * 60,
 }
 
 
