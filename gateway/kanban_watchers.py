@@ -1269,7 +1269,7 @@ class GatewayKanbanWatchersMixin:
                     os.environ["HERMES_KANBAN_BOARD"] = slug
                     try:
                         triage_ids = _decomp.list_auto_decompose_ids(
-                            limit=per_tick,
+                            limit=auto_decompose_per_tick,
                         )
                     except Exception as exc:
                         logger.debug(
