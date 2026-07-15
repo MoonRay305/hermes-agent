@@ -583,6 +583,27 @@ def test_auto_decompose_sweep_only_lists_intended_triage(kanban_home):
     assert depth_child_id not in eligible_ids
 
 
+def test_auto_decompose_sweep_does_not_starve_eligible_rows_after_page(kanban_home):
+    with kb.connect() as conn:
+        for idx in range(1000):
+            kb.create_task(
+                conn,
+                title=f"bridge card {idx}",
+                triage=True,
+                created_by="linear_bridge",
+                idempotency_key=f"linear:starvation-{idx}",
+                priority=1,
+            )
+        intended_id = kb.create_task(
+            conn,
+            title="eligible rough idea behind first page",
+            triage=True,
+            priority=0,
+        )
+
+    assert decomp.list_auto_decompose_ids(limit=1) == [intended_id]
+
+
 def test_decomposition_safety_limits_have_safe_config_defaults():
     from hermes_cli.config import DEFAULT_CONFIG
 

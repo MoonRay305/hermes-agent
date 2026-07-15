@@ -3057,6 +3057,43 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
+def list_auto_decompose_tasks(
+    conn: sqlite3.Connection,
+    *,
+    max_depth: int,
+    tenant: Optional[str] = None,
+    limit: int = 1000,
+) -> list[Task]:
+    """Return triage tasks eligible for automatic decomposition.
+
+    Every durable eligibility predicate is applied in SQL before ``LIMIT`` so
+    ineligible bridge, human-escalation, or depth-exhausted rows cannot starve
+    valid rough ideas ordered behind them. Callers still re-check eligibility
+    at the LLM boundary to defend against races and future predicate drift.
+    """
+    if max_depth < 1:
+        raise ValueError("max_depth must be at least 1")
+    if limit < 1:
+        return []
+
+    query = """
+        SELECT * FROM tasks
+         WHERE status = 'triage'
+           AND LOWER(TRIM(COALESCE(created_by, ''))) != 'linear_bridge'
+           AND LOWER(TRIM(COALESCE(idempotency_key, ''))) NOT LIKE 'linear:%'
+           AND COALESCE(triage_origin, '') != ?
+           AND COALESCE(decomposition_depth, 0) < ?
+    """
+    params: list[Any] = [TRIAGE_ORIGIN_BLOCK_RECURRENCE, max_depth]
+    if tenant is not None:
+        query += " AND tenant = ?"
+        params.append(tenant)
+    query += " ORDER BY priority DESC, created_at ASC LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(query, params).fetchall()
+    return [Task.from_row(row) for row in rows]
+
+
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
     """Assign or reassign a task.  Returns True on success.
 

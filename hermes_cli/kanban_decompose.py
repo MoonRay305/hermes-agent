@@ -536,21 +536,31 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     return [row.id for row in rows]
 
 
-def list_auto_decompose_ids(*, tenant: Optional[str] = None) -> list[str]:
+def list_auto_decompose_ids(
+    *,
+    tenant: Optional[str] = None,
+    limit: int = 1000,
+) -> list[str]:
     """Return only triage tasks carrying genuine decomposition intent.
 
     The gateway uses this filtered sweep so bridge cards, human escalations,
     and depth-exhausted descendants do not consume per-tick slots or generate
-    repeated skip noise. ``decompose_task`` re-checks the same contract before
-    any LLM call as a race-safe second gate.
+    repeated skip noise. SQL applies every durable predicate before ``limit``
+    so ineligible rows cannot starve valid work. ``decompose_task`` re-checks
+    the same contract before any LLM call as a race-safe second gate.
     """
     cfg = _load_config()
+    max_depth = _positive_kanban_limit(
+        cfg,
+        "decomposition_max_depth",
+        kb.DEFAULT_DECOMPOSITION_MAX_DEPTH,
+    )
     with kb.connect_closing() as conn:
-        rows = kb.list_tasks(
+        rows = kb.list_auto_decompose_tasks(
             conn,
-            status="triage",
+            max_depth=max_depth,
             tenant=tenant,
-            limit=1000,
+            limit=limit,
         )
     return [
         row.id
