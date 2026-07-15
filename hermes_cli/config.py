@@ -2730,6 +2730,12 @@ DEFAULT_CONFIG = {
         # large bulk-load of triage tasks from spending a burst of aux
         # LLM calls in one tick. Excess tasks defer to the next tick.
         "auto_decompose_per_tick": 3,
+        # Hard graph bounds. These are enforced in the decomposer and again in
+        # the atomic DB helper; they are not merely prompt guidance. A depth of
+        # 1 allows a root (depth 0) to fan out once but prevents generated
+        # children from recursively decomposing.
+        "decomposition_max_children": 6,
+        "decomposition_max_depth": 1,
         # Stale detection: running tasks that have exceeded this many
         # seconds without a heartbeat (since ``last_heartbeat_at``) are
         # auto-reclaimed to ``ready`` on the next dispatcher tick. The
