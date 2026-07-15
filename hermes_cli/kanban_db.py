@@ -132,6 +132,10 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # spirit (default 2) but counts a different signal: manual unblock recurrences,
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
+TRIAGE_ORIGIN_DECOMPOSE = "decompose"
+TRIAGE_ORIGIN_BLOCK_RECURRENCE = "block_recurrence"
+DEFAULT_DECOMPOSITION_MAX_CHILDREN = 6
+DEFAULT_DECOMPOSITION_MAX_DEPTH = 1
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 
@@ -1068,6 +1072,13 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Why the task entered triage. ``decompose`` means intentional rough-idea
+    # intake; ``block_recurrence`` means a human escalation that auto-decompose
+    # must leave alone. NULL is preserved for backward-compatible legacy rows.
+    triage_origin: Optional[str] = None
+    # Root tasks begin at zero. Atomic decomposition increments this value on
+    # every generated child so automatic fan-out has a durable lineage bound.
+    decomposition_depth: int = 0
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1160,6 +1171,15 @@ class Task:
             block_recurrences=(
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
+                else 0
+            ),
+            triage_origin=(
+                row["triage_origin"] if "triage_origin" in keys else None
+            ),
+            decomposition_depth=(
+                int(row["decomposition_depth"])
+                if "decomposition_depth" in keys
+                and row["decomposition_depth"] is not None
                 else 0
             ),
         )
@@ -1349,7 +1369,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Provenance for triage routing. Intentional rough-idea intake is
+    -- ``decompose``; unblock-loop escalation is ``block_recurrence`` and must
+    -- never be consumed by the automatic decomposer. NULL preserves legacy
+    -- triage rows as intentional/eligible for backward compatibility.
+    triage_origin        TEXT,
+    -- Number of atomic decomposition hops from the original root. Root and
+    -- ordinary tasks are zero; generated children are parent depth + 1.
+    decomposition_depth  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2549,6 +2577,23 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "triage_origin" not in cols:
+        # NULL keeps pre-existing triage cards eligible for decomposition while
+        # newly routed cards receive explicit provenance at their transition.
+        _add_column_if_missing(
+            conn, "tasks", "triage_origin", "triage_origin TEXT"
+        )
+
+    if "decomposition_depth" not in cols:
+        # Existing cards are roots by definition. Children created after this
+        # migration receive parent depth + 1 atomically with their insert.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "decomposition_depth",
+            "decomposition_depth INTEGER NOT NULL DEFAULT 0",
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2997,6 +3042,7 @@ def create_task(
     priority: int = 0,
     parents: Iterable[str] = (),
     triage: bool = False,
+    triage_origin: Optional[str] = None,
     idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
@@ -3060,6 +3106,14 @@ def create_task(
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
+    if triage:
+        triage_origin = (
+            str(triage_origin).strip()
+            if triage_origin is not None and str(triage_origin).strip()
+            else TRIAGE_ORIGIN_DECOMPOSE
+        )
+    else:
+        triage_origin = None
     if not title or not title.strip():
         raise ValueError("title is required")
     if validate_assignee and assignee and classify_assignee(assignee) == "unroutable":
@@ -3330,8 +3384,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        triage_origin
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3357,6 +3412,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        triage_origin,
                     ),
                 )
                 for pid in parents:
@@ -3530,6 +3586,43 @@ def list_tasks(
         query += f" LIMIT {int(limit)}"
     rows = conn.execute(query, params).fetchall()
     return [Task.from_row(r) for r in rows]
+
+
+def list_auto_decompose_tasks(
+    conn: sqlite3.Connection,
+    *,
+    max_depth: int,
+    tenant: Optional[str] = None,
+    limit: int = 1000,
+) -> list[Task]:
+    """Return triage tasks eligible for automatic decomposition.
+
+    Every durable eligibility predicate is applied in SQL before ``LIMIT`` so
+    ineligible bridge, human-escalation, or depth-exhausted rows cannot starve
+    valid rough ideas ordered behind them. Callers still re-check eligibility
+    at the LLM boundary to defend against races and future predicate drift.
+    """
+    if max_depth < 1:
+        raise ValueError("max_depth must be at least 1")
+    if limit < 1:
+        return []
+
+    query = """
+        SELECT * FROM tasks
+         WHERE status = 'triage'
+           AND LOWER(TRIM(COALESCE(created_by, ''))) != 'linear_bridge'
+           AND LOWER(TRIM(COALESCE(idempotency_key, ''))) NOT LIKE 'linear:%'
+           AND COALESCE(triage_origin, '') != ?
+           AND COALESCE(decomposition_depth, 0) < ?
+    """
+    params: list[Any] = [TRIAGE_ORIGIN_BLOCK_RECURRENCE, max_depth]
+    if tenant is not None:
+        query += " AND tenant = ?"
+        params.append(tenant)
+    query += " ORDER BY priority DESC, created_at ASC LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(query, params).fetchall()
+    return [Task.from_row(row) for row in rows]
 
 
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
@@ -5776,12 +5869,20 @@ def block_task(
                        claim_expires = NULL,
                        worker_pid    = NULL,
                        block_kind    = ?,
-                       block_recurrences = ?
+                       block_recurrences = ?,
+                       triage_origin = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, recurrences, task_id) if expected_run_id is None
-                else (kind, recurrences, task_id, int(expected_run_id)),
+                (kind, recurrences, TRIAGE_ORIGIN_BLOCK_RECURRENCE, task_id)
+                if expected_run_id is None
+                else (
+                    kind,
+                    recurrences,
+                    TRIAGE_ORIGIN_BLOCK_RECURRENCE,
+                    task_id,
+                    int(expected_run_id),
+                ),
             )
             if cur.rowcount != 1:
                 return False
@@ -6104,6 +6205,8 @@ def decompose_triage_task(
     children: list[dict],
     author: Optional[str] = None,
     auto_promote: bool = True,
+    max_children: int = DEFAULT_DECOMPOSITION_MAX_CHILDREN,
+    max_depth: int = DEFAULT_DECOMPOSITION_MAX_DEPTH,
 ) -> Optional[list[str]]:
     """Fan a triage task out into child tasks and promote the root to ``todo``.
 
@@ -6133,6 +6236,14 @@ def decompose_triage_task(
     """
     if not children:
         return None
+    if max_children < 1:
+        raise ValueError("max_children must be at least 1")
+    if max_depth < 1:
+        raise ValueError("max_depth must be at least 1")
+    if len(children) > max_children:
+        raise ValueError(
+            f"decomposition requested {len(children)} children; maximum {max_children}"
+        )
     if root_assignee is not None:
         root_assignee = _canonical_assignee(root_assignee)
 
@@ -6189,14 +6300,21 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
-            "FROM tasks WHERE id = ?",
+            "SELECT id, status, tenant, workspace_kind, workspace_path, "
+            "decomposition_depth FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if root_row is None:
             return None
         if root_row["status"] != "triage":
             return None
+        root_depth = int(root_row["decomposition_depth"] or 0)
+        if root_depth >= max_depth:
+            raise ValueError(
+                f"maximum decomposition depth {max_depth} reached "
+                f"(task depth {root_depth})"
+            )
+        child_depth = root_depth + 1
         tenant = root_row["tenant"]
         # Children inherit the root's workspace by default so a fan-out
         # of a code-gen task lands in the parent's project dir/worktree
@@ -6238,8 +6356,9 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, tenant, created_at, created_by, "
+                " decomposition_depth) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -6250,6 +6369,7 @@ def decompose_triage_task(
                     tenant,
                     now,
                     (author or "decomposer"),
+                    child_depth,
                 ),
             )
             _append_event(
