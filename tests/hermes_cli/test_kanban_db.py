@@ -195,12 +195,18 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'index'"
             )
         }
+        legacy_task = kb.get_task(migrated, "legacy")
 
     # Additive columns added by migration:
     assert "session_id" in task_columns
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
+    assert "triage_origin" in task_columns
+    assert "decomposition_depth" in task_columns
     assert "run_id" in event_columns
+    assert legacy_task is not None
+    assert legacy_task.triage_origin is None
+    assert legacy_task.decomposition_depth == 0
     # And their indexes — the regression scope of this test:
     assert "idx_tasks_session_id" in indexes
     assert "idx_tasks_tenant" in indexes

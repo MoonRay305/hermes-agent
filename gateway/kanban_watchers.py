@@ -1268,10 +1268,10 @@ class GatewayKanbanWatchersMixin:
                 try:
                     os.environ["HERMES_KANBAN_BOARD"] = slug
                     try:
-                        triage_ids = _decomp.list_triage_ids()
+                        triage_ids = _decomp.list_auto_decompose_ids()
                     except Exception as exc:
                         logger.debug(
-                            "kanban auto-decompose: list_triage_ids failed on board %s (%s)",
+                            "kanban auto-decompose: list_auto_decompose_ids failed on board %s (%s)",
                             slug, exc,
                         )
                         triage_ids = []
