@@ -933,10 +933,42 @@ class GatewayKanbanWatchersMixin:
                 "on config control alone.", _lock_path,
             )
 
-        # Read max_spawn config to limit concurrent kanban tasks
-        max_spawn = kanban_cfg.get("max_spawn", None)
-        if max_spawn is not None:
-            logger.info(f"kanban dispatcher: max_spawn={max_spawn}")
+        # Read max_spawn config to limit concurrent kanban tasks.
+        # NOTE: max_spawn is a LIVE concurrency ceiling (max workers running at
+        # any instant), NOT a per-tick launch budget — running tasks count
+        # against it. When both max_spawn and max_in_progress are set the
+        # effective global cap is min(max_spawn, max_in_progress).
+        #
+        # Coerce to int with the same validation shape as max_in_progress so a
+        # numeric string (e.g. ``max_spawn: "2"`` from YAML/env) behaves
+        # identically to ``max_spawn: 2`` — dispatch_once does arithmetic on
+        # this value (min(), comparisons), so a bare string would raise or
+        # compare wrong. Invalid / below-1 values log a warning and fall back
+        # to unlimited (None).
+        raw_max_spawn = kanban_cfg.get("max_spawn", None)
+        max_spawn = None
+        if raw_max_spawn is not None:
+            try:
+                max_spawn = int(raw_max_spawn)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "kanban dispatcher: invalid kanban.max_spawn=%r; ignoring",
+                    raw_max_spawn,
+                )
+                max_spawn = None
+            else:
+                if max_spawn < 1:
+                    logger.warning(
+                        "kanban dispatcher: kanban.max_spawn=%r is below 1; ignoring",
+                        raw_max_spawn,
+                    )
+                    max_spawn = None
+                else:
+                    logger.info(
+                        f"kanban dispatcher: max_spawn={max_spawn} "
+                        "(live concurrency ceiling — max workers running at "
+                        "once, not a per-tick launch budget)"
+                    )
 
         # Cap the number of simultaneously running tasks so slow workers
         # (local LLMs, resource-constrained hosts) don't pile up and time
@@ -962,6 +994,18 @@ class GatewayKanbanWatchersMixin:
                     max_in_progress = None
                 else:
                     logger.info(f"kanban dispatcher: max_in_progress={max_in_progress}")
+
+        # When both live ceilings are set, the effective global worker cap is
+        # their minimum. Log it explicitly so operators aren't surprised that
+        # e.g. max_spawn=2 + max_in_progress=3 runs at most 2 workers.
+        if isinstance(max_spawn, int) and isinstance(max_in_progress, int):
+            logger.info(
+                "kanban dispatcher: effective global worker cap = "
+                "min(max_spawn=%d, max_in_progress=%d) = %d",
+                max_spawn,
+                max_in_progress,
+                min(max_spawn, max_in_progress),
+            )
 
         raw_failure_limit = kanban_cfg.get("failure_limit", _kb.DEFAULT_FAILURE_LIMIT)
         try:

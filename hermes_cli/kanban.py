@@ -628,6 +628,31 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Permanently delete already-archived task ids from the board",
     )
 
+    p_supersede = sub.add_parser(
+        "supersede",
+        help="Retire task(s) explicitly superseded by a replacement "
+             "(moves out of ready → archived with an auditable event)",
+    )
+    p_supersede.add_argument("task_ids", nargs="+",
+                             help="Task ids that a replacement has superseded")
+    p_supersede.add_argument(
+        "--replaced-by",
+        dest="replaced_by",
+        default=None,
+        help="Task id of the replacement (recorded on the superseded event/comment)",
+    )
+    p_supersede.add_argument(
+        "--note",
+        default=None,
+        help="Optional audit note for the superseded comment",
+    )
+    p_supersede.add_argument(
+        "--by",
+        dest="actor",
+        default="cli",
+        help="Actor recorded as the comment author (default: cli)",
+    )
+
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
     p_tail.add_argument("task_id")
@@ -975,6 +1000,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
+            "supersede": _cmd_supersede,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
             "daemon":   _cmd_daemon,
@@ -2149,6 +2175,52 @@ def _cmd_archive(args: argparse.Namespace) -> int:
                 print(f"cannot archive {tid}", file=sys.stderr)
             else:
                 print(f"Archived {tid}")
+    return 0 if not failed else 1
+
+
+def _cmd_supersede(args: argparse.Namespace) -> int:
+    """Explicitly retire task(s) a replacement has superseded (BUI-942 item 2).
+
+    The operational entry point that reaches :func:`kanban_db.supersede_task`:
+    an operator or integration that decides a card is obsolete (e.g. a new
+    replacement card now owns the work) runs
+    ``hermes kanban supersede <id> --replaced-by <new-id>``. This transitions
+    the card out of ``ready`` into ``archived``
+    with an auditable ``superseded`` event + comment, and — with
+    ``--replaced-by`` — transfers the card's dependents onto the replacement so
+    they stay blocked until it finishes (rather than being released early). A
+    card with dependents therefore requires ``--replaced-by``.
+    """
+    ids = list(args.task_ids or [])
+    if not ids:
+        print("at least one task_id is required", file=sys.stderr)
+        return 1
+    replaced_by = getattr(args, "replaced_by", None)
+    note = getattr(args, "note", None)
+    actor = getattr(args, "actor", None) or "cli"
+    failed: list[str] = []
+    with kb.connect_closing() as conn:
+        for tid in ids:
+            try:
+                ok = kb.supersede_task(
+                    conn, tid, replaced_by=replaced_by, actor=actor, note=note
+                )
+            except ValueError as exc:
+                # Invalid supersession (self / missing-or-terminal replacement /
+                # done source / dependents-without-replacement). Surface the
+                # exact reason.
+                failed.append(tid)
+                print(f"cannot supersede {tid}: {exc}", file=sys.stderr)
+                continue
+            if ok:
+                suffix = f" (replaced by {replaced_by})" if replaced_by else ""
+                print(f"Superseded {tid}{suffix}")
+            else:
+                failed.append(tid)
+                print(
+                    f"cannot supersede {tid} (unknown or already archived)",
+                    file=sys.stderr,
+                )
     return 0 if not failed else 1
 
 

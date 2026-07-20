@@ -1957,10 +1957,16 @@ def test_dispatch_respawn_guard_skips_recent_success(
         assert kb.get_task(conn, t).status == "ready"  # not blocked, just skipped
 
 
-def test_dispatch_respawn_guard_skips_active_pr(
+def test_dispatch_hands_off_active_pr_task_to_review(
     kanban_home, all_assignees_spawnable
 ):
-    """dispatch_once skips (but does not block) a task with an active PR comment."""
+    """A task with an active PR comment is handed off to the review lane rather
+    than left sitting guard-deferred in ``ready`` (BUI-942 item 2).
+
+    It no longer appears in ``respawn_guarded`` with reason ``active_pr`` and is
+    never auto-blocked; it is surfaced in ``pr_handoff_to_review`` and leaves
+    the ``ready`` column. (With all assignees spawnable, the review lane then
+    claims it — it is not re-spawned as the original ready-lane worker.)"""
     spawned_ids = []
 
     def fake_spawn(task, workspace):
@@ -1974,11 +1980,12 @@ def test_dispatch_respawn_guard_skips_active_pr(
         )
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
 
-    assert (t, "active_pr") in res.respawn_guarded
-    assert t not in spawned_ids
+    assert t in res.pr_handoff_to_review
+    assert (t, "active_pr") not in res.respawn_guarded
     assert t not in res.auto_blocked
     with kb.connect() as conn:
-        assert kb.get_task(conn, t).status == "ready"
+        # It left ready — into review, or already claimed by the review lane.
+        assert kb.get_task(conn, t).status != "ready"
 
 
 def test_dispatch_respawn_guard_dry_run_no_auto_block(

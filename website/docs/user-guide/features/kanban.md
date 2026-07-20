@@ -684,14 +684,20 @@ All commands are also available as a slash command in the interactive CLI and in
 
 | Config key | Default | What it does |
 |------------|---------|--------------|
-| `kanban.max_in_progress` | unset (unlimited) | Caps the number of simultaneously running tasks. When the board already has N running, the dispatcher skips spawning more — useful for slow workers (local LLMs, resource-constrained hosts) so they finish what they have before more pile up and time out. Invalid or below-1 values log a warning and behave as unlimited. |
+| `kanban.max_spawn` | unset (unlimited) | **Live concurrency ceiling** — the maximum number of workers running _at any instant_ across the whole board. It is **not** a per-tick launch budget: tasks already in `running` are counted against it, so at the ceiling a tick spawns nothing more. (A per-tick interpretation would let a 60-second tick grow concurrency by N every minute on a busy board.) See the note below on how it combines with `max_in_progress`. |
+| `kanban.max_in_progress` | unset (unlimited) | Also a live cap on simultaneously running tasks. When the board already has N running, the dispatcher skips spawning more — useful for slow workers (local LLMs, resource-constrained hosts) so they finish what they have before more pile up and time out. Invalid or below-1 values log a warning and behave as unlimited. |
 | `kanban.max_in_progress_per_profile` | unset (unlimited) | Per-profile variant of `max_in_progress` — caps how many tasks any single assignee profile may run concurrently. Useful when one profile is slow or rate-limited but others should keep flowing. Applies alongside the board-wide `max_in_progress`; both must allow a spawn for it to proceed. |
 | `kanban.auto_promote_children` | `true` | After `decompose_triage_task()` produces children with no parent-blocker dependencies, they're automatically promoted to `ready` so the dispatcher can pick them up. Set to `false` to require manual review — children stay in `todo` until you promote them. |
 | `kanban.default_workdir` | unset | Board-level default working directory applied to new tasks when neither `--workspace` nor the task itself overrides it. Per-task `workspace:` still wins. |
 
+:::note `max_spawn` vs `max_in_progress` (the naming trap)
+Both keys are **live concurrency ceilings on running workers**, not per-tick launch budgets, despite `max_spawn` reading like "how many to spawn this tick." When **both** are set, the effective global worker cap is their **minimum**: `min(max_spawn, max_in_progress)`. For example, with `max_spawn: 2` and `max_in_progress: 3`, the board runs **at most 2** workers at once (`min(2, 3) = 2`). Set just one if you only need one ceiling; set both only when a lower bound from either should win.
+:::
+
 ```yaml
 kanban:
-  max_in_progress: 2
+  max_spawn: 2          # live ceiling: at most 2 workers running at once
+  max_in_progress: 3    # also a live ceiling; effective cap = min(2, 3) = 2
   auto_promote_children: false
   default_workdir: ~/work/active-project
 ```
@@ -707,7 +713,14 @@ hermes kanban create "nightly backup audit" \
 
 ### Respawn guard
 
-The dispatcher refuses to re-spawn a ready task when it hit a quota/auth/429 error on the previous run (`blocker_auth`), or completed a run successfully within the guard window (`recent_success`), or a recent task comment links to a GitHub PR (`active_pr`). This prevents repeat worker storms on the same bug or task while a human catches up. See the `respawn_guarded` row in the [event reference](#event-reference).
+The dispatcher refuses to re-spawn a ready task when it hit a quota/auth/429 error on the previous run (`blocker_auth`), or completed a run successfully within the guard window (`recent_success`), or a recent task comment links to a GitHub PR (`active_pr`). This prevents repeat worker storms on the same bug or task while a human catches up. See the `respawn_guarded` row in the [event reference](#event-reference). Note that ready cards with a live PR are normally swept into `review` by the PR handoff below *before* the guard would defer them, so `active_pr` mainly remains as a fallback for direct callers of `check_respawn_guard`.
+
+### Board-state hygiene: PR handoff and supersession
+
+A parent card that already did its work shouldn't loiter in `ready` behind the respawn guard. Two lifecycle transitions keep the board honest:
+
+- **PR handoff → review.** When a ready card has a recent GitHub PR comment (what used to trip the `active_pr` guard), the dispatcher sweeps it out of `ready` into `review` at the start of each tick and records an `auto_review_handoff` event. The review lane (or a human) then verifies/merges the PR — the original maker is **not** re-spawned, so there's no duplicate-PR risk. Swept ids are surfaced in the dispatch result's `pr_handoff_to_review`.
+- **Explicit supersession → archived.** When a replacement card takes over a parent's work, retire the parent explicitly with `hermes kanban supersede <task-id> --replaced-by <replacement-id> [--note "..."]`. It transitions the card out of `ready` (or any non-terminal state) into `archived` and records an auditable `superseded` event (carrying the replacement pointer) plus a comment. Crucially, the card's dependents are **transferred onto the replacement** — each `old-parent → child` edge is retargeted to `replacement → child` — so they stay blocked until the replacement finishes, rather than being released early. Because of that, a card that has dependents **requires** `--replaced-by`. The transfer de-duplicates existing edges and skips any that would form a cycle. The source must be non-terminal (a `done`/`archived` card can't be rewritten) and the replacement must exist, be distinct, and be active (non-terminal). Integrations can call `hermes_cli.kanban_db.supersede_task(...)` directly for the same effect.
 
 ### Drag-to-delete and bulk delete (dashboard)
 
