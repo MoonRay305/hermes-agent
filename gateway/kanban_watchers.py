@@ -25,6 +25,30 @@ from agent.i18n import t
 logger = logging.getLogger("gateway.run")
 
 
+# Programming errors that a watcher tick must SURFACE, not mask (BUI-938).
+#
+# The fail-closed watcher loops catch a broad ``Exception`` around each tick so
+# one bad board / transient I/O hiccup never wedges the loop. That guard is
+# correct for *operational* failures — but it also used to swallow a bare typo
+# (``NameError``), a wrong attribute access (``AttributeError``), or a bad call
+# signature / type misuse (``TypeError``) and downgrade the bug to an
+# "unexpected watcher error" log line while the loop kept spinning. BUI-936 CI
+# confirmed the real-world cost: a ``NameError`` inside ``_auto_decompose_tick``
+# (an undefined name referenced when querying eligible candidates) was silently
+# masked and quietly changed corrupt-board behavior. These are watcher *bugs*,
+# not operational board/DB/network failures, so the tick bodies re-raise them.
+#
+# ``UnboundLocalError`` is a subclass of ``NameError`` and is covered too.
+#
+# NOTE on ``TypeError``: it is a programming-error class *here*, in tick
+# execution. The narrow config input-conversion boundaries in this module
+# (e.g. ``int(...)`` of a user-supplied interval / limit) still catch
+# ``(TypeError, ValueError)`` explicitly and locally — a malformed *config
+# value* is expected operational input, not a watcher bug. This tuple governs
+# the broad tick bodies, not those explicit boundaries.
+_WATCHER_PROGRAMMING_ERRORS = (NameError, AttributeError, TypeError)
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -581,6 +605,14 @@ class GatewayKanbanWatchersMixin:
                             await asyncio.to_thread(
                                 self._kanban_unsub, sub, board_slug,
                             )
+            except _WATCHER_PROGRAMMING_ERRORS:
+                # A typo / bad attribute / bad call signature in the notifier
+                # tick is a bug, not a delivery outage — surface it instead of
+                # masking it as an operational "tick failed" (BUI-938). Best-
+                # effort *delivery* boundaries inside the tick (adapter.send,
+                # artifact upload, wake injection) keep their own broad catches
+                # on purpose: a flaky adapter must not crash the watcher.
+                raise
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
             # Sleep with cancellation checks.
@@ -1145,6 +1177,14 @@ class GatewayKanbanWatchersMixin:
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
                 return None
+            except _WATCHER_PROGRAMMING_ERRORS:
+                # A NameError/AttributeError/TypeError out of dispatch_once is a
+                # watcher bug, not a per-board operational failure. Do NOT
+                # downgrade it to a swallowed "tick failed on board" + return
+                # None (which would let the loop keep spinning on a broken
+                # build and mask the defect, as in BUI-936). Surface it to the
+                # dispatcher loop, which tears down and re-raises (BUI-938).
+                raise
             except Exception as exc:
                 if _is_corrupt_board_db_error(exc):
                     disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
@@ -1271,6 +1311,15 @@ class GatewayKanbanWatchersMixin:
                         triage_ids = _decomp.list_auto_decompose_ids(
                             limit=auto_decompose_per_tick,
                         )
+                    except _WATCHER_PROGRAMMING_ERRORS:
+                        # The confirmed BUI-936 failure: a NameError raised here
+                        # (list_auto_decompose_ids called with an undefined name)
+                        # was swallowed into an empty triage list, so the sweep
+                        # silently no-op'd and the defect was invisible. A
+                        # NameError/AttributeError/TypeError on this call is a
+                        # watcher bug — surface it (BUI-938) rather than
+                        # downgrading it to "no triage tasks this tick".
+                        raise
                     except Exception as exc:
                         logger.debug(
                             "kanban auto-decompose: list_auto_decompose_ids failed on board %s (%s)",
@@ -1285,6 +1334,16 @@ class GatewayKanbanWatchersMixin:
                             outcome = _decomp.decompose_task(
                                 tid, author="auto-decomposer",
                             )
+                        except _WATCHER_PROGRAMMING_ERRORS:
+                            # Consistent with the sibling list call above: a
+                            # NameError/AttributeError/TypeError from invoking
+                            # decompose_task is a watcher bug, not a per-task
+                            # operational failure, so it must not be downgraded
+                            # to a logged "crashed" + continue (which would let
+                            # the sweep spin over a broken build). Surface it
+                            # (BUI-938). Genuine per-task operational failures
+                            # still fail closed below (log + skip this task).
+                            raise
                         except Exception:
                             logger.exception(
                                 "kanban auto-decompose: decompose_task crashed on %s",
@@ -1484,6 +1543,20 @@ class GatewayKanbanWatchersMixin:
                         _last_unroutable_warn = now
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
+                _kb_clear_heartbeat_safe(_kb)
+                _release_singleton_lock(self._kanban_dispatcher_lock_handle)
+                self._kanban_dispatcher_lock_handle = None
+                raise
+            except _WATCHER_PROGRAMMING_ERRORS:
+                # Surface programming errors instead of masking them as an
+                # "unexpected watcher error" and spinning the loop (BUI-938):
+                # a NameError inside a tick used to be logged and swallowed,
+                # hiding the defect and silently changing corrupt-board
+                # behavior (BUI-936). Tear down the same way the cancellation
+                # path does — clear the heartbeat and release the singleton
+                # lock — so a standby can take over the dispatcher, then
+                # re-raise so CI / operators see the crash.
+                logger.exception("kanban dispatcher: programming error in tick; surfacing")
                 _kb_clear_heartbeat_safe(_kb)
                 _release_singleton_lock(self._kanban_dispatcher_lock_handle)
                 self._kanban_dispatcher_lock_handle = None
