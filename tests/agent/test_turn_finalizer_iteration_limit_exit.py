@@ -51,6 +51,10 @@ class _LimitAgent:
         self._handle_max_iterations_called = True
         return "summary from extra call"
 
+    def _apply_gateway_final_response_guardrail(self, final_response, messages):
+        """Mirror the no-truncation path used by the production agent."""
+        return final_response, False, len(final_response or ""), 0
+
     def _emit_status(self, *_args, **_kwargs):
         pass
 
