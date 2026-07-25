@@ -111,11 +111,23 @@ class LocalProviderSensitivityBlocked(RuntimeError):
 
     def __init__(self, decision: SensitivityDecision):
         self.decision = decision
+        where = (
+            f"sent to {decision.provider or 'local provider'} "
+            f"({decision.base_url_host or 'unknown host'})"
+        )
+        if decision.reason == "gate_evaluation_failed":
+            super().__init__(
+                "Local provider sensitivity gate could not evaluate this request "
+                f"before it was {where}, so the send was blocked. The gate fails "
+                "closed: an unreadable payload is treated as sensitive. See the "
+                "agent log for the failure type. No raw prompt text or secret "
+                "values were logged."
+            )
+            return
         classes = ", ".join(decision.data_classes) or "sensitive"
         super().__init__(
             "Local provider sensitivity gate blocked this request before it was "
-            f"sent to {decision.provider or 'local provider'} "
-            f"({decision.base_url_host or 'unknown host'}). "
+            f"{where}. "
             f"Observed data classes: {classes}. Attach an approved worker "
             "contract/local_provider_sensitivity.approved_routes entry for this "
             "provider/model/base_url before routing sensitive/private data to a "
@@ -137,16 +149,47 @@ PATTERNS: tuple[PatternDef, ...] = (
         "Bearer [REDACTED]",
     ),
     PatternDef(
+        # Matches a secret-ish NAME bound to a secret-ish VALUE.  The value
+        # constraint is what makes this usable: the original pattern accepted
+        # any 8+ non-space characters, so ordinary Python — `max_tokens=max_tokens`,
+        # `api_key: Optional[str]`, `api_key=api_key)` — read as a leaked
+        # credential (1,389 hits across this repo's own source).  A quoted
+        # value must be >=12 chars; an unquoted value must be >=20 chars drawn
+        # from a key charset, which no short identifier satisfies.
         "api_key_assignment",
         re.compile(
-            r"(?i)\b([A-Z0-9_\-]*(?:API[_-]?KEY|SECRET|TOKEN|PASSWORD|PRIVATE[_-]?KEY|WEBHOOK[_-]?URL|DATABASE[_-]?URL|DSN)[A-Z0-9_\-]*)\b\s*[:=]\s*(['\"]?)[^\s,'\"}]{8,}\2"
+            r"(?i)\b([A-Z0-9_\-]*(?:API[_-]?KEY|SECRET|TOKEN|PASSWORD|PASSWD|"
+            r"PRIVATE[_-]?KEY|WEBHOOK[_-]?URL|DATABASE[_-]?URL|DSN)[A-Z0-9_\-]*)\b"
+            r"\s*[:=]\s*"
+            r"(?:"
+            r"(['\"])[^\s'\"]{12,}\2"
+            r"|"
+            # Unquoted (.env-style) value.  Single-case snake_case is excluded:
+            # `session_completion_tokens = skipped_nonspawnable` is code, and a
+            # generated credential is essentially never pure lower/UPPER snake.
+            r"(?!(?-i:(?:[a-z0-9]+_)+[a-z0-9]+)(?:[\s,;)\]}]|$))"
+            r"(?!(?-i:(?:[A-Z0-9]+_)+[A-Z0-9]+)(?:[\s,;)\]}]|$))"
+            r"[A-Za-z0-9+/=_\-.]{20,}(?=[\s,;)\]}]|$)"
+            r")"
         ),
         ("secret", "production"),
         "\\1=[REDACTED]",
     ),
     PatternDef(
+        # Provider token shapes.  The separator is mandatory and the match is
+        # case-sensitive: with `-?` optional and re.I, the prefixes swallowed
+        # ordinary snake_case identifiers (`skill_matches_platform`,
+        # `session_completion_tokens`, `skipped_nonspawnable` — 126 hits here).
+        # Real tokens always carry their separator.
         "openai_like_token",
-        re.compile(r"\b(?:sk|pk|rk|sess|ghp|github_pat|xox[baprs])-?[A-Za-z0-9_\-]{18,}\b", re.I),
+        re.compile(
+            r"\b(?:"
+            r"(?:sk|pk|rk|sess)-[A-Za-z0-9_-]{20,}"
+            r"|gh[pousr]_[A-Za-z0-9]{30,}"
+            r"|github_pat_[A-Za-z0-9_]{40,}"
+            r"|xox[baprs]-[A-Za-z0-9-]{12,}"
+            r")\b"
+        ),
         ("secret", "production"),
         "[REDACTED_TOKEN]",
     ),
@@ -162,39 +205,92 @@ PATTERNS: tuple[PatternDef, ...] = (
         ("secret", "production"),
         "[REDACTED_CONNECTION_STRING]",
     ),
+    # --- Topical classes -------------------------------------------------
+    #
+    # These are deliberately phrase-anchored rather than single-token.  The
+    # first cut of this gate matched bare words (``client``, ``production``,
+    # ``options``, ``futures``, ``symptom``, ``privileged``) and therefore
+    # fired on ordinary engineering prose — Hermes' own system prompt embeds
+    # AGENTS.md, which says "MCP client", "npm start # production",
+    # "reproduces the symptom" and "config.yaml options".  That made every
+    # local-provider request classify as client/production/trading/
+    # personal_health and blocked the local route outright.  A gate that
+    # denies 100% of traffic is not a gate; it is an outage, and it trains
+    # operators to switch it off, which is strictly worse than not shipping
+    # it.  Each token below must be one that does not occur in routine
+    # source code or developer documentation.
+    #
+    # Content matching is a backstop.  The authoritative signal is the
+    # operator-declared data class (HERMES_DATA_CLASS, or
+    # worker_contract.data_class), which is applied regardless of what the
+    # text scan finds — see _declared_data_class().
     PatternDef(
         "legal",
-        re.compile(r"\b(?:attorney|counsel|lawsuit|litigation|settlement|legal hold|nda|contract dispute|privileged)\b", re.I),
+        re.compile(
+            r"\b(?:attorney[- ]client\s+privilege|legally\s+privileged|lawsuit|litigation|"
+            r"legal\s+hold|contract\s+dispute|opposing\s+counsel|settlement\s+agreement)\b",
+            re.I,
+        ),
         ("legal",),
         "[LEGAL_TERM]",
     ),
     PatternDef(
         "financial",
-        re.compile(r"\b(?:routing number|account number|wire transfer|bank account|invoice|payroll|w-?9|1099|tax return|credit card)\b", re.I),
+        re.compile(
+            r"\b(?:routing\s+number|account\s+number|wire\s+transfer|bank\s+account|"
+            r"payroll|tax\s+return|credit\s+card|form\s+1099|1099-(?:MISC|NEC|K)|"
+            r"w-9\s+form|invoice\s+(?:number|total|amount))\b",
+            re.I,
+        ),
         ("financial",),
         "[FINANCIAL_TERM]",
     ),
     PatternDef(
         "trading",
-        re.compile(r"\b(?:trading|trade order|market order|limit order|stop loss|portfolio|brokerage|kraken|coinbase|alpaca|ibkr|futures|options)\b", re.I),
+        re.compile(
+            r"\b(?:trading\s+(?:account|desk|strategy)|trade\s+order|market\s+order|"
+            r"limit\s+order|stop\s+loss|brokerage|coinbase|\bIBKR\b|"
+            r"portfolio\s+(?:balance|holdings|value|positions))\b",
+            re.I,
+        ),
         ("trading",),
         "[TRADING_TERM]",
     ),
     PatternDef(
         "personal_health",
-        re.compile(r"\b(?:veterinary|vet visit|medication|diagnosis|symptom|lab result|medical record)\b", re.I),
+        re.compile(
+            r"\b(?:veterinary|vet\s+visit|medication|lab\s+result|medical\s+record|"
+            r"medical\s+diagnosis|patient\s+(?:record|chart|history))\b",
+            re.I,
+        ),
         ("personal_health", "private"),
         "[PRIVATE_TERM]",
     ),
     PatternDef(
         "client",
-        re.compile(r"\b(?:client|customer|prospect|customer data|client file|statement of work|sow|msa)\b", re.I),
+        re.compile(
+            r"\b(?:client\s+(?:file|data|record|matter|engagement)|"
+            r"customer\s+(?:data|record|list|pii)|statement\s+of\s+work)\b",
+            re.I,
+        ),
         ("client",),
         "[CLIENT_TERM]",
     ),
     PatternDef(
+        # Case-sensitive: SOW/MSA/NDA as bare lowercase words are too common
+        # ("sow" the verb, "nda" inside identifiers) to be evidence.
+        "legal_doc_acronym",
+        re.compile(r"\b(?:SOW|MSA|NDA)\b"),
+        ("legal", "client"),
+        "[LEGAL_TERM]",
+    ),
+    PatternDef(
         "production",
-        re.compile(r"\b(?:production|prod database|prod db|kubernetes secret|deploy key|ssh key|live credentials|root password)\b", re.I),
+        re.compile(
+            r"\b(?:prod(?:uction)?\s+(?:database|db|credentials|secrets?)|"
+            r"kubernetes\s+secret|deploy\s+key|live\s+credentials|root\s+password)\b",
+            re.I,
+        ),
         ("production",),
         "[PRODUCTION_TERM]",
     ),
@@ -217,20 +313,35 @@ def _host_from_base_url(base_url: Any) -> str:
 
 
 def is_local_provider_route(provider: Any, base_url: Any) -> bool:
-    provider_id = _normalize_provider(provider)
-    if provider_id in LOCAL_PROVIDER_IDS:
-        return True
+    """Return True when the route terminates at a local/private endpoint.
 
-    host = _host_from_base_url(base_url)
-    if not host:
-        return False
-    if host in {"localhost", "0.0.0.0"} or host.endswith(".localhost") or host.endswith(".local"):
-        return True
+    Total by construction: an unparseable provider/base_url yields ``True``
+    (assume local), because the caller uses this answer to decide whether the
+    gate has jurisdiction.  Guessing "not local" on an input we failed to
+    understand would silently disable the gate — the exact fail-open this
+    module exists to prevent.
+    """
     try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        return False
-    return bool(ip.is_loopback or ip.is_private or ip.is_link_local)
+        provider_id = _normalize_provider(provider)
+        if provider_id in LOCAL_PROVIDER_IDS:
+            return True
+
+        host = _host_from_base_url(base_url)
+        if not host:
+            return False
+        if host in {"localhost", "0.0.0.0"} or host.endswith(".localhost") or host.endswith(".local"):
+            return True
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            return False
+        return bool(ip.is_loopback or ip.is_private or ip.is_link_local)
+    except Exception:
+        logger.warning(
+            "local_provider_sensitivity_gate: route classification failed; "
+            "treating the route as local so the gate still applies"
+        )
+        return True
 
 
 def _message_text(value: Any) -> Iterable[str]:
@@ -458,7 +569,7 @@ def _write_audit(decision: SensitivityDecision) -> None:
     log_fn("local_provider_sensitivity_gate %s", json.dumps(payload, sort_keys=True))
 
 
-def evaluate_local_provider_request(
+def _evaluate_local_provider_request_unguarded(
     *,
     provider: Any,
     base_url: Any,
@@ -564,10 +675,69 @@ def evaluate_local_provider_request(
     )
 
 
+def evaluate_local_provider_request(
+    *,
+    provider: Any,
+    base_url: Any,
+    model: Any,
+    messages: Any,
+    config: dict[str, Any] | None = None,
+) -> SensitivityDecision:
+    """Classify an outbound request and decide whether it may be sent.
+
+    Fail-closed wrapper.  If the evaluation itself raises for any reason —
+    malformed config, an unexpected message shape, a regex or filesystem
+    failure — a local route is *denied*.  "The gate crashed" and "the gate
+    approved" must never be the same outcome: an exception here means we do
+    not know what is in the payload, and an unknown payload does not get to
+    leave the process over a local route.
+
+    Non-local routes are still allowed on internal failure: this gate has no
+    jurisdiction over cloud providers, which carry their own contractual
+    boundary, and failing those closed would take the agent offline on a bug
+    in code that was never meant to govern them.
+    """
+    try:
+        return _evaluate_local_provider_request_unguarded(
+            provider=provider,
+            base_url=base_url,
+            model=model,
+            messages=messages,
+            config=config,
+        )
+    except Exception as exc:
+        local_route = is_local_provider_route(provider, base_url)
+        logger.warning(
+            "local_provider_sensitivity_gate: evaluation failed (%s); "
+            "%s. No raw prompt text was logged.",
+            type(exc).__name__,
+            "denying the local route (fail closed)" if local_route
+            else "allowing the non-local route (gate has no jurisdiction)",
+        )
+        try:
+            host = _host_from_base_url(base_url)
+        except Exception:
+            host = ""
+        return SensitivityDecision(
+            allowed=not local_route,
+            local_route=local_route,
+            provider=_normalize_provider(provider) if isinstance(provider, str) else "",
+            model=str(model or ""),
+            base_url_host=host,
+            data_classes=[],
+            declared_data_class=None,
+            reason="gate_evaluation_failed",
+        )
+
+
 def assert_local_provider_request_allowed(**kwargs: Any) -> SensitivityDecision:
     decision = evaluate_local_provider_request(**kwargs)
     if decision.local_route and (decision.redaction_counts or decision.data_classes or not decision.allowed):
-        _write_audit(decision)
+        # Audit writing must never be able to turn a deny into a send.
+        try:
+            _write_audit(decision)
+        except Exception as exc:  # pragma: no cover - _write_audit is already defensive
+            logger.debug("local provider sensitivity audit write failed: %s", exc)
     if not decision.allowed:
         raise LocalProviderSensitivityBlocked(decision)
     return decision

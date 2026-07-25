@@ -1253,31 +1253,45 @@ def run_conversation(
 
                 # Pre-send sensitivity gate for local providers (BUI-370).
                 #
-                # Anchored after apply_llm_request_middleware() and the
-                # pre_api_request hook: both can rewrite api_kwargs, so this is
-                # the first point at which we can classify the bytes that
-                # actually leave the process.  Gating before them - where this
-                # branch originally placed the call, when the hook was the last
-                # step before the send - would let a middleware or plugin inject
-                # content past the gate.
-                request_messages = api_kwargs.get("messages")
-                if not isinstance(request_messages, list):
-                    request_messages = api_kwargs.get("input")
-                if not isinstance(request_messages, list):
-                    request_messages = api_messages
-
+                # Deliberately placed *after* apply_llm_request_middleware and
+                # the pre_api_request hook: both can rewrite api_kwargs, so this
+                # is the first point at which we can classify the bytes that
+                # actually leave the process.  Gating earlier would let a
+                # middleware or plugin inject sensitive content past the gate.
+                #
+                # Fails closed: if the gate cannot reach a decision, the send is
+                # blocked rather than allowed.  _sensitivity_block is set instead
+                # of returning from inside the except clause so the block path is
+                # identical whether the gate denied or failed to evaluate.
+                _sensitivity_block = None
                 try:
                     from agent.local_provider_sensitivity_gate import (
                         LocalProviderSensitivityBlocked,
                         assert_local_provider_request_allowed,
                     )
-                    assert_local_provider_request_allowed(
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        model=agent.model,
-                        messages=request_messages,
+                except Exception as _gate_import_error:  # pragma: no cover - module ships with the agent
+                    _sensitivity_block = (
+                        "Local provider sensitivity gate could not be loaded "
+                        f"({type(_gate_import_error).__name__}); refusing to send. "
+                        "The gate fails closed by design."
                     )
-                except LocalProviderSensitivityBlocked as _sensitivity_exc:
+                else:
+                    _request_messages = api_kwargs.get("messages")
+                    if not isinstance(_request_messages, list):
+                        _request_messages = api_kwargs.get("input")
+                    if not isinstance(_request_messages, list):
+                        _request_messages = api_messages
+                    try:
+                        assert_local_provider_request_allowed(
+                            provider=agent.provider,
+                            base_url=agent.base_url,
+                            model=agent.model,
+                            messages=_request_messages,
+                        )
+                    except LocalProviderSensitivityBlocked as _sensitivity_exc:
+                        _sensitivity_block = str(_sensitivity_exc)
+
+                if _sensitivity_block is not None:
                     if thinking_spinner:
                         thinking_spinner.stop("")
                         thinking_spinner = None
@@ -1285,12 +1299,12 @@ def run_conversation(
                         agent.thinking_callback("")
                     agent._persist_session(messages, conversation_history)
                     return {
-                        "final_response": str(_sensitivity_exc),
+                        "final_response": _sensitivity_block,
                         "messages": messages,
                         "api_calls": api_call_count,
                         "completed": False,
                         "failed": True,
-                        "error": str(_sensitivity_exc),
+                        "error": _sensitivity_block,
                     }
 
                 if env_var_enabled("HERMES_DUMP_REQUESTS"):

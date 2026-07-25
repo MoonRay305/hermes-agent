@@ -1622,13 +1622,24 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         # turns so Anthropic-family providers don't 400 the summary call.
         api_messages = agent._drop_thinking_only_and_merge_users(api_messages)
 
-        from agent.local_provider_sensitivity_gate import assert_local_provider_request_allowed
-        assert_local_provider_request_allowed(
-            provider=agent.provider,
-            base_url=agent.base_url,
-            model=agent.model,
-            messages=api_messages,
+        # Pre-send sensitivity gate (BUI-370).  The summary call is a real
+        # outbound request on the same route as the main loop, so it gets the
+        # same gate.  Returning the block text as the summary keeps the turn
+        # ending cleanly — this function's contract is to return the final
+        # response string — while still guaranteeing nothing was sent.
+        from agent.local_provider_sensitivity_gate import (
+            LocalProviderSensitivityBlocked,
+            assert_local_provider_request_allowed,
         )
+        try:
+            assert_local_provider_request_allowed(
+                provider=agent.provider,
+                base_url=agent.base_url,
+                model=agent.model,
+                messages=api_messages,
+            )
+        except LocalProviderSensitivityBlocked as _sensitivity_exc:
+            return str(_sensitivity_exc)
 
         summary_extra_body = {}
         try:
