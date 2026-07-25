@@ -81,6 +81,76 @@ def _resolve_auto_decompose_settings(
     return enabled, per_tick
 
 
+# A live-concurrency ceiling that could not be resolved from config. 0 means
+# "spawn nothing": ``dispatch_once`` counts already-running tasks plus this
+# tick's spawns against the ceiling, so 0 breaks both the ready and the review
+# spawn loop on their first iteration. The dispatcher itself keeps running —
+# heartbeat, stale-claim reclaim, promotion, reconciliation and notifications
+# all continue — only *new* work is withheld until the operator fixes the
+# value.
+_SPAWN_CAP_FAIL_CLOSED = 0
+
+
+def _coerce_live_concurrency_cap(raw: Any, setting: str) -> Optional[int]:
+    """Resolve a ``kanban.*`` live-concurrency ceiling to an ``int`` or ``None``.
+
+    Returns ``None`` when the setting is unset (no ceiling — the documented
+    default), the positive ``int`` when the value is usable, and
+    :data:`_SPAWN_CAP_FAIL_CLOSED` when it is not.
+
+    A numeric string is *accepted and normalised* (``"5"`` -> ``5``): YAML
+    quoting and env-var plumbing produce those routinely and the operator's
+    intent is unambiguous. Only values that cannot yield a usable ceiling at
+    all — non-numeric strings, containers, ``bool``, zero and negatives — are
+    rejected.
+
+    **Why this boundary exists.** ``dispatch_once`` does arithmetic on this
+    value (``min(...)``, ``>=`` against a running-task count). Handing it a raw
+    ``str`` raises ``TypeError`` deep inside a tick, and this module
+    deliberately re-raises ``TypeError`` from a tick as a *programming* error
+    (BUI-938) — so an operator's config typo would tear the whole dispatcher
+    down. Converting here keeps that surfacing intact: the ``except`` below is
+    wrapped around the ``int()`` call and nothing else, so a genuine
+    ``TypeError`` from a real watcher bug still propagates untouched. A
+    malformed *config value* is expected operational input, and it is handled
+    locally, where it is read.
+
+    **Why it fails closed rather than ignoring the value.** Falling back to
+    ``None`` would mean *unlimited*: a typo in a safety ceiling would remove
+    the ceiling, which is the exact opposite of what the operator asked for.
+    Withholding spawns instead keeps the board bounded, keeps the dispatcher
+    alive, and turns the mistake into a loud, actionable log line.
+    """
+    if raw is None:
+        return None
+    # bool is an int subclass — ``max_spawn: true`` is a config mistake, not a
+    # ceiling of 1, so reject it before int() silently accepts it.
+    if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+        logger.error(
+            "kanban dispatcher: invalid %s=%r (expected a whole number >= 1); "
+            "refusing to spawn kanban workers until it is fixed",
+            setting, raw,
+        )
+        return _SPAWN_CAP_FAIL_CLOSED
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.error(
+            "kanban dispatcher: invalid %s=%r (expected a whole number >= 1); "
+            "refusing to spawn kanban workers until it is fixed",
+            setting, raw,
+        )
+        return _SPAWN_CAP_FAIL_CLOSED
+    if value < 1:
+        logger.error(
+            "kanban dispatcher: %s=%r is below 1; refusing to spawn kanban "
+            "workers until it is fixed (remove the setting for no ceiling)",
+            setting, raw,
+        )
+        return _SPAWN_CAP_FAIL_CLOSED
+    return value
+
+
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     """Take an exclusive, non-blocking advisory lock for the sole dispatcher.
 
@@ -965,8 +1035,21 @@ class GatewayKanbanWatchersMixin:
                 "on config control alone.", _lock_path,
             )
 
-        # Read max_spawn config to limit concurrent kanban tasks
-        max_spawn = kanban_cfg.get("max_spawn", None)
+        # Read max_spawn config to limit concurrent kanban tasks.
+        #
+        # max_spawn is a LIVE concurrency ceiling (the maximum number of
+        # workers running at any instant), NOT a per-tick launch budget —
+        # already-running tasks count against it. dispatch_once therefore does
+        # arithmetic on this value (min(...), >= against a running-task
+        # count), so it has to arrive as an int.
+        #
+        # Coerce HERE, at the config boundary, and fail CLOSED on a value that
+        # cannot yield a usable ceiling. This module re-raises TypeError out of
+        # a tick as a programming error (BUI-938), so a raw string reaching
+        # that arithmetic would tear the dispatcher down over an operator typo.
+        max_spawn = _coerce_live_concurrency_cap(
+            kanban_cfg.get("max_spawn", None), "kanban.max_spawn",
+        )
         if max_spawn is not None:
             logger.info(f"kanban dispatcher: max_spawn={max_spawn}")
 
