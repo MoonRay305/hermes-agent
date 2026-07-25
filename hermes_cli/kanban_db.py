@@ -7733,9 +7733,16 @@ def _dispatch_once_locked(
     ``max_in_progress`` is the same kind of knob — a live ceiling on running
     tasks, NOT a per-tick budget — despite the similar name. When BOTH are
     set, the effective global worker cap is ``min(max_spawn, max_in_progress)``
-    (e.g. ``min(2, 3) == 2``): this tick trims ``max_spawn`` down to the
-    ``max_in_progress`` headroom before spawning. See the concurrency-cap
-    contract tests and the operator docs for the naming rationale.
+    (e.g. ``min(2, 3) == 2``). See the concurrency-cap contract tests and the
+    operator docs for the naming rationale.
+
+    Whichever ceiling binds, it is resolved ONCE per tick, before any spawning,
+    and it governs **both** dispatch lanes: ready spawns and review spawns draw
+    down the same budget. There is no path — including a tick with an empty
+    ready queue — on which the review lane dispatches against a different (or
+    absent) ceiling than the ready lane. That matters because
+    :func:`reconcile_pr_ready_to_review` runs earlier in this same tick and can
+    empty the ready queue by handing its last card to the review lane.
 
     ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
     ``board`` pins workspace/log/db resolution for this tick to a specific
@@ -7777,15 +7784,45 @@ def _dispatch_once_locked(
     if not dry_run:
         result.pr_handoff_to_review = reconcile_pr_ready_to_review(conn)
 
-    # Count tasks already running so max_spawn enforces concurrency rather
-    # than a per-tick spawn budget. See the docstring above for the full
-    # rationale; the short version is that a 60-second tick interval with a
-    # per-tick budget of N would grow concurrency by N every tick on a busy
-    # board, since "running" tasks aren't reclaimed by completion alone —
-    # they sit in status='running' until the worker calls
-    # kanban_complete/kanban_block (or the dispatcher TTL-reclaims them).
+    # ---- ONE shared live concurrency cap, governing BOTH dispatch lanes ----
+    #
+    # max_spawn and max_in_progress are two spellings of the same kind of knob:
+    # a LIVE ceiling on how many workers may sit in status='running' at once,
+    # NOT a per-tick launch budget. (A per-tick budget of N with a 60-second
+    # tick would grow concurrency by N every minute on a busy board: "running"
+    # tasks are not reclaimed by completion alone — they stay in
+    # status='running' until the worker calls kanban_complete/kanban_block or
+    # the dispatcher TTL-reclaims them.) When both are set, the effective
+    # ceiling is their minimum.
+    #
+    # Resolve that ceiling ONCE, here, and count already-running tasks ONCE.
+    # The ready loop and the review loop below then share a single break
+    # predicate — ``running_count + spawned >= live_cap`` — so every spawn this
+    # tick, ready or review, draws down the same budget.
+    #
+    # This resolution must NOT be conditioned on there being ready work
+    # (BUI-942 item 4). The composition used to live inside ``if
+    # max_in_progress is not None and ready_rows:``, so an empty ready queue
+    # skipped it wholesale and the review loop ran against the raw max_spawn —
+    # or against no ceiling at all when only max_in_progress was configured.
+    # reconcile_pr_ready_to_review() a few lines above makes that trivially
+    # reachable rather than theoretical: it moves the last ready card into
+    # 'review', so ready_rows is empty on the very tick the review lane wants
+    # to dispatch, and a PR handoff could push the board past max_in_progress.
+    #
+    # Counting note: already-running tasks are subtracted exactly ONCE, by the
+    # loop predicate. Do NOT also subtract them from the cap here — that double
+    # count is what made min(3, 3) with one worker running top up to 2 instead
+    # of the correct 3.
+    if max_spawn is not None and max_in_progress is not None:
+        live_cap = min(max_spawn, max_in_progress)
+    elif max_spawn is not None:
+        live_cap = max_spawn
+    else:
+        # None when neither ceiling is configured — unlimited, as documented.
+        live_cap = max_in_progress
     running_count = 0
-    if max_spawn is not None:
+    if live_cap is not None:
         running_count = int(
             conn.execute(
                 "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
@@ -7797,37 +7834,6 @@ def _dispatch_once_locked(
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
-    # Honour kanban.max_in_progress: if the board already has enough running
-    # tasks, skip spawning this tick so slow workers (local LLMs,
-    # resource-constrained hosts) can finish what they have before more tasks
-    # pile up and time out.
-    if max_in_progress is not None and ready_rows:
-        in_progress = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-        ).fetchone()[0]
-        if in_progress >= max_in_progress:
-            return result
-        # Compose the two LIVE ceilings into the effective per-tick spawn cap.
-        # Both max_spawn and max_in_progress bound the number of tasks that may
-        # be in 'running' at once (neither is a per-tick launch budget), so the
-        # effective ceiling is their minimum.
-        #
-        # HOW running tasks are counted matters (BUI-942 item 3):
-        #   * max_spawn set → running_count was computed above and the spawn
-        #     loop breaks at ``running_count + spawned >= max_spawn``, i.e. the
-        #     loop ALREADY subtracts already-running tasks. So cap max_spawn at
-        #     the full ceiling ``min(max_spawn, max_in_progress)`` and let the
-        #     loop do the subtraction ONCE. (The old code subtracted running
-        #     tasks here too — ``max_in_progress - in_progress`` — double
-        #     counting them, so ``min(3, 3)`` with one task running topped up
-        #     to 2 instead of the correct 3.)
-        #   * max_spawn is None → running_count stays 0 and the loop does NOT
-        #     subtract running tasks, so cap by the remaining headroom
-        #     ``max_in_progress - in_progress`` to top up toward the ceiling.
-        if max_spawn is None:
-            max_spawn = max_in_progress - in_progress
-        else:
-            max_spawn = min(max_spawn, max_in_progress)
     spawned = 0
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
@@ -7866,7 +7872,7 @@ def _dispatch_once_locked(
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
     for row in ready_rows:
-        if max_spawn is not None and running_count + spawned >= max_spawn:
+        if live_cap is not None and running_count + spawned >= live_cap:
             break
         row_assignee = row["assignee"]
         if not row_assignee:
@@ -7978,7 +7984,7 @@ def _dispatch_once_locked(
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             # Advance the spawn counter even in dry_run so the concurrency cap
-            # (``running_count + spawned >= max_spawn``) trips at the same point
+            # (``running_count + spawned >= live_cap``) trips at the same point
             # a real pass would. Without this, dry_run reported EVERY ready task
             # as a would-be spawn and ignored max_spawn entirely (BUI-942).
             spawned += 1
@@ -8059,16 +8065,18 @@ def _dispatch_once_locked(
     # sdlc-review skill) that verifies the PR and either merges (→ done)
     # or rejects (→ back to running for the worker to fix).
     #
-    # Same concurrency model as ready dispatch: review spawns count
-    # against max_spawn alongside ready tasks, so the total number of
-    # running workers stays bounded.
+    # Same concurrency model as ready dispatch, enforced by the SAME
+    # ``live_cap`` resolved once above: review spawns count against it
+    # alongside ready spawns and already-running workers, so the total number
+    # of running workers stays bounded no matter which lane the work came from
+    # (BUI-942 item 4).
     review_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'review' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     for row in review_rows:
-        if max_spawn is not None and running_count + spawned >= max_spawn:
+        if live_cap is not None and running_count + spawned >= live_cap:
             break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
@@ -8082,6 +8090,12 @@ def _dispatch_once_locked(
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
+            # Advance the shared spawn counter in dry_run too, exactly as the
+            # ready lane does above. Without it, a dry run reported EVERY review
+            # card as a would-be spawn and ignored the live ceiling entirely —
+            # the review lane's copy of the ready-lane dry_run bug, and another
+            # way the two lanes stopped sharing one cap (BUI-942 item 4).
+            spawned += 1
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
