@@ -26,8 +26,35 @@ These tests pin the fixed contract:
     zero, bool, container) fails CLOSED — the dispatcher stays up and spawns
     *nothing* rather than falling back to unlimited;
   * an unset value still means "no ceiling";
+  * quoting is not load-bearing — ``5.9`` and ``"5.9"`` are the same operator
+    intent and must resolve the same way (see below);
   * and, critically, the BUI-938 surfacing is NOT weakened — a genuine
     ``TypeError`` out of a tick still propagates out of the watcher.
+
+The quoting-parity follow-up
+----------------------------
+
+The first cut of the boundary converted with ``int()``, which reads a float and
+a string differently:
+
+    int(5.9)    -> 5              # silently truncated; ceiling nobody wrote
+    int("5.9")  -> ValueError     # fail closed
+
+So ``max_spawn: 5.9`` granted a live ceiling of 5 while ``max_spawn: "5.9"``
+withheld every spawn — the same intent resolving two ways depending on whether
+the YAML loader handed us a ``float`` or a ``str``. That is the exact ambiguity
+this boundary was added to eliminate, reintroduced one layer down.
+
+``int()`` also could not express the non-finite values YAML can produce:
+``max_spawn: .inf`` raised ``OverflowError``, which is **not** a ``ValueError``
+and therefore escaped the ``except`` entirely — out of ``_coerce_live_
+concurrency_cap``, out of ``_kanban_dispatcher_watcher`` (the call site sits
+above the per-tick guard), killing the dispatcher over a config value. A
+fail-closed boundary that fails *fatal* on one of its inputs is not fail-closed.
+
+Both spellings now take one path — ``float()``, then a finiteness screen, then
+a whole-number requirement — so the answer depends on the value, never on how
+it was typed.
 """
 
 from __future__ import annotations
@@ -391,3 +418,138 @@ def test_dispatch_once_receives_an_int_or_none_never_a_string(tmp_path):
     assert seen, "dispatch tick should have run"
     assert seen[0] == 5
     assert isinstance(seen[0], int) and not isinstance(seen[0], bool)
+
+
+# --------------------------------------------------------------------------
+# quoting parity: the value decides, not the spelling
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "number, quoted",
+    [
+        (5.9, "5.9"),            # THE case: int() truncated one, rejected the other
+        (0.5, "0.5"),            # rounds toward a below-1 cap under int()
+        (5.0, "5.0"),            # whole float — usable in both spellings
+        (float("inf"), "inf"),   # int() raised OverflowError on the float
+        (float("nan"), "nan"),
+    ],
+)
+def test_quoting_does_not_change_the_answer(number, quoted):
+    """A YAML loader decides whether a number arrives as ``float`` or ``str``.
+    That is not a decision about concurrency, so it must not move the ceiling."""
+    assert _coerce_live_concurrency_cap(
+        number, "kanban.max_spawn"
+    ) == _coerce_live_concurrency_cap(quoted, "kanban.max_spawn")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        5.9,             # THE regression: int() made this a live ceiling of 5
+        "5.9",
+        0.5,
+        "0.5",
+        2.000001,        # a hair off whole is still not whole
+        float("inf"),    # int() raised OverflowError, escaping the boundary
+        float("-inf"),
+        float("nan"),
+        "inf",
+        "1e400",         # overflows to inf on parse
+    ],
+)
+def test_fractional_and_non_finite_values_fail_closed(raw):
+    """Neither a fraction nor a non-finite value can be a live-worker ceiling.
+    Fail closed instead of truncating to whatever ``int()`` happened to yield —
+    a truncated cap is a ceiling the operator never wrote, granted silently."""
+    assert _coerce_live_concurrency_cap(raw, "kanban.max_spawn") == 0
+
+
+def test_non_finite_value_does_not_raise_out_of_the_boundary():
+    """``int(float("inf"))`` raises ``OverflowError`` — not a ``ValueError``, so
+    it sailed past the except clause and out of the watcher. The boundary must
+    absorb it like any other unusable value."""
+    for raw in (float("inf"), float("-inf"), float("nan"), "inf"):
+        assert _coerce_live_concurrency_cap(raw, "kanban.max_spawn") == 0
+
+
+def test_whole_floats_are_still_usable():
+    """Rejecting fractions must not turn into rejecting every float:
+    ``max_spawn: 5.0`` is an unambiguous 5 and stays one."""
+    assert _coerce_live_concurrency_cap(5.0, "kanban.max_spawn") == 5
+    assert _coerce_live_concurrency_cap("5.0", "kanban.max_spawn") == 5
+    assert _coerce_live_concurrency_cap(1.0, "kanban.max_spawn") == 1
+
+
+def test_integer_values_are_not_round_tripped_through_float():
+    """An ``int`` is already exact; parsing it as a float to reach the same
+    answer would introduce precision loss above 2**53 while fixing a precision
+    bug. Absurd as a ceiling, but it must not be silently *changed*."""
+    big = 2 ** 53 + 1
+    assert _coerce_live_concurrency_cap(big, "kanban.max_spawn") == big
+
+
+def test_fractional_fail_closed_logs_an_operator_facing_error(caplog):
+    """The operator wrote ``5.9`` and got no workers — that has to be findable
+    in the log, named and echoed, not inferred from an idle board."""
+    with caplog.at_level(logging.ERROR, logger="gateway.run"):
+        _coerce_live_concurrency_cap(5.9, "kanban.max_spawn")
+    assert len(caplog.records) == 1
+    msg = caplog.records[0].getMessage()
+    assert "kanban.max_spawn" in msg
+    assert "5.9" in msg
+    assert "refusing to spawn" in msg
+
+
+def test_fractional_max_spawn_fails_closed_without_killing_dispatcher(
+    kanban_home, spawnable, caplog
+):
+    """End-to-end on the real dispatcher: ``max_spawn: 5.9`` used to truncate to
+    a working ceiling of 5 and quietly spawn five workers. Same value quoted
+    spawned none. Now it fails closed either way, and the loop keeps ticking."""
+    _seed_ready(8)
+    runner = _make_runner()
+    spawns = []
+    ticks = []
+
+    with caplog.at_level(logging.ERROR, logger="gateway.run"):
+        _run_dispatcher(runner, _dispatcher_config(5.9), spawns, ticks=ticks)
+
+    assert spawns == [], "an unquoted fractional ceiling must not truncate to 5"
+    assert any("kanban.max_spawn" in r.getMessage() for r in caplog.records)
+    assert len(ticks) >= 3, "dispatcher aborted instead of continuing to tick"
+
+
+def test_infinite_max_spawn_does_not_kill_the_dispatcher(
+    kanban_home, spawnable, caplog
+):
+    """``max_spawn: .inf`` is legal YAML. It reached ``int()``, raised
+    ``OverflowError``, and — because the coercion happens above the per-tick
+    guard — took the dispatcher watcher down before the first tick."""
+    _seed_ready(4)
+    runner = _make_runner()
+    spawns = []
+    ticks = []
+
+    with caplog.at_level(logging.ERROR, logger="gateway.run"):
+        # Must NOT raise OverflowError out of the watcher.
+        _run_dispatcher(runner, _dispatcher_config(float("inf")), spawns, ticks=ticks)
+
+    assert spawns == [], "an unusable ceiling must not fall back to unlimited"
+    assert any("kanban.max_spawn" in r.getMessage() for r in caplog.records)
+    assert len(ticks) >= 3
+
+
+def test_unquoted_and_quoted_agree_through_the_real_dispatcher(
+    kanban_home, spawnable
+):
+    """The parity contract where it actually matters: same config value, two
+    spellings, same number of workers on the board."""
+    _seed_ready(8)
+    unquoted_spawns = []
+    _run_dispatcher(_make_runner(), _dispatcher_config(5.9), unquoted_spawns)
+
+    quoted_spawns = []
+    _run_dispatcher(_make_runner(), _dispatcher_config("5.9"), quoted_spawns)
+
+    assert unquoted_spawns == quoted_spawns == []

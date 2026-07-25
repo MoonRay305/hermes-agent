@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import sqlite3
 import time
@@ -101,8 +102,8 @@ def _coerce_live_concurrency_cap(raw: Any, setting: str) -> Optional[int]:
     A numeric string is *accepted and normalised* (``"5"`` -> ``5``): YAML
     quoting and env-var plumbing produce those routinely and the operator's
     intent is unambiguous. Only values that cannot yield a usable ceiling at
-    all — non-numeric strings, containers, ``bool``, zero and negatives — are
-    rejected.
+    all — non-numeric strings, fractional or non-finite numbers, containers,
+    ``bool``, zero and negatives — are rejected.
 
     **Why this boundary exists.** ``dispatch_once`` does arithmetic on this
     value (``min(...)``, ``>=`` against a running-task count). Handing it a raw
@@ -110,7 +111,7 @@ def _coerce_live_concurrency_cap(raw: Any, setting: str) -> Optional[int]:
     deliberately re-raises ``TypeError`` from a tick as a *programming* error
     (BUI-938) — so an operator's config typo would tear the whole dispatcher
     down. Converting here keeps that surfacing intact: the ``except`` below is
-    wrapped around the ``int()`` call and nothing else, so a genuine
+    wrapped around the ``float()`` call and nothing else, so a genuine
     ``TypeError`` from a real watcher bug still propagates untouched. A
     malformed *config value* is expected operational input, and it is handled
     locally, where it is read.
@@ -120,6 +121,18 @@ def _coerce_live_concurrency_cap(raw: Any, setting: str) -> Optional[int]:
     the ceiling, which is the exact opposite of what the operator asked for.
     Withholding spawns instead keeps the board bounded, keeps the dispatcher
     alive, and turns the mistake into a loud, actionable log line.
+
+    **Why quoting cannot change the answer.** ``max_spawn: 5.9`` and
+    ``max_spawn: "5.9"`` are one operator intent typed two ways — YAML decides
+    which one the loader hands us, and that is not a decision about
+    concurrency. A bare ``int()`` resolved them differently: it *truncated* the
+    float to ``5``, silently granting a ceiling nobody asked for, while
+    rejecting the string. A ceiling that depends on quoting is precisely the
+    ambiguity this boundary exists to remove, so both spellings take one path —
+    parse as ``float``, screen out the non-finite values (``int(float("inf"))``
+    raises ``OverflowError``, which is *not* a ``ValueError`` and so would
+    escape this function and kill the watcher outright), then require a whole
+    number. ``5.9`` and ``"5.9"`` now both fail closed, and so does ``.inf``.
     """
     if raw is None:
         return None
@@ -132,15 +145,44 @@ def _coerce_live_concurrency_cap(raw: Any, setting: str) -> Optional[int]:
             setting, raw,
         )
         return _SPAWN_CAP_FAIL_CLOSED
-    try:
-        value = int(raw)
-    except (TypeError, ValueError):
-        logger.error(
-            "kanban dispatcher: invalid %s=%r (expected a whole number >= 1); "
-            "refusing to spawn kanban workers until it is fixed",
-            setting, raw,
-        )
-        return _SPAWN_CAP_FAIL_CLOSED
+    if isinstance(raw, int):
+        # Already exact. Round-tripping through float() would lose precision
+        # above 2**53 on a value that needed no parsing in the first place.
+        value = raw
+    else:
+        # str and float share ONE path, so the result cannot depend on whether
+        # the number arrived quoted.
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError):
+            logger.error(
+                "kanban dispatcher: invalid %s=%r (expected a whole number >= 1); "
+                "refusing to spawn kanban workers until it is fixed",
+                setting, raw,
+            )
+            return _SPAWN_CAP_FAIL_CLOSED
+        if not math.isfinite(parsed):
+            # ``.inf`` / ``.nan`` / ``"1e400"``. int() cannot represent these:
+            # NaN raises ValueError but infinity raises OverflowError, which
+            # would sail past the except above and out of this function.
+            logger.error(
+                "kanban dispatcher: invalid %s=%r (expected a finite whole "
+                "number >= 1); refusing to spawn kanban workers until it is fixed",
+                setting, raw,
+            )
+            return _SPAWN_CAP_FAIL_CLOSED
+        if parsed != int(parsed):
+            # The quoting-parity case: reject the fractional value in either
+            # spelling rather than truncating one of them to a ceiling the
+            # operator never wrote.
+            logger.error(
+                "kanban dispatcher: invalid %s=%r (expected a whole number >= 1, "
+                "not a fractional one); refusing to spawn kanban workers until "
+                "it is fixed",
+                setting, raw,
+            )
+            return _SPAWN_CAP_FAIL_CLOSED
+        value = int(parsed)
     if value < 1:
         logger.error(
             "kanban dispatcher: %s=%r is below 1; refusing to spawn kanban "
