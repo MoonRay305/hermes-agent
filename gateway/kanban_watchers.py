@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import sqlite3
 import time
@@ -23,6 +24,30 @@ from agent.i18n import t
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+
+
+# Programming errors that a watcher tick must SURFACE, not mask (BUI-938).
+#
+# The fail-closed watcher loops catch a broad ``Exception`` around each tick so
+# one bad board / transient I/O hiccup never wedges the loop. That guard is
+# correct for *operational* failures — but it also used to swallow a bare typo
+# (``NameError``), a wrong attribute access (``AttributeError``), or a bad call
+# signature / type misuse (``TypeError``) and downgrade the bug to an
+# "unexpected watcher error" log line while the loop kept spinning. BUI-936 CI
+# confirmed the real-world cost: a ``NameError`` inside ``_auto_decompose_tick``
+# (an undefined name referenced when querying eligible candidates) was silently
+# masked and quietly changed corrupt-board behavior. These are watcher *bugs*,
+# not operational board/DB/network failures, so the tick bodies re-raise them.
+#
+# ``UnboundLocalError`` is a subclass of ``NameError`` and is covered too.
+#
+# NOTE on ``TypeError``: it is a programming-error class *here*, in tick
+# execution. The narrow config input-conversion boundaries in this module
+# (e.g. ``int(...)`` of a user-supplied interval / limit) still catch
+# ``(TypeError, ValueError)`` explicitly and locally — a malformed *config
+# value* is expected operational input, not a watcher bug. This tuple governs
+# the broad tick bodies, not those explicit boundaries.
+_WATCHER_PROGRAMMING_ERRORS = (NameError, AttributeError, TypeError)
 
 
 def _resolve_auto_decompose_settings(
@@ -55,6 +80,117 @@ def _resolve_auto_decompose_settings(
     if per_tick < 1:
         per_tick = 1
     return enabled, per_tick
+
+
+# A live-concurrency ceiling that could not be resolved from config. 0 means
+# "spawn nothing": ``dispatch_once`` counts already-running tasks plus this
+# tick's spawns against the ceiling, so 0 breaks both the ready and the review
+# spawn loop on their first iteration. The dispatcher itself keeps running —
+# heartbeat, stale-claim reclaim, promotion, reconciliation and notifications
+# all continue — only *new* work is withheld until the operator fixes the
+# value.
+_SPAWN_CAP_FAIL_CLOSED = 0
+
+
+def _coerce_live_concurrency_cap(raw: Any, setting: str) -> Optional[int]:
+    """Resolve a ``kanban.*`` live-concurrency ceiling to an ``int`` or ``None``.
+
+    Returns ``None`` when the setting is unset (no ceiling — the documented
+    default), the positive ``int`` when the value is usable, and
+    :data:`_SPAWN_CAP_FAIL_CLOSED` when it is not.
+
+    A numeric string is *accepted and normalised* (``"5"`` -> ``5``): YAML
+    quoting and env-var plumbing produce those routinely and the operator's
+    intent is unambiguous. Only values that cannot yield a usable ceiling at
+    all — non-numeric strings, fractional or non-finite numbers, containers,
+    ``bool``, zero and negatives — are rejected.
+
+    **Why this boundary exists.** ``dispatch_once`` does arithmetic on this
+    value (``min(...)``, ``>=`` against a running-task count). Handing it a raw
+    ``str`` raises ``TypeError`` deep inside a tick, and this module
+    deliberately re-raises ``TypeError`` from a tick as a *programming* error
+    (BUI-938) — so an operator's config typo would tear the whole dispatcher
+    down. Converting here keeps that surfacing intact: the ``except`` below is
+    wrapped around the ``float()`` call and nothing else, so a genuine
+    ``TypeError`` from a real watcher bug still propagates untouched. A
+    malformed *config value* is expected operational input, and it is handled
+    locally, where it is read.
+
+    **Why it fails closed rather than ignoring the value.** Falling back to
+    ``None`` would mean *unlimited*: a typo in a safety ceiling would remove
+    the ceiling, which is the exact opposite of what the operator asked for.
+    Withholding spawns instead keeps the board bounded, keeps the dispatcher
+    alive, and turns the mistake into a loud, actionable log line.
+
+    **Why quoting cannot change the answer.** ``max_spawn: 5.9`` and
+    ``max_spawn: "5.9"`` are one operator intent typed two ways — YAML decides
+    which one the loader hands us, and that is not a decision about
+    concurrency. A bare ``int()`` resolved them differently: it *truncated* the
+    float to ``5``, silently granting a ceiling nobody asked for, while
+    rejecting the string. A ceiling that depends on quoting is precisely the
+    ambiguity this boundary exists to remove, so both spellings take one path —
+    parse as ``float``, screen out the non-finite values (``int(float("inf"))``
+    raises ``OverflowError``, which is *not* a ``ValueError`` and so would
+    escape this function and kill the watcher outright), then require a whole
+    number. ``5.9`` and ``"5.9"`` now both fail closed, and so does ``.inf``.
+    """
+    if raw is None:
+        return None
+    # bool is an int subclass — ``max_spawn: true`` is a config mistake, not a
+    # ceiling of 1, so reject it before int() silently accepts it.
+    if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+        logger.error(
+            "kanban dispatcher: invalid %s=%r (expected a whole number >= 1); "
+            "refusing to spawn kanban workers until it is fixed",
+            setting, raw,
+        )
+        return _SPAWN_CAP_FAIL_CLOSED
+    if isinstance(raw, int):
+        # Already exact. Round-tripping through float() would lose precision
+        # above 2**53 on a value that needed no parsing in the first place.
+        value = raw
+    else:
+        # str and float share ONE path, so the result cannot depend on whether
+        # the number arrived quoted.
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError):
+            logger.error(
+                "kanban dispatcher: invalid %s=%r (expected a whole number >= 1); "
+                "refusing to spawn kanban workers until it is fixed",
+                setting, raw,
+            )
+            return _SPAWN_CAP_FAIL_CLOSED
+        if not math.isfinite(parsed):
+            # ``.inf`` / ``.nan`` / ``"1e400"``. int() cannot represent these:
+            # NaN raises ValueError but infinity raises OverflowError, which
+            # would sail past the except above and out of this function.
+            logger.error(
+                "kanban dispatcher: invalid %s=%r (expected a finite whole "
+                "number >= 1); refusing to spawn kanban workers until it is fixed",
+                setting, raw,
+            )
+            return _SPAWN_CAP_FAIL_CLOSED
+        if parsed != int(parsed):
+            # The quoting-parity case: reject the fractional value in either
+            # spelling rather than truncating one of them to a ceiling the
+            # operator never wrote.
+            logger.error(
+                "kanban dispatcher: invalid %s=%r (expected a whole number >= 1, "
+                "not a fractional one); refusing to spawn kanban workers until "
+                "it is fixed",
+                setting, raw,
+            )
+            return _SPAWN_CAP_FAIL_CLOSED
+        value = int(parsed)
+    if value < 1:
+        logger.error(
+            "kanban dispatcher: %s=%r is below 1; refusing to spawn kanban "
+            "workers until it is fixed (remove the setting for no ceiling)",
+            setting, raw,
+        )
+        return _SPAWN_CAP_FAIL_CLOSED
+    return value
 
 
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
@@ -790,6 +926,14 @@ class GatewayKanbanWatchersMixin:
                             await asyncio.to_thread(
                                 self._kanban_unsub, sub, board_slug,
                             )
+            except _WATCHER_PROGRAMMING_ERRORS:
+                # A typo / bad attribute / bad call signature in the notifier
+                # tick is a bug, not a delivery outage — surface it instead of
+                # masking it as an operational "tick failed" (BUI-938). Best-
+                # effort *delivery* boundaries inside the tick (adapter.send,
+                # artifact upload, wake injection) keep their own broad catches
+                # on purpose: a flaky adapter must not crash the watcher.
+                raise
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
             # Sleep with cancellation checks.
@@ -1142,8 +1286,21 @@ class GatewayKanbanWatchersMixin:
                 "on config control alone.", _lock_path,
             )
 
-        # Read max_spawn config to limit concurrent kanban tasks
-        max_spawn = kanban_cfg.get("max_spawn", None)
+        # Read max_spawn config to limit concurrent kanban tasks.
+        #
+        # max_spawn is a LIVE concurrency ceiling (the maximum number of
+        # workers running at any instant), NOT a per-tick launch budget —
+        # already-running tasks count against it. dispatch_once therefore does
+        # arithmetic on this value (min(...), >= against a running-task
+        # count), so it has to arrive as an int.
+        #
+        # Coerce HERE, at the config boundary, and fail CLOSED on a value that
+        # cannot yield a usable ceiling. This module re-raises TypeError out of
+        # a tick as a programming error (BUI-938), so a raw string reaching
+        # that arithmetic would tear the dispatcher down over an operator typo.
+        max_spawn = _coerce_live_concurrency_cap(
+            kanban_cfg.get("max_spawn", None), "kanban.max_spawn",
+        )
         if max_spawn is not None:
             logger.info("kanban dispatcher: max_spawn=%s", max_spawn)
 
@@ -1354,6 +1511,14 @@ class GatewayKanbanWatchersMixin:
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
                 return None
+            except _WATCHER_PROGRAMMING_ERRORS:
+                # A NameError/AttributeError/TypeError out of dispatch_once is a
+                # watcher bug, not a per-board operational failure. Do NOT
+                # downgrade it to a swallowed "tick failed on board" + return
+                # None (which would let the loop keep spinning on a broken
+                # build and mask the defect, as in BUI-936). Surface it to the
+                # dispatcher loop, which tears down and re-raises (BUI-938).
+                raise
             except Exception as exc:
                 if _is_corrupt_board_db_error(exc):
                     disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
@@ -1480,6 +1645,15 @@ class GatewayKanbanWatchersMixin:
                         triage_ids = _decomp.list_auto_decompose_ids(
                             limit=auto_decompose_per_tick,
                         )
+                    except _WATCHER_PROGRAMMING_ERRORS:
+                        # The confirmed BUI-936 failure: a NameError raised here
+                        # (list_auto_decompose_ids called with an undefined name)
+                        # was swallowed into an empty triage list, so the sweep
+                        # silently no-op'd and the defect was invisible. A
+                        # NameError/AttributeError/TypeError on this call is a
+                        # watcher bug — surface it (BUI-938) rather than
+                        # downgrading it to "no triage tasks this tick".
+                        raise
                     except Exception as exc:
                         logger.debug(
                             "kanban auto-decompose: list_auto_decompose_ids failed on board %s (%s)",
@@ -1494,6 +1668,16 @@ class GatewayKanbanWatchersMixin:
                             outcome = _decomp.decompose_task(
                                 tid, author="auto-decomposer",
                             )
+                        except _WATCHER_PROGRAMMING_ERRORS:
+                            # Consistent with the sibling list call above: a
+                            # NameError/AttributeError/TypeError from invoking
+                            # decompose_task is a watcher bug, not a per-task
+                            # operational failure, so it must not be downgraded
+                            # to a logged "crashed" + continue (which would let
+                            # the sweep spin over a broken build). Surface it
+                            # (BUI-938). Genuine per-task operational failures
+                            # still fail closed below (log + skip this task).
+                            raise
                         except Exception:
                             logger.exception(
                                 "kanban auto-decompose: decompose_task crashed on %s",
@@ -1695,6 +1879,20 @@ class GatewayKanbanWatchersMixin:
                 logger.debug("kanban dispatcher: cancelled")
                 _kb_clear_heartbeat_safe(_kb)
                 self._release_kanban_dispatcher_lock()
+                raise
+            except _WATCHER_PROGRAMMING_ERRORS:
+                # Surface programming errors instead of masking them as an
+                # "unexpected watcher error" and spinning the loop (BUI-938):
+                # a NameError inside a tick used to be logged and swallowed,
+                # hiding the defect and silently changing corrupt-board
+                # behavior (BUI-936). Tear down the same way the cancellation
+                # path does — clear the heartbeat and release the singleton
+                # lock — so a standby can take over the dispatcher, then
+                # re-raise so CI / operators see the crash.
+                logger.exception("kanban dispatcher: programming error in tick; surfacing")
+                _kb_clear_heartbeat_safe(_kb)
+                _release_singleton_lock(self._kanban_dispatcher_lock_handle)
+                self._kanban_dispatcher_lock_handle = None
                 raise
             except Exception:
                 logger.exception("kanban dispatcher: unexpected watcher error")
