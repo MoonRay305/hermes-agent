@@ -1463,6 +1463,25 @@ updates:
 #   # Env override: HERMES_REQUIRE_DECLARED_DATA_CLASS=1
 #   require_declared_data_class: false
 #
+#   # An `llm_execution` middleware is handed a `next_call` and is expected to
+#   # pass the request down it; that path ends at the agent's own send, where
+#   # the gate re-checks the exact payload before it goes out. A middleware may
+#   # instead call the provider itself and never touch `next_call` — and then
+#   # Hermes never sees the bytes, so there is nothing to inspect. That send
+#   # CANNOT be blocked: by the time the middleware returns, it has happened.
+#   #
+#   # Such a turn is always logged to the gate's audit file, so it does not pass
+#   # silently. When this flag is true the turn additionally fails: the
+#   # middleware's response is discarded instead of entering the conversation.
+#   # That bounds the exposure to one exchange and names the plugin — it does
+#   # not un-send the request. Treat a block here as a middleware to remove.
+#   #
+#   # Off by default: a response cache or offline-replay middleware legitimately
+#   # answers without calling `next_call`, and Hermes cannot tell that apart
+#   # from a self-send, so defaulting this on would break those plugins.
+#   # Env override: HERMES_REQUIRE_MEDIATED_EXECUTION=1
+#   require_mediated_execution: false
+#
 #   # Override which classes count as sensitive. Default: client, legal,
 #   # financial, trading, personal_health, private, production, secret.
 #   sensitive_classes: [client, legal, financial, trading, personal_health, private, production, secret]

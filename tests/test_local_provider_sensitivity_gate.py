@@ -1,3 +1,4 @@
+import hashlib
 import json
 import pathlib
 from types import SimpleNamespace
@@ -712,3 +713,153 @@ def test_ordinary_local_turn_still_reaches_the_provider(monkeypatch, tmp_path):
 
     assert client.chat.completions.calls >= 1, "benign local turn was blocked"
     assert str(result["final_response"]).startswith("done")
+
+
+# ---------------------------------------------------------------------------
+# Unmediated execution middleware (BUI-370 follow-up).
+#
+# End-to-end coverage lives in
+# tests/run_agent/test_local_provider_gate_execution_middleware.py; these pin
+# the gate-module contract the loop depends on.
+# ---------------------------------------------------------------------------
+
+
+def _unmediated(**kwargs):
+    from agent.local_provider_sensitivity_gate import evaluate_unmediated_execution
+
+    kwargs.setdefault("provider", "ollama")
+    kwargs.setdefault("base_url", "http://127.0.0.1:11434/v1")
+    kwargs.setdefault("model", "llama3.2")
+    return evaluate_unmediated_execution(**kwargs)
+
+
+def test_unmediated_execution_is_allowed_but_audited_by_default(tmp_path, monkeypatch):
+    """Default: the turn proceeds, but the un-inspected send is on the record."""
+    import agent.local_provider_sensitivity_gate as gate
+
+    monkeypatch.setattr(gate, "get_hermes_home", lambda: str(tmp_path))
+    monkeypatch.delenv("HERMES_REQUIRE_MEDIATED_EXECUTION", raising=False)
+
+    decision = _unmediated(config={})
+
+    assert decision.allowed is True
+    assert decision.local_route is True
+    assert decision.reason == "unmediated_execution_middleware"
+
+    event = json.loads(
+        (tmp_path / "logs" / "local_provider_sensitivity_gate.jsonl")
+        .read_text()
+        .splitlines()[-1]
+    )
+    assert event["reason"] == "unmediated_execution_middleware"
+    assert event["decision"] == "allow"
+    assert event["base_url_host"] == "127.0.0.1"
+
+
+def test_unmediated_execution_denies_under_require_mediated_execution(tmp_path, monkeypatch):
+    import agent.local_provider_sensitivity_gate as gate
+
+    monkeypatch.setattr(gate, "get_hermes_home", lambda: str(tmp_path))
+
+    decision = _unmediated(config={"local_provider_sensitivity": {"require_mediated_execution": True}})
+
+    assert decision.allowed is False
+    assert decision.reason == "unmediated_execution_middleware"
+
+    with pytest.raises(LocalProviderSensitivityBlocked) as excinfo:
+        gate.assert_mediated_execution(
+            provider="ollama",
+            base_url="http://127.0.0.1:11434/v1",
+            model="llama3.2",
+            config={"local_provider_sensitivity": {"require_mediated_execution": True}},
+        )
+    message = str(excinfo.value)
+    # The message must not claim the send was prevented -- it was not.
+    assert "could not be prevented" in message
+    assert "next_call" in message
+
+
+def test_unmediated_execution_env_override(tmp_path, monkeypatch):
+    import agent.local_provider_sensitivity_gate as gate
+
+    monkeypatch.setattr(gate, "get_hermes_home", lambda: str(tmp_path))
+    monkeypatch.setenv("HERMES_REQUIRE_MEDIATED_EXECUTION", "1")
+
+    assert _unmediated(config={}).allowed is False
+
+    monkeypatch.setenv("HERMES_REQUIRE_MEDIATED_EXECUTION", "0")
+    assert _unmediated(config={"local_provider_sensitivity": {"require_mediated_execution": True}}).allowed is True
+
+
+def test_unmediated_execution_has_no_jurisdiction_over_cloud_routes(tmp_path, monkeypatch):
+    import agent.local_provider_sensitivity_gate as gate
+
+    monkeypatch.setattr(gate, "get_hermes_home", lambda: str(tmp_path))
+
+    decision = _unmediated(
+        provider="openai",
+        base_url="https://api.openai.com/v1",
+        config={"local_provider_sensitivity": {"require_mediated_execution": True}},
+    )
+
+    assert decision.allowed is True
+    assert decision.local_route is False
+    assert decision.reason == "not_local_route"
+    assert not (tmp_path / "logs" / "local_provider_sensitivity_gate.jsonl").exists()
+
+
+def test_unmediated_execution_respects_the_disable_switch(tmp_path, monkeypatch):
+    import agent.local_provider_sensitivity_gate as gate
+
+    monkeypatch.setattr(gate, "get_hermes_home", lambda: str(tmp_path))
+
+    decision = _unmediated(
+        config={
+            "local_provider_sensitivity": {
+                "enabled": False,
+                "require_mediated_execution": True,
+            }
+        }
+    )
+
+    assert decision.allowed is True
+    assert decision.reason == "gate_disabled"
+
+
+def test_unmediated_execution_fails_closed_on_an_unreadable_config(tmp_path, monkeypatch):
+    """Same posture as the content path: a config we cannot read denies local."""
+    import agent.local_provider_sensitivity_gate as gate
+
+    monkeypatch.setattr(gate, "get_hermes_home", lambda: str(tmp_path))
+
+    def _boom():
+        raise PermissionError("config unreadable")
+
+    monkeypatch.setattr(gate, "load_config", _boom)
+
+    decision = _unmediated()
+    assert decision.allowed is False
+    assert decision.local_route is True
+    assert decision.reason == "gate_evaluation_failed"
+
+    cloud = _unmediated(provider="openai", base_url="https://api.openai.com/v1")
+    assert cloud.allowed is True
+
+
+def test_canonical_request_text_is_the_text_the_gate_classifies():
+    """The loop compares this string to decide whether a re-check is needed."""
+    from agent.local_provider_sensitivity_gate import (
+        canonical_request_text,
+        classify_request,
+    )
+
+    messages = [{"role": "user", "content": "hello there"}]
+    text = canonical_request_text(messages)
+    assert "hello there" in text
+
+    _classes, _redacted, _counts, digest = classify_request(messages)
+    assert digest == hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+
+    # A payload that gained content must not fingerprint equal to the original.
+    grown = messages + [{"role": "user", "content": "API_KEY=REDACTMEVALUE1234567890"}]
+    assert canonical_request_text(grown) != text

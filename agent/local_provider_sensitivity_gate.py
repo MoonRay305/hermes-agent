@@ -134,6 +134,22 @@ class LocalProviderSensitivityBlocked(RuntimeError):
                 "accepted here. No raw prompt text or secret values were logged."
             )
             return
+        if decision.reason == "unmediated_execution_middleware":
+            # Deliberately worded as "was sent", not "was blocked": this turn's
+            # request already left the process via a middleware that performed
+            # the provider call itself. Only the response is being discarded.
+            super().__init__(
+                "An llm_execution middleware performed the provider call itself "
+                f"instead of passing it down next_call, so this request was {where} "
+                "without the local provider sensitivity gate being able to inspect "
+                "it. This deployment sets "
+                "local_provider_sensitivity.require_mediated_execution, so the "
+                "response is discarded and the turn fails. The send itself could "
+                "not be prevented — remove or fix the middleware rather than "
+                "relying on this check. No raw prompt text or secret values were "
+                "logged."
+            )
+            return
         classes = ", ".join(decision.data_classes) or "sensitive"
         super().__init__(
             "Local provider sensitivity gate blocked this request before it was "
@@ -303,20 +319,36 @@ PATTERNS: tuple[PatternDef, ...] = (
     # The test each one had to pass: zero occurrences in AGENTS.md — which is
     # embedded verbatim into Hermes' system prompt, so a token appearing there
     # denies *every* local turn — and near-zero occurrence across this repo's
-    # 5,782-file corpus.  Measured hits (corpus files / AGENTS.md):
+    # corpus.
     #
-    #     counsel      2 /0     invoice   8 /0     subpoena   0 /0
-    #     malpractice  0 /0     prognosis 0 /0     retainer   0 /0
+    # CORPUS: the 6,059 text files tracked by git at this branch's merge-base,
+    # c54fee563 — which is the tree this gate is being added to, so it excludes
+    # the gate's own module, tests and docs and the pattern list is not measured
+    # against itself.  Both numbers below are reproducible, and must be re-derived
+    # rather than copied forward if this list is ever revisited:
     #
-    # and the `counsel`/`invoice` corpus hits are this module and docs prose.
+    #     denominator:  git grep -lI  ''    c54fee563 | wc -l
+    #     per token:    git grep -lwiI TOKEN c54fee563 | wc -l
+    #
+    # Measured hits (corpus files / AGENTS.md):
+    #
+    #     counsel      2 /0     subpoena   0 /0     malpractice  0 /0
+    #     disbarment   0 /0     deposed    0 /0
+    #     invoice      7 /0     remittance 0 /0     garnishment  0 /0
+    #     prognosis    0 /0     comorbidity 0 /0    immunization 0 /0
+    #
+    # and the `counsel`/`invoice` corpus hits are docs prose.  Restoring all
+    # eleven costs +8 files of 6,059 — that is, 8 files classify sensitive that
+    # would not otherwise, measured by running the real classifier over the
+    # corpus with and without these three PatternDefs.
     #
     # Deliberately NOT restored, with their measurements, so this is not
     # re-litigated from intuition later:
     #
-    #     client     904 files / 4 in AGENTS.md      production 407 / 1
-    #     options    415 / 1                         symptom     90 / 2
-    #     futures     93 / 0  (`concurrent.futures`) privileged  32 / 0
-    #     diagnosis   26 / 0  ("diagnosis" of a bug, in troubleshooting docs)
+    #     client     913 files / 4 in AGENTS.md      production 417 / 1
+    #     options    459 / 1                         symptom     88 / 2
+    #     futures     91 / 0  (`concurrent.futures`) privileged  31 / 0
+    #     diagnosis   24 / 0  ("diagnosis" of a bug, in troubleshooting docs)
     #
     # The first four appear in the system prompt itself and would restore the
     # 100%-denial outage this gate was remediated for.  `futures` is a stdlib
@@ -426,6 +458,18 @@ def _message_text(value: Any) -> Iterable[str]:
 
 def _canonical_request_text(messages: Any) -> str:
     return "\n".join(part for part in _message_text(messages) if part)
+
+
+def canonical_request_text(messages: Any) -> str:
+    """Public view of the exact text this gate classifies.
+
+    A caller that gates the same request at more than one point — see the
+    pre-chain and terminal checks in ``agent/conversation_loop.py`` — uses this
+    to tell whether the payload changed in between.  Comparing this string may
+    only ever be used to *skip* a re-check when the text is byte-identical;
+    never to skip one when it differs, or when the comparison itself failed.
+    """
+    return _canonical_request_text(messages)
 
 
 def classify_request(messages: Any, *, declared_data_class: str | None = None) -> tuple[list[str], str, dict[str, int], str]:
@@ -550,6 +594,35 @@ def _require_declared_data_class(config: dict[str, Any]) -> bool:
     section = config.get("local_provider_sensitivity") if isinstance(config, dict) else None
     if isinstance(section, dict) and "require_declared_data_class" in section:
         return bool(section.get("require_declared_data_class"))
+    return False
+
+
+def _require_mediated_execution(config: dict[str, Any]) -> bool:
+    """Opt-in: refuse a local turn whose provider call the gate could not see.
+
+    An ``llm_execution`` middleware is handed ``next_call`` and is *expected*
+    to pass the request down it; that path terminates in the agent's own send,
+    where the gate re-checks the exact payload.  A callback may instead perform
+    provider execution itself and return a response without ever calling
+    ``next_call`` — at which point it, not the agent, holds the socket.
+
+    That case cannot be prevented in-band, and this flag does not claim to
+    prevent it: by the time the chain returns, the bytes are already gone.  See
+    ``evaluate_unmediated_execution`` for exactly what it does and does not buy.
+
+    Off by default for the same reason ``require_declared_data_class`` is: a
+    response cache or an offline-replay middleware legitimately answers without
+    calling ``next_call``, and Hermes cannot tell that apart from a self-send.
+    Defaulting this on would break those plugins on every local route.
+    """
+    env = os.getenv("HERMES_REQUIRE_MEDIATED_EXECUTION", "").strip().lower()
+    if env in _TRUTHY:
+        return True
+    if env in _FALSEY:
+        return False
+    section = config.get("local_provider_sensitivity") if isinstance(config, dict) else None
+    if isinstance(section, dict) and "require_mediated_execution" in section:
+        return bool(section.get("require_mediated_execution"))
     return False
 
 
@@ -838,6 +911,112 @@ def assert_local_provider_request_allowed(**kwargs: Any) -> SensitivityDecision:
             _write_audit(decision)
         except Exception as exc:  # pragma: no cover - _write_audit is already defensive
             logger.debug("local provider sensitivity audit write failed: %s", exc)
+    if not decision.allowed:
+        raise LocalProviderSensitivityBlocked(decision)
+    return decision
+
+
+def evaluate_unmediated_execution(
+    *,
+    provider: Any,
+    base_url: Any,
+    model: Any,
+    config: dict[str, Any] | None = None,
+) -> SensitivityDecision:
+    """Decide what to do about a local turn the gate never got to see.
+
+    **This is containment, not prevention, and the distinction is the whole
+    point of this function's existence.**
+
+    ``run_llm_execution_middleware`` hands each callback a ``next_call``.  A
+    callback that uses it lands in the agent's own send, where the terminal
+    check re-classifies the exact payload — that path is fully covered.  A
+    callback may instead open its own connection to the provider and return a
+    response without calling ``next_call`` at all.  Those bytes never traverse
+    any code the agent controls: there is no interposition point, so there is
+    nothing to gate.  By the time the middleware chain returns and Hermes can
+    observe that the terminal boundary was skipped, the request has already
+    been sent and any disclosure has already happened.
+
+    So this call cannot stop that send.  What it can do:
+
+    * **Always** (local routes): record an audit event, so an operator
+      reviewing ``local_provider_sensitivity_gate.jsonl`` sees that a turn went
+      out un-inspected instead of the gate's silence implying it was clean.
+    * **Under ``require_mediated_execution``**: deny the turn — the response is
+      discarded rather than adopted into the conversation, and the loop reports
+      a block.  That bounds the blast radius to one exchange and surfaces the
+      plugin, but the outbound request is already gone.
+
+    The only true prevention is not registering an unmediated ``llm_execution``
+    middleware on a local route in the first place.  A deployment that needs
+    the strong guarantee should set ``require_mediated_execution`` and treat
+    any resulting block as a plugin to remove, not a setting to turn back off.
+    """
+    try:
+        if config is None:
+            config = load_config() or {}
+        provider_id = _normalize_provider(provider)
+        local_route = is_local_provider_route(provider_id, base_url)
+        host = _host_from_base_url(base_url)
+        enabled = _enabled(config)
+        required = _require_mediated_execution(config)
+    except Exception as exc:
+        # Mirror evaluate_local_provider_request: an evaluation we could not
+        # complete denies a local route and leaves cloud routes alone.
+        local_route = is_local_provider_route(provider, base_url)
+        logger.warning(
+            "local_provider_sensitivity_gate: unmediated-execution evaluation "
+            "failed (%s); %s.",
+            type(exc).__name__,
+            "denying the local route (fail closed)" if local_route
+            else "allowing the non-local route (gate has no jurisdiction)",
+        )
+        return SensitivityDecision(
+            allowed=not local_route,
+            local_route=local_route,
+            provider="",
+            model=str(model or ""),
+            base_url_host="",
+            reason="gate_evaluation_failed",
+        )
+
+    decision = SensitivityDecision(
+        allowed=not (enabled and local_route and required),
+        local_route=local_route,
+        provider=provider_id,
+        model=str(model or ""),
+        base_url_host=host,
+        reason=(
+            "gate_disabled" if not enabled
+            else "unmediated_execution_middleware" if local_route
+            else "not_local_route"
+        ),
+    )
+
+    if enabled and local_route:
+        # Unconditional: the operator must be able to see that this turn was
+        # not inspected, whether or not the strict flag is on.
+        logger.warning(
+            "local_provider_sensitivity_gate: an llm_execution middleware "
+            "performed the provider call itself on a local route (%s); the "
+            "payload actually sent could not be inspected. %s",
+            host or "unknown host",
+            "Denying this turn (require_mediated_execution)." if required
+            else "Set local_provider_sensitivity.require_mediated_execution to "
+                 "deny turns the gate cannot see.",
+        )
+        try:
+            _write_audit(decision)
+        except Exception as exc:  # pragma: no cover - _write_audit is defensive
+            logger.debug("local provider sensitivity audit write failed: %s", exc)
+
+    return decision
+
+
+def assert_mediated_execution(**kwargs: Any) -> SensitivityDecision:
+    """``evaluate_unmediated_execution`` that raises when the turn is denied."""
+    decision = evaluate_unmediated_execution(**kwargs)
     if not decision.allowed:
         raise LocalProviderSensitivityBlocked(decision)
     return decision
