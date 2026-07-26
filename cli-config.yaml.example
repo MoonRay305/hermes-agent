@@ -1439,3 +1439,51 @@ updates:
 #     binary_path: ""                               # "" = resolve op via PATH; else absolute path
 #     cache_ttl_seconds: 300                        # 0 disables BOTH cache layers
 #     override_existing: true                       # resolved values win over existing env
+
+# =============================================================================
+# Local-provider sensitivity gate (BUI-370)
+# =============================================================================
+# Classifies every outbound request to a LOCAL provider (Ollama, LM Studio,
+# llama.cpp, localhost/private-IP custom endpoints) and blocks sensitive data
+# classes unless a route is explicitly approved. Cloud providers are out of
+# scope. Full docs: website/docs/integrations/providers.md
+#
+# READ THIS BEFORE RELYING ON IT: with nothing declared below, the gate runs on
+# CONTENT MATCHING ALONE, which is a best-effort backstop and will miss things.
+# Ordinary-sounding sensitive prose passes an undeclared local route. The
+# declared data class is the signal to rely on -- Hermes never sets it for you.
+#
+# local_provider_sensitivity:
+#   enabled: true                       # false (or HERMES_LOCAL_PROVIDER_SENSITIVITY_GATE=0) disables the gate
+#
+#   # Strict mode. When true, a local route with NO declared data class is
+#   # denied outright, before content matching gets a vote. This is what turns
+#   # best-effort filtering into an actual guarantee. Off by default: nothing
+#   # declares out of the box, so defaulting it on denies ALL local traffic.
+#   # Env override: HERMES_REQUIRE_DECLARED_DATA_CLASS=1
+#   require_declared_data_class: false
+#
+#   # Override which classes count as sensitive. Default: client, legal,
+#   # financial, trading, personal_health, private, production, secret.
+#   sensitive_classes: [client, legal, financial, trading, personal_health, private, production, secret]
+#
+#   approved_routes:
+#     - provider: custom
+#       base_url: http://localhost:11434/v1
+#       model: qwen2.5-coder:32b
+#       data_classes: [personal_health, private]   # must be non-empty; ["*"] = intentionally broad
+#       approved: true
+#       approval_id: local-personal-health-route-approval
+#
+# The authoritative declaration. Applies regardless of message content.
+# Env override: HERMES_DATA_CLASS (or HERMES_WORKER_DATA_CLASS).
+#
+# worker_contract:
+#   data_class: personal_health
+#   allowed_model_routes:
+#     - provider: custom
+#       base_url: http://localhost:11434/v1
+#       model: qwen2.5-coder:32b
+#       data_classes: [personal_health, private]
+#       approved: true
+#       approval_id: local-personal-health-route-approval

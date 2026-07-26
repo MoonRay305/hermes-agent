@@ -654,15 +654,21 @@ model:
   context_length: 64000   # See warning below
 ```
 
-:::caution Sensitive/private data is blocked from local routes by default
+:::caution Local-route sensitivity gate — read what it does and does not guarantee
 Before Hermes sends a request to a local provider (Ollama, LM Studio, llama.cpp, localhost/private-IP custom endpoints), it classifies the outbound request and denies sensitive data classes — client, legal, financial, trading, personal health, private, production, and secrets — unless the current worker contract or `local_provider_sensitivity.approved_routes` explicitly approves that provider/model/base URL for every detected class.
+
+**What this does not mean.** On a stock install, nothing declares a data class, so the gate is running on **content matching alone — a best-effort backstop that will miss things**. It is not a guarantee that sensitive data cannot reach a local model. Treat an undeclared local route as filtered, not as safe. If that is not good enough for your deployment, turn on strict mode (below).
 
 Two signals feed the classification:
 
-- **The declared data class** — `HERMES_DATA_CLASS`, or `worker_contract.data_class` — is authoritative and applies regardless of message content. **If you route sensitive work to a local model, declare it here.** This is the signal to rely on.
-- **Content matching** is a backstop for undeclared data. It looks for credential shapes (private keys, bearer tokens, `KEY=value` assignments, provider tokens, AWS keys, connection strings) and for topic phrases such as `client file`, `medical record`, `wire transfer`, `production credentials`. Matching is phrase-anchored on purpose: bare words like `client`, `production` or `options` occur constantly in source code and developer documentation, so matching them would deny every local request rather than the sensitive ones. Content matching will not catch everything — it is not a substitute for declaring the data class.
+- **The declared data class** — `HERMES_DATA_CLASS`, or `worker_contract.data_class` — is authoritative and applies regardless of message content. **If you route sensitive work to a local model, declare it here.** This is the signal to rely on. Hermes never sets it for you; it is operator input, and it is unset until you set it.
+- **Content matching** is the backstop when nothing is declared. It looks for credential shapes (private keys, bearer tokens, `KEY=value` assignments, provider tokens, AWS keys, connection strings), topic phrases such as `client file`, `medical record`, `wire transfer`, `production credentials`, and a small set of high-signal bare words (`counsel`, `subpoena`, `invoice`, `prognosis`, …).
 
-The gate **fails closed**. If it cannot reach a decision — unreadable config, an unexpected payload shape, an internal error — the request is blocked rather than sent, and the block is reported separately from a policy denial. A failure evaluating a *non-local* route is allowed through, since this gate has no jurisdiction over cloud providers.
+  Most matching is phrase-anchored on purpose. Bare words like `client`, `production`, `options` and `symptom` appear in `AGENTS.md`, which is embedded verbatim into Hermes' own system prompt — matching them denied **100% of local requests**, which is an outage, not a control. Bare words are only used where they were measured to be absent from the system prompt and effectively absent from ordinary source and docs. The practical consequence: ordinary-sounding sensitive prose (*"the client asked about the production rollout"*) **passes an undeclared local route**. Declare the data class if that matters to you.
+
+**Strict mode — require an explicit declaration.** Set `local_provider_sensitivity.require_declared_data_class: true` (or `HERMES_REQUIRE_DECLARED_DATA_CLASS=1`) and any local route with no declared data class is denied outright, before content matching gets a vote. This is the setting that turns "best-effort filtering" into an actual guarantee. It is **off by default** deliberately: because nothing declares out of the box, defaulting it on would deny every local-provider request on a fresh install.
+
+The gate **fails closed**. If it cannot reach a decision — unreadable or unparseable config, an unexpected payload shape, an internal error — the request is blocked rather than sent, and the block is reported separately from a policy denial. A failure evaluating a *non-local* route is allowed through, since this gate has no jurisdiction over cloud providers.
 
 Set `local_provider_sensitivity.enabled: false` (or `HERMES_LOCAL_PROVIDER_SENSITIVITY_GATE=0`) to turn the gate off entirely. That is an explicit operator decision and is honoured; it is not the same as the gate failing.
 

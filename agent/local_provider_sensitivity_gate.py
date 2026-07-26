@@ -124,6 +124,16 @@ class LocalProviderSensitivityBlocked(RuntimeError):
                 "values were logged."
             )
             return
+        if decision.reason == "no_declared_data_class":
+            super().__init__(
+                "Local provider sensitivity gate blocked this request before it "
+                f"was {where}. This deployment sets "
+                "local_provider_sensitivity.require_declared_data_class, so a "
+                "local route needs an explicit data class: set HERMES_DATA_CLASS "
+                "or worker_contract.data_class. Content matching alone is not "
+                "accepted here. No raw prompt text or secret values were logged."
+            )
+            return
         classes = ", ".join(decision.data_classes) or "sensitive"
         super().__init__(
             "Local provider sensitivity gate blocked this request before it was "
@@ -283,6 +293,53 @@ PATTERNS: tuple[PatternDef, ...] = (
         re.compile(r"\b(?:SOW|MSA|NDA)\b"),
         ("legal", "client"),
         "[LEGAL_TERM]",
+    ),
+    # --- High-signal bare tokens -----------------------------------------
+    #
+    # Phrase anchoring alone leaves real gaps: "counsel advised against it"
+    # and "pull the invoice" carry the same exposure as the phrases above but
+    # match nothing.  These are the bare tokens that survived measurement.
+    #
+    # The test each one had to pass: zero occurrences in AGENTS.md — which is
+    # embedded verbatim into Hermes' system prompt, so a token appearing there
+    # denies *every* local turn — and near-zero occurrence across this repo's
+    # 5,782-file corpus.  Measured hits (corpus files / AGENTS.md):
+    #
+    #     counsel      2 /0     invoice   8 /0     subpoena   0 /0
+    #     malpractice  0 /0     prognosis 0 /0     retainer   0 /0
+    #
+    # and the `counsel`/`invoice` corpus hits are this module and docs prose.
+    #
+    # Deliberately NOT restored, with their measurements, so this is not
+    # re-litigated from intuition later:
+    #
+    #     client     904 files / 4 in AGENTS.md      production 407 / 1
+    #     options    415 / 1                         symptom     90 / 2
+    #     futures     93 / 0  (`concurrent.futures`) privileged  32 / 0
+    #     diagnosis   26 / 0  ("diagnosis" of a bug, in troubleshooting docs)
+    #
+    # The first four appear in the system prompt itself and would restore the
+    # 100%-denial outage this gate was remediated for.  `futures` is a stdlib
+    # module name, `privileged` is container-security vocabulary, and bare
+    # `diagnosis` is ordinary debugging prose; `medical diagnosis` is already
+    # covered as a phrase above.
+    PatternDef(
+        "legal_bare_token",
+        re.compile(r"\b(?:counsel|subpoena|malpractice|disbarment|deposed)\b", re.I),
+        ("legal",),
+        "[LEGAL_TERM]",
+    ),
+    PatternDef(
+        "financial_bare_token",
+        re.compile(r"\b(?:invoice|invoices|invoiced|remittance|garnishment)\b", re.I),
+        ("financial",),
+        "[FINANCIAL_TERM]",
+    ),
+    PatternDef(
+        "personal_health_bare_token",
+        re.compile(r"\b(?:prognosis|comorbidity|immunization)\b", re.I),
+        ("personal_health", "private"),
+        "[PRIVATE_TERM]",
     ),
     PatternDef(
         "production",
@@ -474,6 +531,28 @@ def _sensitive_classes(config: dict[str, Any]) -> set[str]:
     return set(DEFAULT_SENSITIVE_CLASSES)
 
 
+def _require_declared_data_class(config: dict[str, Any]) -> bool:
+    """Opt-in strict mode: a local route with no declared data class denies.
+
+    Off by default, and that default is a deliberate trade rather than an
+    oversight.  Nothing in Hermes *produces* a declaration — it is operator
+    input (``HERMES_DATA_CLASS`` or a config section), so defaulting this on
+    would deny 100% of local-provider traffic on a stock install, which is the
+    outage this gate was remediated for.  Operators who genuinely route
+    regulated work to a local endpoint need a way to demand the strong
+    guarantee rather than the content backstop, and this is it.
+    """
+    env = os.getenv("HERMES_REQUIRE_DECLARED_DATA_CLASS", "").strip().lower()
+    if env in _TRUTHY:
+        return True
+    if env in _FALSEY:
+        return False
+    section = config.get("local_provider_sensitivity") if isinstance(config, dict) else None
+    if isinstance(section, dict) and "require_declared_data_class" in section:
+        return bool(section.get("require_declared_data_class"))
+    return False
+
+
 def _enabled(config: dict[str, Any]) -> bool:
     env = os.getenv("HERMES_LOCAL_PROVIDER_SENSITIVITY_GATE", "").strip().lower()
     if env in _FALSEY:
@@ -578,10 +657,14 @@ def _evaluate_local_provider_request_unguarded(
     config: dict[str, Any] | None = None,
 ) -> SensitivityDecision:
     if config is None:
-        try:
-            config = load_config() or {}
-        except Exception:
-            config = {}
+        # Deliberately unguarded.  A config we cannot read is an *evaluation
+        # failure*, not an empty policy: substituting {} here would silently
+        # disable the enable-flag, the sensitive-class set and every approved
+        # route, then classify the payload against that empty policy and
+        # return a normal `no_sensitive_classes_detected` allow.  Letting this
+        # raise hands the decision to the fail-closed wrapper, which denies
+        # local routes with reason="gate_evaluation_failed".
+        config = load_config() or {}
 
     provider_id = _normalize_provider(provider)
     base_url_str = str(base_url or "")
@@ -619,6 +702,23 @@ def _evaluate_local_provider_request_unguarded(
             data_classes=audit_classes,
             declared_data_class=audit_declared,
             reason="non_local_route",
+            request_sha256=request_hash,
+            redaction_counts=counts,
+        )
+
+    if declared is None and _require_declared_data_class(config):
+        # Strict mode: without a declaration the only signal left is the
+        # content backstop, and the operator has said that is not good enough
+        # for this deployment.  Deny before the backstop gets a vote.
+        return SensitivityDecision(
+            allowed=False,
+            local_route=True,
+            provider=provider_id,
+            model=model_str,
+            base_url_host=host,
+            data_classes=audit_classes,
+            declared_data_class=None,
+            reason="no_declared_data_class",
             request_sha256=request_hash,
             redaction_counts=counts,
         )

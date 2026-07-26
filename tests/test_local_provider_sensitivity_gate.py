@@ -1,4 +1,5 @@
 import json
+import pathlib
 from types import SimpleNamespace
 
 import pytest
@@ -308,6 +309,81 @@ def test_evaluation_failure_is_not_silently_downgraded_to_allow(monkeypatch):
     assert decision.reason == "gate_evaluation_failed"
 
 
+def test_config_read_failure_denies_the_local_route(monkeypatch):
+    """An unreadable config is an evaluation failure, not a clean classification.
+
+    Regression for the fail-open found by review at 75a375c49: the ``config is
+    None`` branch caught ``load_config()`` failures and substituted ``{}``
+    before the fail-closed wrapper could see them, so a PermissionError on the
+    config file produced ``allowed=True`` /
+    ``reason=no_sensitive_classes_detected`` — a normal classification of a
+    payload the gate had in fact never managed to evaluate under policy.
+    """
+    import agent.local_provider_sensitivity_gate as gate
+
+    def _unreadable_config():
+        raise PermissionError("[Errno 13] Permission denied: 'cli-config.yaml'")
+
+    monkeypatch.setattr(gate, "load_config", _unreadable_config)
+
+    decision = evaluate_local_provider_request(
+        provider="ollama",
+        base_url="http://127.0.0.1:11434/v1",
+        model="llama3.2",
+        messages=[{"role": "user", "content": "anything at all"}],
+    )
+
+    assert decision.allowed is False
+    assert decision.local_route is True
+    assert decision.reason == "gate_evaluation_failed"
+
+
+def test_config_read_failure_blocks_the_send_on_a_local_route(monkeypatch):
+    """The deny is enforced at the call site, not merely reported."""
+    import agent.local_provider_sensitivity_gate as gate
+
+    def _unreadable_config():
+        raise OSError("config volume went away mid-turn")
+
+    monkeypatch.setattr(gate, "load_config", _unreadable_config)
+
+    with pytest.raises(LocalProviderSensitivityBlocked) as excinfo:
+        assert_local_provider_request_allowed(
+            provider="lmstudio",
+            base_url="http://192.168.1.10:1234/v1",
+            model="qwen",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+
+    decision = excinfo.value.decision
+    assert decision.allowed is False
+    assert decision.reason == "gate_evaluation_failed"
+    assert "could not evaluate" in str(excinfo.value)
+    # The operator message must not leak filesystem internals as prompt text.
+    assert "config volume went away" not in str(excinfo.value)
+
+
+def test_config_read_failure_on_a_cloud_route_does_not_take_the_agent_offline(monkeypatch):
+    """Same jurisdiction rule as any other evaluation failure."""
+    import agent.local_provider_sensitivity_gate as gate
+
+    def _unreadable_config():
+        raise PermissionError("nope")
+
+    monkeypatch.setattr(gate, "load_config", _unreadable_config)
+
+    decision = evaluate_local_provider_request(
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+        model="anthropic/claude-sonnet-4",
+        messages=[{"role": "user", "content": "hello"}],
+    )
+
+    assert decision.allowed is True
+    assert decision.local_route is False
+    assert decision.reason == "gate_evaluation_failed"
+
+
 def test_unparseable_route_is_treated_as_local_not_as_cloud(monkeypatch):
     """Route classification is total: an unreadable route still gets gated."""
     import agent.local_provider_sensitivity_gate as gate
@@ -397,6 +473,125 @@ def test_ordinary_developer_context_is_allowed_through_a_local_route():
     assert decision.allowed is True
     assert decision.local_route is True
     assert decision.reason == "no_sensitive_classes_detected"
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("counsel advised we hold the release", "legal"),
+        ("serve the subpoena on Monday", "legal"),
+        ("the malpractice claim is still open", "legal"),
+        ("pull the invoice and check the total", "financial"),
+        ("invoices went out late again", "financial"),
+        ("send the remittance advice", "financial"),
+        ("the prognosis was not good", "personal_health"),
+        ("comorbidity was noted in the chart", "personal_health"),
+    ],
+)
+def test_high_signal_bare_tokens_classify(text, expected):
+    """Phrase anchoring alone missed these; they carry the same exposure."""
+    classes, _redacted, _counts, _hash = classify_request([{"role": "user", "content": text}])
+
+    assert expected in classes, f"missed {expected} in {text!r}"
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["client", "production", "options", "futures", "symptom", "privileged", "diagnosis"],
+)
+def test_outage_causing_bare_tokens_stay_out(token):
+    """These bare words are why the first cut denied 100% of local traffic.
+
+    `client`, `production`, `options` and `symptom` occur in AGENTS.md, which
+    is embedded verbatim into Hermes' system prompt, so restoring any of them
+    denies every local turn.  `futures` is `concurrent.futures`, `privileged`
+    is container vocabulary, `diagnosis` is ordinary debugging prose.  Pinned
+    so a future "just add a few more tokens" pass has to argue with a test.
+    """
+    classes, _redacted, _counts, _hash = classify_request(
+        [{"role": "user", "content": f"the {token} was fine"}]
+    )
+
+    assert classes == [], f"bare {token!r} classified as {classes} — restores the outage"
+
+
+def test_the_real_system_prompt_source_does_not_classify_as_sensitive():
+    """The strongest regression available: gate the actual embedded document.
+
+    AGENTS.md is embedded into Hermes' system prompt on every turn.  If it
+    classifies, every local-provider request is denied — which is exactly the
+    failure this gate was remediated for.
+    """
+    agents_md = pathlib.Path(__file__).resolve().parents[1] / "AGENTS.md"
+    if not agents_md.is_file():  # pragma: no cover - repo layout guard
+        pytest.skip("AGENTS.md not present")
+
+    classes, _redacted, counts, _hash = classify_request(
+        [{"role": "system", "content": agents_md.read_text(encoding="utf-8")}]
+    )
+
+    assert classes == [], (
+        f"AGENTS.md classified as {classes} via {counts} — this denies every local turn"
+    )
+
+
+def test_strict_mode_denies_a_local_route_with_no_declared_data_class():
+    decision = evaluate_local_provider_request(
+        provider="ollama",
+        base_url="http://127.0.0.1:11434/v1",
+        model="llama3.2",
+        messages=[{"role": "user", "content": "perfectly ordinary text"}],
+        config={"local_provider_sensitivity": {"require_declared_data_class": True}},
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "no_declared_data_class"
+    assert decision.declared_data_class is None
+
+
+def test_strict_mode_allows_the_route_once_the_class_is_declared():
+    decision = evaluate_local_provider_request(
+        provider="ollama",
+        base_url="http://127.0.0.1:11434/v1",
+        model="llama3.2",
+        messages=[{"role": "user", "content": "perfectly ordinary text"}],
+        config={
+            "local_provider_sensitivity": {
+                "require_declared_data_class": True,
+                "data_class": "internal",
+            }
+        },
+    )
+
+    assert decision.allowed is True
+    assert decision.reason == "no_sensitive_classes_detected"
+
+
+def test_strict_mode_is_off_by_default_so_a_stock_install_is_not_an_outage():
+    """Defaulting this on would deny 100% of local traffic — nothing declares."""
+    decision = evaluate_local_provider_request(
+        provider="ollama",
+        base_url="http://127.0.0.1:11434/v1",
+        model="llama3.2",
+        messages=[{"role": "user", "content": "perfectly ordinary text"}],
+        config={},
+    )
+
+    assert decision.allowed is True
+    assert decision.reason == "no_sensitive_classes_detected"
+
+
+def test_strict_mode_does_not_apply_to_cloud_routes():
+    decision = evaluate_local_provider_request(
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+        model="anthropic/claude-sonnet-4",
+        messages=[{"role": "user", "content": "perfectly ordinary text"}],
+        config={"local_provider_sensitivity": {"require_declared_data_class": True}},
+    )
+
+    assert decision.allowed is True
+    assert decision.reason == "non_local_route"
 
 
 @pytest.mark.parametrize(
