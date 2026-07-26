@@ -2249,6 +2249,160 @@ def repair_db(
         )
 
 
+class KanbanRealBoardInTestError(RuntimeError):
+    """Raised when a test tries to open the real, live Kanban board.
+
+    Hard backstop for the ``t_83bfe788`` incident (BUI-942 item 4): a test
+    that inherited ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_HOME`` (or otherwise
+    resolved a board path) pointing at the operator's real ``~/.hermes`` live
+    board would silently mutate production task state. When
+    ``PYTEST_CURRENT_TEST`` is set we refuse *before* opening / creating /
+    migrating such a board and fail loudly with an actionable message. Temp
+    isolated test roots (``tmp_path``, per-test ``HERMES_HOME``) are unaffected.
+    """
+
+
+def _real_hermes_home_dirs() -> "list[Path]":
+    """Return candidate *real* OS home directories for the current user.
+
+    Deliberately independent of ``Path.home`` (which test fixtures routinely
+    monkeypatch to a tmp dir) and of ``HERMES_*`` overrides (which the
+    incident poisoned): we want the genuine machine home so the backstop can
+    tell "the real live board" apart from an isolated tmp root even when the
+    env has been pointed at the real board. Reads ``$HOME`` via
+    :func:`os.path.expanduser` and, on POSIX, the passwd database as a second
+    anchor that survives ``HOME`` redirection.
+    """
+    homes: list[Path] = []
+
+    def _add(candidate: "Optional[str]") -> None:
+        if not candidate:
+            return
+        p = Path(candidate)
+        if p not in homes:
+            homes.append(p)
+
+    try:
+        _add(os.path.expanduser("~"))
+    except Exception:
+        pass
+    if os.name != "nt":
+        try:
+            import pwd  # POSIX-only; anchor that ignores $HOME redirection
+
+            getuid = getattr(os, "getuid", None)
+            if callable(getuid):
+                uid = getuid()
+                if isinstance(uid, int):
+                    _add(pwd.getpwuid(uid).pw_dir)
+        except Exception:
+            pass
+    return homes
+
+
+def _real_hermes_kanban_roots() -> "list[Path]":
+    """Return the *real* Hermes root dir(s) that anchor the live Kanban board.
+
+    Mirrors :func:`hermes_constants._get_platform_default_hermes_home` but is
+    computed from the genuine machine home (see :func:`_real_hermes_home_dirs`)
+    rather than the possibly-monkeypatched ``Path.home`` — so a test can never
+    disguise the real ``~/.hermes`` as an isolated root.
+    """
+    roots: list[Path] = []
+
+    def _add(candidate: Path) -> None:
+        if candidate not in roots:
+            roots.append(candidate)
+
+    if os.name == "nt":
+        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_appdata:
+            _add(Path(local_appdata) / "hermes")
+        for home in _real_hermes_home_dirs():
+            _add(home / "AppData" / "Local" / "hermes")
+    else:
+        for home in _real_hermes_home_dirs():
+            _add(home / ".hermes")
+    return roots
+
+
+def _is_real_live_board_path(path: Path) -> bool:
+    """Return True iff ``path`` resolves to the real live board's data area.
+
+    The live board lives at ``<root>/kanban.db`` (default board, back-compat
+    path) and ``<root>/kanban/**`` (named boards, workspaces, logs). We match
+    exactly that area — NOT all of ``<root>`` — so a repo checked out under
+    ``~/.hermes/worktrees/...`` (or any other non-kanban sibling) is never a
+    false positive.
+    """
+    try:
+        resolved = path.resolve()
+    except Exception:
+        resolved = path
+    for root in _real_hermes_kanban_roots():
+        try:
+            root_resolved = root.resolve()
+        except Exception:
+            root_resolved = root
+        if resolved == root_resolved / "kanban.db":
+            return True
+        try:
+            resolved.relative_to(root_resolved / "kanban")
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _is_pytest_process() -> bool:
+    """Return True iff this interpreter is running under pytest.
+
+    Robust across the WHOLE pytest lifecycle, not just test execution:
+
+    * ``PYTEST_CURRENT_TEST`` — set by pytest during a test's setup/call/
+      teardown. This is the exact signal the backstop was originally spec'd
+      around; it is preserved and checked first.
+    * ``PYTEST_VERSION`` — set by pytest 8.1+ for the entire session, including
+      the *collection* phase where ``PYTEST_CURRENT_TEST`` is still unset.
+    * ``pytest`` / ``_pytest`` in :data:`sys.modules` — a version-independent
+      fallback that is true from the moment pytest imports the test module
+      (collection/import time), closing the window the env-only check missed
+      (a module-level ``connect()`` executed during collection).
+
+    Production never imports pytest, so this stays False there. Kept cheap
+    (no imports, no I/O) since :func:`connect` calls it on every open.
+    """
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return True
+    if os.environ.get("PYTEST_VERSION"):
+        return True
+    if "pytest" in sys.modules or "_pytest" in sys.modules:
+        return True
+    return False
+
+
+def _guard_test_board_isolation(path: Path) -> None:
+    """Fail loudly if a test would open/create/migrate the real live board.
+
+    No-op unless this is a pytest process (see :func:`_is_pytest_process`), so
+    production is unaffected. Active during collection/import too — not just
+    test execution — so a module-level ``connect()`` can't slip past. Called at
+    the very top of :func:`connect` — the single choke point through which
+    every open / create / migrate (including :func:`init_db`) flows.
+    """
+    if not _is_pytest_process():
+        return
+    if _is_real_live_board_path(path):
+        raise KanbanRealBoardInTestError(
+            "Refusing to open the real Hermes Kanban board at "
+            f"{path} from inside a pytest process. This backstop (BUI-942, "
+            "incident t_83bfe788) prevents a test from mutating live task "
+            "state when HERMES_KANBAN_DB / HERMES_KANBAN_HOME leak the real "
+            "~/.hermes board into the test process. Point the test at a "
+            "tmp_path board (or an isolated per-test HERMES_HOME) instead."
+        )
+
+
 def connect(
     db_path: Optional[Path] = None,
     *,
@@ -2276,6 +2430,9 @@ def connect(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    # Hard test-isolation backstop (BUI-942 item 4): before touching the
+    # filesystem, refuse if a test resolved this to the real live board.
+    _guard_test_board_isolation(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, the expensive
@@ -7004,6 +7161,11 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    pr_handoff_to_review: list[str] = field(default_factory=list)
+    """Ready task ids swept to ``review`` this tick because they already
+    produced a PR (BUI-942 item 2). Instead of sitting guard-deferred in
+    ``ready`` (``respawn_guarded`` with reason ``active_pr``) they move into
+    the review lane. See :func:`reconcile_pr_ready_to_review`."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -8291,15 +8453,254 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    if _has_recent_pr_comment(conn, task_id, now):
+        return "active_pr"
+
+    return None
+
+
+def _has_recent_pr_comment(
+    conn: sqlite3.Connection, task_id: str, now: Optional[int] = None
+) -> bool:
+    """Return True iff ``task_id`` has a GitHub PR URL in a comment newer than
+    ``_RESPAWN_GUARD_PR_WINDOW``.
+
+    Single source of truth for "this card already has a live PR" — used both by
+    :func:`check_respawn_guard` (the ``active_pr`` deferral reason) and by
+    :func:`reconcile_pr_ready_to_review` (BUI-942 item 2, which moves such a
+    ready card into ``review`` instead of leaving it to sit guard-deferred).
+    Keeping one helper guarantees the two stay in lock-step.
+    """
+    if now is None:
+        now = int(time.time())
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
         "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+            return True
+    return False
 
-    return None
+
+def reconcile_pr_ready_to_review(conn: sqlite3.Connection) -> "list[str]":
+    """Move ready cards that already produced a PR into ``review`` (BUI-942 item 2).
+
+    A ready task with a recent GitHub PR comment is exactly what trips the
+    ``active_pr`` respawn guard: the dispatcher would refuse to re-spawn it and
+    just record ``respawn_guarded`` every tick, leaving the card wedged in
+    ``ready`` forever. That's a board-state-hygiene bug — the PR belongs in the
+    review lane (or in front of a human), not in the ready queue.
+
+    This sweep transitions each such card ``ready -> review`` (an existing
+    lifecycle state — the same column a worker moves to after opening a PR),
+    clearing any claim state and emitting an auditable ``status`` event (for
+    the live feed / notifier) plus an ``auto_review_handoff`` event recording
+    *why* it moved. Returns the list of moved task ids.
+
+    Deliberately independent of assignee/profile routing: hygiene applies to
+    every ready card with a live PR, whether or not an auto-review agent will
+    claim it. Does NOT consult or mutate :func:`has_spawnable_ready`,
+    ``_ready_nonempty``, or the stranded-ready diagnostics (BUI-953 item 1).
+    """
+    now = int(time.time())
+    ready_ids = [
+        r["id"]
+        for r in conn.execute(
+            "SELECT id FROM tasks WHERE status = 'ready' AND claim_lock IS NULL"
+        ).fetchall()
+    ]
+    moved: list[str] = []
+    for task_id in ready_ids:
+        if not _has_recent_pr_comment(conn, task_id, now):
+            continue
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'review', "
+                "  claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status = 'ready' AND claim_lock IS NULL",
+                (task_id,),
+            )
+            if cur.rowcount != 1:
+                # Raced with another writer (claimed/moved between the read and
+                # this txn) — skip; the next tick reconciles if still eligible.
+                continue
+            _append_event(conn, task_id, "status", {"status": "review"})
+            _append_event(
+                conn, task_id, "auto_review_handoff", {"reason": "active_pr"}
+            )
+        moved.append(task_id)
+    return moved
+
+
+# Terminal states that a supersession must never rewrite (source) nor accept
+# as a live replacement (target).
+_TERMINAL_STATES = {"done", "archived"}
+
+
+def supersede_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    replaced_by: Optional[str] = None,
+    actor: str = "system",
+    note: Optional[str] = None,
+) -> bool:
+    """Explicitly retire ``task_id`` because a replacement has superseded it.
+
+    Board-state hygiene for BUI-942 item 2 (BLOCKER-2 hardened): when a parent
+    card's work is taken over by a replacement, the parent must not keep sitting
+    in ``ready`` (where the respawn guard would defer it forever). This moves it
+    out of the active board into ``archived`` and records an auditable
+    ``superseded`` event (carrying the ``replaced_by`` pointer) + comment.
+
+    **Dependency transfer (the correctness fix).** Simply archiving the parent
+    would let :func:`recompute_ready` PROMOTE its dependents (an ``archived``
+    parent satisfies the gate) — releasing children before the replacement has
+    done the work. Instead, when ``replaced_by`` is given, every edge
+    ``task_id -> child`` is atomically retargeted to ``replaced_by -> child``
+    *before* archiving, so each dependent stays blocked until the replacement
+    reaches a terminal state (the existing gating semantics). The retarget:
+
+    * de-duplicates (``INSERT OR IGNORE``) if the child already depends on the
+      replacement,
+    * skips the self edge when ``child == replaced_by``,
+    * skips any edge that would introduce a cycle (``_would_cycle``),
+
+    always removing the stale ``task_id -> child`` edge either way.
+
+    **Validation.**
+
+    * Unknown ``task_id`` or already ``archived`` → returns ``False`` (idempotent
+      no-op — nothing to retire).
+    * The source must still be in ``ready``. Running, review, blocked, todo, and
+      done cards require their normal lifecycle handling rather than having an
+      in-flight/terminal state silently rewritten.
+    * A parent that HAS dependents but no ``replaced_by`` → ``ValueError`` (that
+      path would prematurely release the children; pass the replacement).
+    * ``replaced_by`` must exist, be distinct from ``task_id``, and be in a
+      non-terminal (active) state, else ``ValueError``.
+
+    Returns ``True`` on a successful transition.
+    """
+    children: list[str]
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False  # unknown → idempotent no-op
+        status = row["status"]
+        if status == "archived":
+            return False  # already retired → idempotent no-op
+        if status != "ready":
+            raise ValueError(
+                f"cannot supersede {task_id}: it is '{status}'; only ready "
+                "cards can be superseded"
+            )
+
+        children = [
+            r["child_id"]
+            for r in conn.execute(
+                "SELECT child_id FROM task_links WHERE parent_id = ?", (task_id,)
+            ).fetchall()
+        ]
+
+        # Validate the replacement (when provided).
+        if replaced_by is not None:
+            if replaced_by == task_id:
+                raise ValueError(
+                    f"a task cannot supersede itself ({task_id}); the "
+                    "replacement must be a distinct task"
+                )
+            repl = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (replaced_by,)
+            ).fetchone()
+            if repl is None:
+                raise ValueError(
+                    f"replacement task {replaced_by} does not exist"
+                )
+            if repl["status"] in _TERMINAL_STATES:
+                raise ValueError(
+                    f"replacement task {replaced_by} is '{repl['status']}' "
+                    "(terminal); the replacement must be an active task"
+                )
+        elif children:
+            # No replacement, but there ARE dependents — archiving would free
+            # them via recompute_ready. Refuse rather than silently release.
+            raise ValueError(
+                f"cannot supersede {task_id}: it has {len(children)} "
+                "dependent(s) and no --replaced-by. Provide the replacement "
+                "so the dependents transfer instead of being released early."
+            )
+
+        # Validate every proposed edge before deleting any old edge. Silently
+        # skipping a cyclic transfer would release that child when the source is
+        # archived — the same premature-dispatch bug this function prevents.
+        if replaced_by is not None:
+            for child_id in children:
+                if child_id != replaced_by and _would_cycle(
+                    conn, replaced_by, child_id
+                ):
+                    raise ValueError(
+                        f"cannot supersede {task_id} with {replaced_by}: "
+                        f"transferring dependent {child_id} would create a cycle"
+                    )
+
+        # Atomically retarget each dependency edge onto the replacement, then
+        # archive. Order matters: retargeting BEFORE the archive means the
+        # post-txn recompute_ready never sees an archived parent still linked
+        # to a child (which would promote it).
+        if replaced_by is not None:
+            for child_id in children:
+                conn.execute(
+                    "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+                    (task_id, child_id),
+                )
+                if child_id == replaced_by:
+                    continue  # a task cannot depend on itself
+                conn.execute(
+                    "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
+                    "VALUES (?, ?)",
+                    (replaced_by, child_id),
+                )
+
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'archived', "
+            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status != 'archived'",
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            return False
+        # Close any in-flight run so attempt history isn't orphaned (mirrors
+        # archive_task's handling of a still-running task).
+        run_id = _end_run(
+            conn, task_id,
+            outcome="reclaimed", status="reclaimed",
+            summary="task superseded by replacement",
+        )
+        payload = {"replaced_by": replaced_by} if replaced_by else None
+        _append_event(conn, task_id, "superseded", payload, run_id=run_id)
+        # Also emit the standard ``archived`` event so archive-aware telemetry
+        # and the live feed treat the retirement consistently.
+        _append_event(conn, task_id, "archived", payload, run_id=run_id)
+        # Auditable comment for humans reading the card.
+        body = note or (
+            f"Superseded by {replaced_by}." if replaced_by
+            else "Superseded (no replacement)."
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (task_id, (actor or "system").strip() or "system", body, int(time.time())),
+        )
+    # Recompute AFTER the txn so any dependents whose gate genuinely cleared
+    # (e.g. transferred onto an already-terminal replacement) are promoted.
+    # Dependents transferred onto an ACTIVE replacement stay blocked because
+    # the replacement is non-terminal — the whole point of the transfer.
+    recompute_ready(conn)
+    return True
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
@@ -8478,6 +8879,20 @@ def _dispatch_once_locked(
     a 60-second tick interval could grow concurrency by N every minute on a
     busy board and accumulate without bound.
 
+    ``max_in_progress`` is the same kind of knob — a live ceiling on running
+    tasks, NOT a per-tick budget — despite the similar name. When BOTH are
+    set, the effective global worker cap is ``min(max_spawn, max_in_progress)``
+    (e.g. ``min(2, 3) == 2``). See the concurrency-cap contract tests and the
+    operator docs for the naming rationale.
+
+    Whichever ceiling binds, it is resolved ONCE per tick, before any spawning,
+    and it governs **both** dispatch lanes: ready spawns and review spawns draw
+    down the same budget. There is no path — including a tick with an empty
+    ready queue — on which the review lane dispatches against a different (or
+    absent) ceiling than the ready lane. That matters because
+    :func:`reconcile_pr_ready_to_review` runs earlier in this same tick and can
+    empty the ready queue by handing its last card to the review lane.
+
     ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
@@ -8511,15 +8926,52 @@ def _dispatch_once_locked(
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
-    # Count tasks already running so max_spawn enforces concurrency rather
-    # than a per-tick spawn budget. See the docstring above for the full
-    # rationale; the short version is that a 60-second tick interval with a
-    # per-tick budget of N would grow concurrency by N every tick on a busy
-    # board, since "running" tasks aren't reclaimed by completion alone —
-    # they sit in status='running' until the worker calls
-    # kanban_complete/kanban_block (or the dispatcher TTL-reclaims them).
+    # Board-state hygiene (BUI-942 item 2): before the spawn loop, sweep ready
+    # cards that already produced a PR into the review lane. Otherwise the
+    # active_pr respawn guard would defer them every tick and they'd wedge in
+    # ``ready`` forever. Skipped under dry_run (which must not mutate the DB).
+    if not dry_run:
+        result.pr_handoff_to_review = reconcile_pr_ready_to_review(conn)
+
+    # ---- ONE shared live concurrency cap, governing BOTH dispatch lanes ----
+    #
+    # max_spawn and max_in_progress are two spellings of the same kind of knob:
+    # a LIVE ceiling on how many workers may sit in status='running' at once,
+    # NOT a per-tick launch budget. (A per-tick budget of N with a 60-second
+    # tick would grow concurrency by N every minute on a busy board: "running"
+    # tasks are not reclaimed by completion alone — they stay in
+    # status='running' until the worker calls kanban_complete/kanban_block or
+    # the dispatcher TTL-reclaims them.) When both are set, the effective
+    # ceiling is their minimum.
+    #
+    # Resolve that ceiling ONCE, here, and count already-running tasks ONCE.
+    # The ready loop and the review loop below then share a single break
+    # predicate — ``running_count + spawned >= live_cap`` — so every spawn this
+    # tick, ready or review, draws down the same budget.
+    #
+    # This resolution must NOT be conditioned on there being ready work
+    # (BUI-942 item 4). The composition used to live inside ``if
+    # max_in_progress is not None and ready_rows:``, so an empty ready queue
+    # skipped it wholesale and the review loop ran against the raw max_spawn —
+    # or against no ceiling at all when only max_in_progress was configured.
+    # reconcile_pr_ready_to_review() a few lines above makes that trivially
+    # reachable rather than theoretical: it moves the last ready card into
+    # 'review', so ready_rows is empty on the very tick the review lane wants
+    # to dispatch, and a PR handoff could push the board past max_in_progress.
+    #
+    # Counting note: already-running tasks are subtracted exactly ONCE, by the
+    # loop predicate. Do NOT also subtract them from the cap here — that double
+    # count is what made min(3, 3) with one worker running top up to 2 instead
+    # of the correct 3.
+    if max_spawn is not None and max_in_progress is not None:
+        live_cap = min(max_spawn, max_in_progress)
+    elif max_spawn is not None:
+        live_cap = max_spawn
+    else:
+        # None when neither ceiling is configured — unlimited, as documented.
+        live_cap = max_in_progress
     running_count = 0
-    if max_spawn is not None:
+    if live_cap is not None:
         running_count = int(
             conn.execute(
                 "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
@@ -8531,20 +8983,6 @@ def _dispatch_once_locked(
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
-    # Honour kanban.max_in_progress: if the board already has enough running
-    # tasks, skip spawning this tick so slow workers (local LLMs,
-    # resource-constrained hosts) can finish what they have before more tasks
-    # pile up and time out.
-    if max_in_progress is not None and ready_rows:
-        in_progress = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-        ).fetchone()[0]
-        if in_progress >= max_in_progress:
-            return result
-        # Only spawn enough to reach the cap, respecting max_spawn too.
-        remaining = max_in_progress - in_progress
-        if max_spawn is None or max_spawn > remaining:
-            max_spawn = remaining
     spawned = 0
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
@@ -8583,7 +9021,7 @@ def _dispatch_once_locked(
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
     for row in ready_rows:
-        if max_spawn is not None and running_count + spawned >= max_spawn:
+        if live_cap is not None and running_count + spawned >= live_cap:
             break
         row_assignee = row["assignee"]
         if not row_assignee:
@@ -8672,6 +9110,11 @@ def _dispatch_once_locked(
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
+            # Advance the spawn counter even in dry_run so the concurrency cap
+            # (``running_count + spawned >= live_cap``) trips at the same point
+            # a real pass would. Without this, dry_run reported EVERY ready task
+            # as a would-be spawn and ignored max_spawn entirely (BUI-942).
+            spawned += 1
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
@@ -8749,16 +9192,18 @@ def _dispatch_once_locked(
     # sdlc-review skill) that verifies the PR and either merges (→ done)
     # or rejects (→ back to running for the worker to fix).
     #
-    # Same concurrency model as ready dispatch: review spawns count
-    # against max_spawn alongside ready tasks, so the total number of
-    # running workers stays bounded.
+    # Same concurrency model as ready dispatch, enforced by the SAME
+    # ``live_cap`` resolved once above: review spawns count against it
+    # alongside ready spawns and already-running workers, so the total number
+    # of running workers stays bounded no matter which lane the work came from
+    # (BUI-942 item 4).
     review_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'review' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     for row in review_rows:
-        if max_spawn is not None and running_count + spawned >= max_spawn:
+        if live_cap is not None and running_count + spawned >= live_cap:
             break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
@@ -8772,6 +9217,12 @@ def _dispatch_once_locked(
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
+            # Advance the shared spawn counter in dry_run too, exactly as the
+            # ready lane does above. Without it, a dry run reported EVERY review
+            # card as a would-be spawn and ignored the live ceiling entirely —
+            # the review lane's copy of the ready-lane dry_run bug, and another
+            # way the two lanes stopped sharing one cap (BUI-942 item 4).
+            spawned += 1
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:

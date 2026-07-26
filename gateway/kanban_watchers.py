@@ -1329,6 +1329,18 @@ class GatewayKanbanWatchersMixin:
                 else:
                     logger.info("kanban dispatcher: max_in_progress=%s", max_in_progress)
 
+        # When both live ceilings are set, the effective global worker cap is
+        # their minimum. Log it explicitly so operators aren't surprised that
+        # e.g. max_spawn=2 + max_in_progress=3 runs at most 2 workers.
+        if isinstance(max_spawn, int) and isinstance(max_in_progress, int):
+            logger.info(
+                "kanban dispatcher: effective global worker cap = "
+                "min(max_spawn=%d, max_in_progress=%d) = %d",
+                max_spawn,
+                max_in_progress,
+                min(max_spawn, max_in_progress),
+            )
+
         raw_failure_limit = kanban_cfg.get("failure_limit", _kb.DEFAULT_FAILURE_LIMIT)
         try:
             failure_limit = int(raw_failure_limit)

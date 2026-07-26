@@ -239,9 +239,10 @@ def test_nameerror_in_notifier_tick_surfaces_out_of_watcher(tmp_path):
             "list_boards",
             return_value=[{"slug": "default", "db_path": str(tmp_path / "kanban.db")}],
         ):
-            with patch.object(_kb, "connect", return_value=_DummyConn()):
-                with patch.object(_kb, "list_notify_subs", side_effect=boom_list_subs):
-                    with patch("asyncio.sleep", side_effect=_stop_after(runner, 3)):
-                        with patch("asyncio.to_thread", side_effect=_passthru_to_thread):
-                            with pytest.raises(NameError):
-                                asyncio.run(runner._kanban_notifier_watcher())
+            with patch.object(_kb, "count_notify_subs", return_value=1):
+                with patch.object(_kb, "connect", return_value=_DummyConn()):
+                    with patch.object(_kb, "list_notify_subs", side_effect=boom_list_subs):
+                        with patch("asyncio.sleep", side_effect=_stop_after(runner, 3)):
+                            with patch("asyncio.to_thread", side_effect=_passthru_to_thread):
+                                with pytest.raises(NameError):
+                                    asyncio.run(runner._kanban_notifier_watcher())
