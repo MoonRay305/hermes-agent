@@ -41,18 +41,19 @@ def _mock_client_returning(content: str):
 
 
 def _patch_aux_client(content: str, *, model: str = "test-model"):
-    client = _mock_client_returning(content)
+    # decompose_task now routes through call_llm (see #35566) — mock it at
+    # the source module so task config, extra_body, and retries stay out of
+    # unit-test scope.
     return patch(
-        "agent.auxiliary_client.get_text_auxiliary_client",
-        return_value=(client, model),
+        "agent.auxiliary_client.call_llm",
+        return_value=_fake_aux_response(content),
     )
 
 
 def _patch_extra_body():
-    return patch(
-        "agent.auxiliary_client.get_auxiliary_extra_body",
-        return_value={},
-    )
+    # No-op shim retained for call-site compatibility: extra_body plumbing
+    # now lives inside call_llm, which _patch_aux_client already mocks.
+    return patch("agent.auxiliary_client.get_auxiliary_extra_body", return_value={})
 
 
 def _patch_list_profiles(names: list[str]):
@@ -334,9 +335,11 @@ def test_decompose_no_aux_client_configured(kanban_home):
     for p in patches:
         p.start()
     try:
+        # call_llm raises RuntimeError when no provider is configured; the
+        # decomposer must convert that into a failed outcome, not a crash.
         with patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(None, ""),
+            "agent.auxiliary_client.call_llm",
+            side_effect=RuntimeError("No LLM provider configured"),
         ):
             outcome = decomp.decompose_task(tid, author="me")
     finally:
@@ -344,7 +347,8 @@ def test_decompose_no_aux_client_configured(kanban_home):
             p.stop()
 
     assert outcome.ok is False
-    assert "no auxiliary client" in outcome.reason
+    # call_llm's no-provider RuntimeError surfaces via the LLM-error branch.
+    assert "LLM error" in outcome.reason
 
 
 def test_linear_bridge_origin_task_is_not_decomposed(kanban_home):
@@ -372,9 +376,9 @@ def test_linear_bridge_origin_task_is_not_decomposed(kanban_home):
         p.start()
     try:
         with patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(client, "test-model"),
-        ), _patch_extra_body():
+            "agent.auxiliary_client.call_llm",
+            return_value=client.chat.completions.create.return_value,
+        ) as call_llm_mock, _patch_extra_body():
             outcome = decomp.decompose_task(tid, author="auto-decomposer")
     finally:
         for p in patches:
@@ -382,7 +386,7 @@ def test_linear_bridge_origin_task_is_not_decomposed(kanban_home):
 
     assert outcome.ok is False
     assert "linear bridge" in outcome.reason.lower()
-    assert client.chat.completions.create.call_count == 0
+    assert call_llm_mock.call_count == 0
     with kb.connect() as conn:
         assert kb.get_task(conn, tid).status == "triage"
         assert conn.execute(
@@ -415,9 +419,9 @@ def test_block_recurrence_triage_is_not_decomposed(kanban_home):
         p.start()
     try:
         with patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(client, "test-model"),
-        ), _patch_extra_body():
+            "agent.auxiliary_client.call_llm",
+            return_value=client.chat.completions.create.return_value,
+        ) as call_llm_mock, _patch_extra_body():
             outcome = decomp.decompose_task(tid, author="auto-decomposer")
     finally:
         for p in patches:
@@ -425,7 +429,7 @@ def test_block_recurrence_triage_is_not_decomposed(kanban_home):
 
     assert outcome.ok is False
     assert "human escalation" in outcome.reason.lower()
-    assert client.chat.completions.create.call_count == 0
+    assert call_llm_mock.call_count == 0
     with kb.connect() as conn:
         assert kb.get_task(conn, tid).status == "triage"
         assert conn.execute(
@@ -456,9 +460,9 @@ def test_decomposition_rejects_children_over_configured_hard_cap(kanban_home):
         p.start()
     try:
         with patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(client, "test-model"),
-        ), patch.object(
+            "agent.auxiliary_client.call_llm",
+            return_value=client.chat.completions.create.return_value,
+        ) as call_llm_mock, patch.object(
             decomp,
             "_load_config",
             return_value={"kanban": {"decomposition_max_children": 6}},
@@ -516,9 +520,9 @@ def test_decomposition_child_cannot_recursively_decompose_at_max_depth(kanban_ho
         p.start()
     try:
         with patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(client, "test-model"),
-        ), patch.object(
+            "agent.auxiliary_client.call_llm",
+            return_value=client.chat.completions.create.return_value,
+        ) as call_llm_mock, patch.object(
             decomp,
             "_load_config",
             return_value={"kanban": {"decomposition_max_depth": 1}},
@@ -530,7 +534,7 @@ def test_decomposition_child_cannot_recursively_decompose_at_max_depth(kanban_ho
 
     assert outcome.ok is False
     assert "maximum decomposition depth" in outcome.reason.lower()
-    assert client.chat.completions.create.call_count == 0
+    assert call_llm_mock.call_count == 0
     with kb.connect() as conn:
         assert kb.get_task(conn, child_id).status == "triage"
         assert conn.execute(
@@ -638,11 +642,11 @@ def test_decomposition_child_block_loop_cannot_recursively_decompose(kanban_home
         "tasks": [{"title": "forbidden grandchild", "assignee": "worker", "parents": []}],
     }))
     with patch(
-        "agent.auxiliary_client.get_text_auxiliary_client",
-        return_value=(client, "test-model"),
-    ):
+        "agent.auxiliary_client.call_llm",
+        return_value=client.chat.completions.create.return_value,
+    ) as call_llm_mock:
         outcome = decomp.decompose_task(child_id, author="auto-decomposer")
 
     assert outcome.ok is False
     assert "human escalation" in outcome.reason.lower()
-    assert client.chat.completions.create.call_count == 0
+    assert call_llm_mock.call_count == 0
