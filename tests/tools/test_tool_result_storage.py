@@ -194,7 +194,8 @@ class TestMaybePersistToolResult:
         assert PERSISTED_OUTPUT_TAG in result
         assert "tc_456.txt" in result
         assert len(result) < len(content)
-        env.execute.assert_called_once()
+        # One retention sweep plus the spill write.
+        assert env.execute.call_count == 2
 
     def test_persists_full_content_as_is(self):
         """Content is persisted verbatim — no JSON extraction."""

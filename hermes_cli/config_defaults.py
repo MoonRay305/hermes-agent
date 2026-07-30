@@ -2131,6 +2131,18 @@ DEFAULT_CONFIG = {
     "security": {
         "allow_private_urls": False,  # Allow requests to private/internal IPs (for OpenWrt, proxies, VPNs)
         "redact_secrets": True,
+        "tool_output_redaction": {
+            # Names only: matching never reads or resolves the named values.
+            "secret_names": [
+                "access_token", "api_key", "apikey", "auth_token",
+                "client_secret", "password", "passwd", "private_key",
+                "refresh_token", "secret", "secret_key", "token",
+            ],
+            "entropy_min_length": 48,
+            "entropy_floor": 4.5,
+            # Spill files older than 24 hours are swept on tool-result traffic.
+            "spill_max_age_seconds": 86400,
+        },
         "tirith_enabled": True,
         "tirith_path": "tirith",
         "tirith_timeout": 5,
