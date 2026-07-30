@@ -112,6 +112,7 @@ from typing import Any, Coroutine, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from tools.registry import tool_error
+from agent.redact import normalize_tool_output
 
 logger = logging.getLogger(__name__)
 
@@ -1354,7 +1355,9 @@ class SamplingHandler:
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tr.toolUseId,
-                    "content": self._extract_tool_result_text(tr),
+                    "content": normalize_tool_output(
+                        self._extract_tool_result_text(tr)
+                    ),
                 })
 
             # Emit assistant tool_calls message

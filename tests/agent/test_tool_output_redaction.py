@@ -109,6 +109,29 @@ def test_configured_secret_name_is_resolved_at_runtime_without_a_value_lookup():
     assert result == 'deployment_credential = "[REDACTED:NAME:DEPLOYMENT_CREDENTIAL]"'
 
 
+def test_literal_incident_systemd_environment_string_is_redacted():
+    incident = "Environment=DB_PASSWORD=s3cr3tValue123"
+    result = normalize_tool_output(incident)
+    assert result == "Environment=DB_PASSWORD=[REDACTED:NAME:DB_PASSWORD]"
+
+
+@pytest.mark.parametrize(
+    ("literal", "label"),
+    [
+        ("DATABASE_PASSWORD=hunter2corrhorse", "DATABASE_PASSWORD"),
+        (
+            "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI7MDENGbPxRfiCYEXAMPLEKEY",
+            "AWS_SECRET_ACCESS_KEY",
+        ),
+        ('{"database_password": "hunter2corrhorse"}', "DATABASE_PASSWORD"),
+    ],
+)
+def test_compound_secret_names_are_redacted(literal, label):
+    result = normalize_tool_output(literal)
+    assert literal not in result
+    assert f"[REDACTED:NAME:{label}]" in result
+
+
 def test_generic_high_entropy_uses_configurable_thresholds():
     literal = _synthetic_high_entropy()
     assert normalize_tool_output(literal) == "[REDACTED:HIGH_ENTROPY]"
@@ -119,6 +142,49 @@ def test_generic_high_entropy_uses_configurable_thresholds():
         entropy_floor=7.0,
     )
     assert normalize_tool_output(literal, policy=policy) == literal
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        (
+            "integrity: sha512-"
+            "3q7Q/5V1wS9nE0f4J6mY2xC8pK1uR9tL5bN7dH0sA4gF6jQ8vW2zX9cM"
+            "1kP3rT7uY5iO0lK6nB4eS8dG2fA=="
+        ),
+        (
+            '"integrity": "sha512-'
+            "3q7Q/5V1wS9nE0f4J6mY2xC8pK1uR9tL5bN7dH0sA4gF6jQ8vW2zX9cM"
+            '1kP3rT7uY5iO0lK6nB4eS8dG2fA=="'
+        ),
+        (
+            "resolution: {integrity: sha512-"
+            "3q7Q/5V1wS9nE0f4J6mY2xC8pK1uR9tL5bN7dH0sA4gF6jQ8vW2zX9cM"
+            "1kP3rT7uY5iO0lK6nB4eS8dG2fA==}"
+        ),
+        (
+            '"integrity": "sha512-'
+            "V7Qr52IhZmdKPVr+Vtw8o+WLsQJYCTd8loIfpDaMRWGUZfBOYEJeyJIkq"
+            'DgqkQzHElZDM7A5Y5DqTqvS7A=="'
+        ),
+        '"registry-auth-token": "^5.0.1",',
+    ],
+)
+def test_package_manager_integrity_digests_are_not_redacted(literal):
+    assert normalize_tool_output(literal) == literal
+
+
+def test_digest_shield_marker_forgery_cannot_alias_multiple_digests():
+    first = "sha512-" + _synthetic_high_entropy()
+    second = "sha256-" + _synthetic_high_entropy()[::-1]
+    text = f"\x00HERMES_TOOL_DIGEST_0\x00 {first} {second}"
+    assert normalize_tool_output(text) == text
+
+
+def test_high_entropy_after_whitespace_only_prefix_does_not_crash():
+    literal = _synthetic_high_entropy()
+    result = normalize_tool_output(f"{' ' * 128}{literal}")
+    assert result.endswith("[REDACTED:HIGH_ENTROPY]")
 
 
 def test_redaction_is_idempotent():
@@ -142,6 +208,18 @@ def test_serializer_normalizes_before_returning_to_model():
     )
     assert literal not in message["content"]
     assert "[REDACTED:BCRYPT_2B]" in message["content"]
+
+
+def test_verbose_tool_result_log_text_is_normalized():
+    from agent.tool_executor import _normalized_tool_result_log_text
+
+    incident = "Environment=DB_PASSWORD=s3cr3tValue123"
+    bcrypt = "$2b$12$" + "L" * 53
+    result = _normalized_tool_result_log_text(f"{incident}\n{bcrypt}")
+    assert incident not in result
+    assert bcrypt not in result
+    assert "[REDACTED:NAME:DB_PASSWORD]" in result
+    assert "[REDACTED:BCRYPT_2B]" in result
 
 
 def test_spill_path_writes_only_normalized_content():

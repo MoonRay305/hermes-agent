@@ -1756,6 +1756,20 @@ class TestConvertMessages:
         assert result[0] == {"role": "user", "content": "Hello world"}
 
 
+    def test_tool_result_message_is_normalized(self):
+        incident = "Environment=DB_PASSWORD=s3cr3tValue123"
+        inner = SimpleNamespace(text=incident)
+        tr_block = SimpleNamespace(toolUseId="call-secret", content=[inner])
+        msg = SimpleNamespace(
+            role="user",
+            content=[tr_block],
+            content_as_list=[tr_block],
+        )
+        params = _make_sampling_params(messages=[msg])
+        result = self.handler._convert_messages(params)
+        assert incident not in result[0]["content"]
+        assert "[REDACTED:NAME:DB_PASSWORD]" in result[0]["content"]
+
     def test_tool_use_message(self):
         tu_block = SimpleNamespace(
             id="call_2", name="get_weather", input={"city": "London"}
