@@ -7,12 +7,112 @@ Short tokens (< 18 chars) are fully masked. Longer tokens preserve
 the first 6 and last 4 characters for debuggability.
 """
 
+import base64
+import binascii
+import json
 import logging
+import math
 import os
 import re
 import shlex
+from collections import Counter
+from dataclasses import dataclass
+from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
+
+TOOL_OUTPUT_REDACTED_PREFIX = "[REDACTED:"
+DEFAULT_TOOL_OUTPUT_SECRET_NAMES = (
+    "access_token",
+    "api_key",
+    "apikey",
+    "auth_token",
+    "client_secret",
+    "password",
+    "passwd",
+    "private_key",
+    "refresh_token",
+    "secret",
+    "secret_key",
+    "token",
+)
+DEFAULT_TOOL_OUTPUT_ENTROPY_MIN_LENGTH = 48
+DEFAULT_TOOL_OUTPUT_ENTROPY_FLOOR = 4.5
+DEFAULT_TOOL_OUTPUT_SPILL_MAX_AGE_SECONDS = 24 * 60 * 60
+
+
+@dataclass(frozen=True)
+class ToolOutputRedactionPolicy:
+    """Runtime policy for the final tool-output safety boundary."""
+
+    secret_names: tuple[str, ...] = DEFAULT_TOOL_OUTPUT_SECRET_NAMES
+    entropy_min_length: int = DEFAULT_TOOL_OUTPUT_ENTROPY_MIN_LENGTH
+    entropy_floor: float = DEFAULT_TOOL_OUTPUT_ENTROPY_FLOOR
+    spill_max_age_seconds: int = DEFAULT_TOOL_OUTPUT_SPILL_MAX_AGE_SECONDS
+
+
+def _coerce_secret_names(value: Any) -> tuple[str, ...]:
+    """Return normalized config names without looking up any named value."""
+    if value is None:
+        return DEFAULT_TOOL_OUTPUT_SECRET_NAMES
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple, set)):
+        return DEFAULT_TOOL_OUTPUT_SECRET_NAMES
+    names = {
+        str(name).strip()
+        for name in value
+        if str(name).strip() and len(str(name).strip()) <= 128
+    }
+    return tuple(sorted(names, key=lambda item: (-len(item), item.casefold())))
+
+
+def resolve_tool_output_redaction_policy() -> ToolOutputRedactionPolicy:
+    """Resolve non-secret matcher settings from ``config.yaml`` at call time.
+
+    The configured deny-list contains *names only*. This function never reads
+    environment variables or fetches the values associated with those names.
+    """
+    raw: dict[str, Any] = {}
+    try:
+        from hermes_cli.config import read_raw_config
+
+        loaded = read_raw_config()
+        security = loaded.get("security", {}) if isinstance(loaded, dict) else {}
+        raw = security.get("tool_output_redaction", {}) if isinstance(security, dict) else {}
+        if not isinstance(raw, dict):
+            raw = {}
+    except Exception as exc:
+        logger.debug("Could not resolve tool-output redaction config: %s", exc)
+
+    def _bounded_int(key: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            return max(minimum, min(maximum, int(raw.get(key, default))))
+        except (TypeError, ValueError):
+            return default
+
+    try:
+        entropy_floor = float(raw.get("entropy_floor", DEFAULT_TOOL_OUTPUT_ENTROPY_FLOOR))
+    except (TypeError, ValueError):
+        entropy_floor = DEFAULT_TOOL_OUTPUT_ENTROPY_FLOOR
+    entropy_floor = max(0.0, min(8.0, entropy_floor))
+
+    return ToolOutputRedactionPolicy(
+        secret_names=_coerce_secret_names(raw.get("secret_names")),
+        entropy_min_length=_bounded_int(
+            "entropy_min_length",
+            DEFAULT_TOOL_OUTPUT_ENTROPY_MIN_LENGTH,
+            8,
+            4096,
+        ),
+        entropy_floor=entropy_floor,
+        spill_max_age_seconds=_bounded_int(
+            "spill_max_age_seconds",
+            DEFAULT_TOOL_OUTPUT_SPILL_MAX_AGE_SECONDS,
+            0,
+            365 * 24 * 60 * 60,
+        ),
+    )
 
 # Sensitive query-string parameter names (case-insensitive exact match).
 # Ported from nearai/ironclaw#2529 — catches tokens whose values don't match
@@ -262,6 +362,202 @@ _JWT_RE = re.compile(
     r"eyJ[A-Za-z0-9_-]{10,}"           # Header (always starts with eyJ)
     r"(?:\.[A-Za-z0-9_=-]{4,}){0,2}"   # Optional payload and/or signature
 )
+
+# Final-boundary tool-output matchers. These deliberately use stable,
+# class-labelled placeholders instead of head/tail-preserving masks.
+_TOOL_BCRYPT_RE = re.compile(
+    r"(?<![./A-Za-z0-9])\$2(?P<variant>[aby])\$\d{2}\$[./A-Za-z0-9]{53}"
+    r"(?![./A-Za-z0-9])"
+)
+_TOOL_PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN (?P<label>(?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY)-----"
+    r"[\s\S]*?"
+    r"-----END (?P=label)-----"
+)
+_TOOL_GITHUB_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_])"
+    r"(?P<prefix>github_pat_|ghp_|gho_|ghu_|ghs_|ghr_)"
+    r"[A-Za-z0-9_]{20,255}"
+    r"(?![A-Za-z0-9_])"
+)
+_TOOL_AWS_ACCESS_KEY_RE = re.compile(
+    r"(?<![A-Z0-9])"
+    r"(?:A3T[A-Z0-9]|AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASCA)"
+    r"[A-Z0-9]{16}"
+    r"(?![A-Z0-9])"
+)
+_TOOL_JWT_CANDIDATE_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])"
+    r"(?P<header>eyJ[A-Za-z0-9_-]{5,})\."
+    r"(?P<payload>[A-Za-z0-9_-]{8,})\."
+    r"(?P<signature>[A-Za-z0-9_-]{16,})"
+    r"(?![A-Za-z0-9_-])"
+)
+_TOOL_DYNAMIC_VALUE_RE = re.compile(
+    r"^(?:"
+    r"os\.(?:getenv|environ)|process\.env|\$ENV\{|\$\{|\{\{|"
+    r"[A-Za-z_][A-Za-z0-9_.]*\s*\(|"
+    r"None$|null$|true$|false$"
+    r")",
+    re.IGNORECASE,
+)
+_TOOL_DIGEST_PREFIX_RE = re.compile(r"(?:sha(?:1|224|256|384|512)-)$", re.IGNORECASE)
+
+
+def _tool_placeholder(label: str) -> str:
+    return f"{TOOL_OUTPUT_REDACTED_PREFIX}{label}]"
+
+
+def _decode_base64url_json(value: str) -> dict[str, Any] | None:
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
+        parsed = json.loads(decoded.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, binascii.Error, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _redact_tool_jwts(text: str) -> str:
+    def _replace(match: re.Match) -> str:
+        header = _decode_base64url_json(match.group("header"))
+        payload = _decode_base64url_json(match.group("payload"))
+        if header is None or payload is None:
+            return match.group(0)
+        if not ({"alg", "typ"} & set(header)):
+            return match.group(0)
+        return _tool_placeholder("JWT")
+
+    return _TOOL_JWT_CANDIDATE_RE.sub(_replace, text)
+
+
+def _name_label(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").upper()
+    return cleaned or "SECRET"
+
+
+def _redact_tool_named_values(text: str, names: Iterable[str]) -> str:
+    normalized = tuple(name for name in names if name)
+    if not normalized:
+        return text
+    alternation = "|".join(re.escape(name) for name in normalized)
+    assignment_re = re.compile(
+        rf"(?<![A-Za-z0-9_.-])"
+        rf"(?P<key_quote>['\"]?)(?P<name>{alternation})(?P=key_quote)"
+        rf"(?P<separator>\s*(?:=|:)\s*)"
+        rf"(?:(?P<value_quote>['\"])(?P<quoted>(?:\\.|(?!['\"]).)*)(?P=value_quote)"
+        rf"|(?P<bare>[^\s,;]+))",
+        re.IGNORECASE,
+    )
+
+    def _replace(match: re.Match) -> str:
+        value = match.group("quoted") if match.group("value_quote") else match.group("bare")
+        if (
+            not value
+            or value.startswith(TOOL_OUTPUT_REDACTED_PREFIX)
+            or _TOOL_DYNAMIC_VALUE_RE.match(value)
+            or value.isdecimal()
+        ):
+            return match.group(0)
+        placeholder = _tool_placeholder(f"NAME:{_name_label(match.group('name'))}")
+        quote = match.group("value_quote") or ""
+        prefix = (
+            f"{match.group('key_quote')}{match.group('name')}{match.group('key_quote')}"
+            f"{match.group('separator')}"
+        )
+        return f"{prefix}{quote}{placeholder}{quote}"
+
+    return assignment_re.sub(_replace, text)
+
+
+def _shannon_entropy_per_character(value: str) -> float:
+    if not value:
+        return 0.0
+    length = len(value)
+    return -sum(
+        (count / length) * math.log2(count / length)
+        for count in Counter(value).values()
+    )
+
+
+def _redact_tool_high_entropy(
+    text: str,
+    *,
+    min_length: int,
+    entropy_floor: float,
+) -> str:
+    candidate_re = re.compile(
+        rf"(?<![A-Za-z0-9_+/\-])"
+        rf"(?P<value>[A-Za-z0-9][A-Za-z0-9_+/\-]{{{max(0, min_length - 2)},}}"
+        rf"[A-Za-z0-9](?:={{1,2}})?)"
+        rf"(?![A-Za-z0-9_+/\-=])"
+    )
+
+    def _replace(match: re.Match) -> str:
+        value = match.group("value")
+        prefix = text[max(0, match.start() - 128):match.start()]
+        if _TOOL_DIGEST_PREFIX_RE.search(prefix):
+            return value
+        token_prefix = prefix.rsplit(None, 1)[-1] if prefix else ""
+        if token_prefix.endswith("base64,"):
+            return value
+        if "://" in token_prefix and prefix[-1:] not in {"=", "&", "?", "#"}:
+            return value
+        if re.fullmatch(r"[A-Fa-f0-9]+", value):
+            return value
+        classes = sum(
+            (
+                any(char.islower() for char in value),
+                any(char.isupper() for char in value),
+                any(char.isdigit() for char in value),
+                any(char in "_+/=-" for char in value),
+            )
+        )
+        if classes < 3:
+            return value
+        if _shannon_entropy_per_character(value) < entropy_floor:
+            return value
+        return _tool_placeholder("HIGH_ENTROPY")
+
+    return candidate_re.sub(_replace, text)
+
+
+def normalize_tool_output(
+    text: str,
+    *,
+    policy: ToolOutputRedactionPolicy | None = None,
+) -> str:
+    """Normalize a tool result before model serialization or spill storage.
+
+    The pass is deterministic and idempotent. Shape matches use stable class
+    labels; configured name matches use ``[REDACTED:NAME:<NAME>]``. Name
+    matching inspects adjacent literals only and never resolves a secret value.
+    """
+    if text is None:
+        return None
+    if not isinstance(text, str):
+        text = str(text)
+    if not text:
+        return text
+    policy = policy or resolve_tool_output_redaction_policy()
+
+    text = _TOOL_PRIVATE_KEY_RE.sub(_tool_placeholder("PEM_PRIVATE_KEY"), text)
+    text = _TOOL_BCRYPT_RE.sub(
+        lambda match: _tool_placeholder(f"BCRYPT_2{match.group('variant').upper()}"),
+        text,
+    )
+    text = _TOOL_GITHUB_TOKEN_RE.sub(_tool_placeholder("GITHUB_TOKEN"), text)
+    text = _redact_tool_jwts(text)
+    text = _TOOL_AWS_ACCESS_KEY_RE.sub(_tool_placeholder("AWS_ACCESS_KEY_ID"), text)
+    text = _redact_tool_named_values(text, policy.secret_names)
+    text = _redact_tool_high_entropy(
+        text,
+        min_length=policy.entropy_min_length,
+        entropy_floor=policy.entropy_floor,
+    )
+
+    # Preserve all existing Hermes credential classes at this forced boundary.
+    return redact_sensitive_text(text, force=True, code_file=True, file_read=True)
 
 # E.164 phone numbers: +<country><number>, 7-15 digits
 # Negative lookahead prevents matching hex strings or identifiers

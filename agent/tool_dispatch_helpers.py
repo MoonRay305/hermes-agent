@@ -31,6 +31,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from agent.redact import normalize_tool_output
 from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
 )
@@ -378,7 +379,8 @@ def make_tool_result_message(name: str, content: Any, tool_call_id: str) -> dict
     The outer list itself is rebuilt rather than returned by identity, so
     callers should compare by value, not by ``is``.
     """
-    wrapped = _maybe_wrap_untrusted(name, content)
+    normalized = normalize_tool_output(content) if isinstance(content, str) else content
+    wrapped = _maybe_wrap_untrusted(name, normalized)
     return {
         "role": "tool",
         "name": name,
