@@ -107,6 +107,8 @@ from datetime import datetime
 from typing import Any, Coroutine, Dict, List, Optional
 from urllib.parse import urlparse
 
+from agent.redact import normalize_tool_output
+
 logger = logging.getLogger(__name__)
 
 # Upper bound for the OSV malware preflight during stdio MCP startup. The
@@ -1041,7 +1043,9 @@ class SamplingHandler:
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tr.toolUseId,
-                    "content": self._extract_tool_result_text(tr),
+                    "content": normalize_tool_output(
+                        self._extract_tool_result_text(tr)
+                    ),
                 })
 
             # Emit assistant tool_calls message

@@ -402,6 +402,13 @@ _TOOL_DYNAMIC_VALUE_RE = re.compile(
     re.IGNORECASE,
 )
 _TOOL_DIGEST_PREFIX_RE = re.compile(r"(?:sha(?:1|224|256|384|512)-)$", re.IGNORECASE)
+_TOOL_DIGEST_VALUE_RE = re.compile(
+    r"sha(?:1|224|256|384|512)-[A-Za-z0-9_+/=-]{20,}",
+    re.IGNORECASE,
+)
+_TOOL_PACKAGE_VERSION_RE = re.compile(
+    r"^[~^<>=]*\d+(?:\.\d+){1,3}(?:[-+][A-Za-z0-9.-]+)?$"
+)
 
 
 def _tool_placeholder(label: str) -> str:
@@ -440,34 +447,75 @@ def _redact_tool_named_values(text: str, names: Iterable[str]) -> str:
     normalized = tuple(name for name in names if name)
     if not normalized:
         return text
-    alternation = "|".join(re.escape(name) for name in normalized)
+
+    configured_parts = tuple(
+        tuple(part for part in re.split(r"[_.-]+", name.casefold()) if part)
+        for name in normalized
+    )
     assignment_re = re.compile(
-        rf"(?<![A-Za-z0-9_.-])"
-        rf"(?P<key_quote>['\"]?)(?P<name>{alternation})(?P=key_quote)"
+        rf"(?=(?<![A-Za-z0-9_.-])"
+        rf"(?P<key_quote>['\"]?)(?P<name>[A-Za-z0-9_.-]{{1,128}})(?P=key_quote)"
         rf"(?P<separator>\s*(?:=|:)\s*)"
         rf"(?:(?P<value_quote>['\"])(?P<quoted>(?:\\.|(?!['\"]).)*)(?P=value_quote)"
-        rf"|(?P<bare>[^\s,;]+))",
-        re.IGNORECASE,
+        rf"|(?P<bare>[^\s,;]+)))",
     )
 
-    def _replace(match: re.Match) -> str:
+    def _is_secret_name(name: str) -> bool:
+        parts = tuple(
+            part for part in re.split(r"[_.-]+", name.casefold()) if part
+        )
+        if not parts:
+            return False
+        for configured in configured_parts:
+            if not configured or len(configured) > len(parts):
+                continue
+            # Lowercase/camel-case compound config names are considered secret
+            # only when the configured name is the suffix. This preserves
+            # source identifiers such as ``api_key_name``.
+            if parts[-len(configured):] == configured:
+                return True
+            # All-uppercase identifiers are environment/config names rather
+            # than source variable names. Match configured components anywhere
+            # so AWS_SECRET_ACCESS_KEY and similar vendor compounds are caught.
+            if name.upper() == name and any(char.isalpha() for char in name):
+                for idx in range(len(parts) - len(configured) + 1):
+                    if parts[idx:idx + len(configured)] == configured:
+                        return True
+        return False
+
+    replacements: list[tuple[int, int, str]] = []
+    for match in assignment_re.finditer(text):
+        if not _is_secret_name(match.group("name")):
+            continue
         value = match.group("quoted") if match.group("value_quote") else match.group("bare")
         if (
             not value
             or value.startswith(TOOL_OUTPUT_REDACTED_PREFIX)
             or _TOOL_DYNAMIC_VALUE_RE.match(value)
+            or _TOOL_PACKAGE_VERSION_RE.match(value)
             or value.isdecimal()
         ):
-            return match.group(0)
-        placeholder = _tool_placeholder(f"NAME:{_name_label(match.group('name'))}")
-        quote = match.group("value_quote") or ""
-        prefix = (
-            f"{match.group('key_quote')}{match.group('name')}{match.group('key_quote')}"
-            f"{match.group('separator')}"
+            continue
+        value_group = "quoted" if match.group("value_quote") else "bare"
+        replacements.append(
+            (
+                match.start(value_group),
+                match.end(value_group),
+                _tool_placeholder(f"NAME:{_name_label(match.group('name'))}"),
+            )
         )
-        return f"{prefix}{quote}{placeholder}{quote}"
 
-    return assignment_re.sub(_replace, text)
+    # The lookahead permits nested assignments such as the exact incident
+    # shape ``Environment=DB_PASSWORD=value``. Prefer the outermost selected
+    # secret value if two qualifying assignments overlap, then patch backwards.
+    selected: list[tuple[int, int, str]] = []
+    for replacement in sorted(replacements, key=lambda item: (item[0], -item[1])):
+        if selected and replacement[0] < selected[-1][1]:
+            continue
+        selected.append(replacement)
+    for start, end, placeholder in reversed(selected):
+        text = f"{text[:start]}{placeholder}{text[end:]}"
+    return text
 
 
 def _shannon_entropy_per_character(value: str) -> float:
@@ -496,9 +544,13 @@ def _redact_tool_high_entropy(
     def _replace(match: re.Match) -> str:
         value = match.group("value")
         prefix = text[max(0, match.start() - 128):match.start()]
-        if _TOOL_DIGEST_PREFIX_RE.search(prefix):
+        if (
+            _TOOL_DIGEST_PREFIX_RE.search(prefix)
+            or _TOOL_DIGEST_VALUE_RE.match(value)
+        ):
             return value
-        token_prefix = prefix.rsplit(None, 1)[-1] if prefix else ""
+        prefix_parts = prefix.rsplit(None, 1)
+        token_prefix = prefix_parts[-1] if prefix_parts else ""
         if token_prefix.endswith("base64,"):
             return value
         if "://" in token_prefix and prefix[-1:] not in {"=", "&", "?", "#"}:
@@ -520,6 +572,34 @@ def _redact_tool_high_entropy(
         return _tool_placeholder("HIGH_ENTROPY")
 
     return candidate_re.sub(_replace, text)
+
+
+def _legacy_redact_preserving_digests(text: str) -> str:
+    """Run the legacy pass without corrupting package integrity digests."""
+    digests: list[tuple[str, str]] = []
+    next_marker_index = 0
+
+    def _shield(match: re.Match) -> str:
+        nonlocal next_marker_index
+        marker_index = next_marker_index
+        marker = f"\x00HERMES_TOOL_DIGEST_{marker_index}\x00"
+        while marker in text:
+            marker_index += 1
+            marker = f"\x00HERMES_TOOL_DIGEST_{marker_index}\x00"
+        next_marker_index = marker_index + 1
+        digests.append((marker, match.group(0)))
+        return marker
+
+    shielded = _TOOL_DIGEST_VALUE_RE.sub(_shield, text)
+    redacted = redact_sensitive_text(
+        shielded,
+        force=True,
+        code_file=True,
+        file_read=True,
+    )
+    for marker, digest in digests:
+        redacted = redacted.replace(marker, digest)
+    return redacted
 
 
 def normalize_tool_output(
@@ -557,7 +637,7 @@ def normalize_tool_output(
     )
 
     # Preserve all existing Hermes credential classes at this forced boundary.
-    return redact_sensitive_text(text, force=True, code_file=True, file_read=True)
+    return _legacy_redact_preserving_digests(text)
 
 # E.164 phone numbers: +<country><number>, 7-15 digits
 # Negative lookahead prevents matching hex strings or identifiers

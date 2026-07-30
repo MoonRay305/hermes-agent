@@ -31,6 +31,7 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.tool_guardrails import ToolGuardrailDecision
+from agent.redact import normalize_tool_output
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
     _is_multimodal_tool_result,
@@ -49,6 +50,11 @@ from tools.tool_result_storage import (
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
+
+
+def _normalized_tool_result_log_text(result: Any) -> str:
+    """Return tool output safe for verbose/debug log serialization."""
+    return normalize_tool_output(_multimodal_text_summary(result))
 
 
 def _budget_for_agent(agent) -> BudgetConfig:
@@ -884,7 +890,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
             if agent.verbose_logging:
                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
-                logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
+                _log_result = _normalized_tool_result_log_text(function_result)
+                logging.debug(f"Tool result ({len(_log_result)} chars): {_log_result}")
 
         # Print cute message per tool
         if agent._should_emit_quiet_tool_messages():
@@ -1555,7 +1562,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         if agent.verbose_logging:
             logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
-            _log_result = _multimodal_text_summary(function_result)
+            _log_result = _normalized_tool_result_log_text(function_result)
             logging.debug(f"Tool result ({len(_log_result)} chars): {_log_result}")
 
         if not _execution_blocked and agent.tool_complete_callback:
