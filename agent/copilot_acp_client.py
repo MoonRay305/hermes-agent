@@ -27,7 +27,7 @@ from openai.types.chat.chat_completion_message_tool_call import (
 )
 
 from agent.file_safety import get_read_block_error, get_write_denied_error
-from agent.redact import redact_sensitive_text
+from agent.redact import normalize_tool_output_content, redact_sensitive_text
 from tools.environments.local import hermes_subprocess_env
 
 ACP_MARKER_BASE_URL = "acp://copilot"
@@ -189,6 +189,8 @@ def _format_messages_as_prompt(
             role = "context"
 
         content = message.get("content")
+        if role == "tool":
+            content = normalize_tool_output_content(content)
         rendered = _render_message_content(content)
         if not rendered:
             continue

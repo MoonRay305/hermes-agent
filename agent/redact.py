@@ -547,8 +547,87 @@ def _redact_tool_jwts(text: str) -> str:
 
 
 def _name_label(name: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").upper()
+    expanded = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name)
+    expanded = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", expanded)
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", expanded).strip("_").upper()
     return cleaned or "SECRET"
+
+
+def _tool_name_parts(name: str) -> tuple[str, ...]:
+    """Split snake/kebab/dotted and camelCase credential names."""
+    expanded = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name)
+    expanded = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", expanded)
+    return tuple(
+        part for part in re.split(r"[_.-]+", expanded.casefold()) if part
+    )
+
+
+def _is_tool_credential_literal(value: str) -> bool:
+    """Return whether an adjacent value looks like credential data.
+
+    Named-value matching is a silent, irreversible boundary, so a secret-like
+    key alone is insufficient.  Values that are ordinary source identifiers,
+    type annotations, indexing expressions, constants, or bracketed sentinels
+    stay visible. Credential literals must be long enough and combine letters
+    with digits.
+    """
+    value = value.strip()
+    if (
+        not value
+        or value.startswith(TOOL_OUTPUT_REDACTED_PREFIX)
+        or _TOOL_DYNAMIC_VALUE_RE.match(value)
+        or _TOOL_PACKAGE_VERSION_RE.match(value)
+        or value.isdecimal()
+    ):
+        return False
+
+    if (
+        (value.startswith("[") and value.endswith("]"))
+        or (value.startswith("{") and value.endswith("}"))
+        or (value.startswith("<") and value.endswith(">"))
+        or any(char in value for char in "()[]{}")
+    ):
+        return False
+
+    if any(char.isspace() for char in value):
+        return False
+
+    if not value.isascii():
+        return False
+
+    if (
+        "://" in value
+        or value.startswith(("/", "./", "../"))
+        or re.fullmatch(r"(?:\+\+|--)[A-Za-z_$][A-Za-z0-9_$.]*", value)
+        or re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$.]*(?:\+\+|--)", value)
+        or re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*\.[A-Za-z0-9_$.]+", value)
+        or re.fullmatch(r"[A-Fa-f0-9]{8,}", value)
+    ):
+        return False
+
+    placeholder = value.casefold()
+    if (
+        "..." in value
+        or re.search(r"x{4,}", placeholder)
+        or re.search(
+            r"(?:^|[-_.])(?:dummy|example|fake|inspect|placeholder|sample|synthetic|test|your)(?:$|[-_.])",
+            placeholder,
+        )
+        or placeholder in {"no-key-required", "moa-virtual-provider"}
+    ):
+        return False
+
+    # Constants such as OPENAI_API_KEY name another setting; they are not its
+    # value.  This also preserves source fixtures that document env-var names.
+    if re.fullmatch(r"[A-Z][A-Z0-9_]*", value) and "_" in value:
+        return False
+
+    if len(value) < 8:
+        return False
+
+    has_alpha = any(char.isalpha() for char in value)
+    has_digit = any(char.isdigit() for char in value)
+    return has_alpha and has_digit
 
 
 def _redact_tool_named_values(text: str, names: Iterable[str]) -> str:
@@ -556,22 +635,17 @@ def _redact_tool_named_values(text: str, names: Iterable[str]) -> str:
     if not normalized:
         return text
 
-    configured_parts = tuple(
-        tuple(part for part in re.split(r"[_.-]+", name.casefold()) if part)
-        for name in normalized
-    )
+    configured_parts = tuple(_tool_name_parts(name) for name in normalized)
     assignment_re = re.compile(
         rf"(?=(?<![A-Za-z0-9_.-])"
         rf"(?P<key_quote>['\"]?)(?P<name>[A-Za-z0-9_.-]{{1,128}})(?P=key_quote)"
         rf"(?P<separator>\s*(?:=|:)\s*)"
         rf"(?:(?P<value_quote>['\"])(?P<quoted>(?:\\.|(?!['\"]).)*)(?P=value_quote)"
-        rf"|(?P<bare>[^\s,;]+)))",
+        rf"|(?P<bare>[^\s,;'\"}}\]]+)))",
     )
 
     def _is_secret_name(name: str) -> bool:
-        parts = tuple(
-            part for part in re.split(r"[_.-]+", name.casefold()) if part
-        )
+        parts = _tool_name_parts(name)
         if not parts:
             return False
         for configured in configured_parts:
@@ -582,27 +656,30 @@ def _redact_tool_named_values(text: str, names: Iterable[str]) -> str:
             # source identifiers such as ``api_key_name``.
             if parts[-len(configured):] == configured:
                 return True
-            # All-uppercase identifiers are environment/config names rather
-            # than source variable names. Match configured components anywhere
-            # so AWS_SECRET_ACCESS_KEY and similar vendor compounds are caught.
-            if name.upper() == name and any(char.isalpha() for char in name):
-                for idx in range(len(parts) - len(configured) + 1):
-                    if parts[idx:idx + len(configured)] == configured:
-                        return True
+        # AWS_SECRET_ACCESS_KEY and similar vendor compounds carry ``secret``
+        # before a trailing ``key`` rather than as a configured-name suffix.
+        if (
+            name.upper() == name
+            and any(char.isalpha() for char in name)
+            and parts[-1:] == ("key",)
+            and "secret" in parts
+        ):
+            return True
         return False
 
     replacements: list[tuple[int, int, str]] = []
     for match in assignment_re.finditer(text):
         if not _is_secret_name(match.group("name")):
             continue
+        prefix_parts = text[:match.start("name")].rsplit(None, 1)
+        token_prefix = prefix_parts[-1] if prefix_parts else ""
+        if "://" in token_prefix:
+            # Preserve URL query parameters.  The legacy redactor deliberately
+            # leaves web URLs intact so source links and asset identifiers are
+            # not silently rewritten.
+            continue
         value = match.group("quoted") if match.group("value_quote") else match.group("bare")
-        if (
-            not value
-            or value.startswith(TOOL_OUTPUT_REDACTED_PREFIX)
-            or _TOOL_DYNAMIC_VALUE_RE.match(value)
-            or _TOOL_PACKAGE_VERSION_RE.match(value)
-            or value.isdecimal()
-        ):
+        if not _is_tool_credential_literal(value):
             continue
         value_group = "quoted" if match.group("value_quote") else "bare"
         replacements.append(
@@ -710,6 +787,28 @@ def _legacy_redact_preserving_digests(text: str) -> str:
     return redacted
 
 
+def _redact_tool_output_classes(
+    text: str,
+    policy: ToolOutputRedactionPolicy,
+) -> str:
+    """Apply the tool-specific shape, name, and entropy matchers."""
+    text = _TOOL_PRIVATE_KEY_RE.sub(_tool_placeholder("PEM_PRIVATE_KEY"), text)
+    text = _TOOL_BCRYPT_RE.sub(
+        lambda match: _tool_placeholder(f"BCRYPT_2{match.group('variant').upper()}"),
+        text,
+    )
+    text = _TOOL_GITHUB_TOKEN_RE.sub(_tool_placeholder("GITHUB_TOKEN"), text)
+    text = _redact_tool_jwts(text)
+    text = _TOOL_AWS_ACCESS_KEY_RE.sub(_tool_placeholder("AWS_ACCESS_KEY_ID"), text)
+    text = _redact_tool_named_values(text, policy.secret_names)
+    text = _redact_tool_high_entropy(
+        text,
+        min_length=policy.entropy_min_length,
+        entropy_floor=policy.entropy_floor,
+    )
+    return text
+
+
 def normalize_tool_output(
     text: str,
     *,
@@ -729,23 +828,44 @@ def normalize_tool_output(
         return text
     policy = policy or resolve_tool_output_redaction_policy()
 
-    text = _TOOL_PRIVATE_KEY_RE.sub(_tool_placeholder("PEM_PRIVATE_KEY"), text)
-    text = _TOOL_BCRYPT_RE.sub(
-        lambda match: _tool_placeholder(f"BCRYPT_2{match.group('variant').upper()}"),
-        text,
-    )
-    text = _TOOL_GITHUB_TOKEN_RE.sub(_tool_placeholder("GITHUB_TOKEN"), text)
-    text = _redact_tool_jwts(text)
-    text = _TOOL_AWS_ACCESS_KEY_RE.sub(_tool_placeholder("AWS_ACCESS_KEY_ID"), text)
-    text = _redact_tool_named_values(text, policy.secret_names)
-    text = _redact_tool_high_entropy(
-        text,
-        min_length=policy.entropy_min_length,
-        entropy_floor=policy.entropy_floor,
-    )
+    text = _redact_tool_output_classes(text, policy)
 
     # Preserve all existing Hermes credential classes at this forced boundary.
     return _legacy_redact_preserving_digests(text)
+
+
+def normalize_tool_output_content(
+    content: Any,
+    *,
+    policy: ToolOutputRedactionPolicy | None = None,
+) -> Any:
+    """Normalize string output or text parts in a multimodal content list.
+
+    Non-text parts are preserved by identity, while text dictionaries and the
+    outer list are shallow-copied so callers never mutate a producer-owned
+    multimodal result.
+    """
+    if isinstance(content, str):
+        return normalize_tool_output(content, policy=policy)
+    if not isinstance(content, list):
+        return content
+
+    normalized_parts: list[Any] = []
+    for part in content:
+        if (
+            isinstance(part, dict)
+            and part.get("type") == "text"
+            and isinstance(part.get("text"), str)
+        ):
+            normalized_parts.append(
+                {
+                    **part,
+                    "text": normalize_tool_output(part["text"], policy=policy),
+                }
+            )
+        else:
+            normalized_parts.append(part)
+    return normalized_parts
 
 # E.164 phone numbers: +<country><number>, 7-15 digits
 # Negative lookahead prevents matching hex strings or identifiers
@@ -1381,4 +1501,10 @@ class RedactingFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         original = super().format(record)
-        return redact_sensitive_text(original)
+        # Preserve the formatter's established legacy placeholders, then add
+        # the tool-output-only classes that the legacy pass does not cover.
+        redacted = redact_sensitive_text(original)
+        return _redact_tool_output_classes(
+            redacted,
+            resolve_tool_output_redaction_policy(),
+        )
