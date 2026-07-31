@@ -660,7 +660,7 @@ def session_search(
     window: int = 5,
     # Discovery shape
     sort: str = None,
-    # Cross-profile (any shape)
+    # Explicit profile selection (cross-profile READ is supported when enabled)
     profile: str = None,
 ) -> str:
     """Single-shape tool. Mode inferred from which args are set.
@@ -670,9 +670,11 @@ def session_search(
     Read:      pass ``session_id`` (no anchor) — dumps the whole session.
     Browse:    pass nothing.
 
-    Pass ``profile`` to read another profile's sessions (e.g. resolving an
-    ``@session:<profile>/<id>`` link). Scroll wins over read/discovery when an
-    anchor is set — the agent has asked for a specific slice.
+    Cross-profile READ is disabled by default. Pass ``profile`` only when
+    ``security.session_search_cross_profile_enabled`` is ``true`` in the
+    calling profile's config. Cross-profile discovery is not supported because
+    the target database is opened read-only. Scroll wins over read/discovery
+    when an anchor is set — the agent has asked for a specific slice.
     """
     if db is None:
         try:
@@ -836,11 +838,16 @@ SESSION_SEARCH_SCHEMA = {
         "       - When messages_before or messages_after is < window, you're at the "
         "start or end of the session.\n\n"
         "  3) READ — pass `session_id` only (no around_message_id):\n"
-        "     session_search(session_id=\"...\", profile=\"work\")\n"
+        "     session_search(session_id=\"...\")\n"
         "     Dumps the whole session by id (first 20 + last 10 messages when "
         "large). This is how you resolve an `@session:<profile>/<id>` link the "
         "user dropped into the chat: split the value on `/` into profile + id "
-        "and call session_search(session_id=id, profile=profile).\n\n"
+        "before calling. Cross-profile access is disabled by default. Do not pass "
+        "`profile` unless the operator enabled "
+        "`security.session_search_cross_profile_enabled: true` in the calling "
+        "profile's config.yaml; when enabled, call "
+        "session_search(session_id=id, profile=profile). Cross-profile DISCOVERY "
+        "is not supported because the target database is opened read-only.\n\n"
         "  4) BROWSE — no args:\n"
         "     session_search()\n"
         "     Returns recent sessions chronologically: titles, previews, timestamps. "
@@ -928,10 +935,16 @@ SESSION_SEARCH_SCHEMA = {
             "profile": {
                 "type": "string",
                 "description": (
-                    "Optional. Read sessions from another Hermes profile's database "
-                    "(read-only). Use when resolving an `@session:<profile>/<id>` link: "
-                    "pass the profile segment here with session_id as the id segment. "
-                    "Omit to use the current profile."
+                    "Optional. For cross-profile access, use only with the READ shape "
+                    "to read a session from another Hermes profile's database "
+                    "(read-only). Cross-profile access is disabled by default; do not "
+                    "pass this parameter unless the operator set "
+                    "`security.session_search_cross_profile_enabled: true` in the "
+                    "calling profile's config.yaml. When enabled and resolving an "
+                    "`@session:<profile>/<id>` link, pass the profile segment here with "
+                    "session_id as the id segment. Cross-profile DISCOVERY is not "
+                    "supported because the target database is opened read-only. Omit "
+                    "to use the current profile."
                 ),
             },
         },

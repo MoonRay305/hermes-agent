@@ -108,6 +108,18 @@ class TestSchema:
         assert "session_search as secondary" in desc
         assert "not found" in desc
 
+    def test_schema_teaches_cross_profile_read_policy(self):
+        desc = SESSION_SEARCH_SCHEMA["description"]
+        profile_desc = SESSION_SEARCH_SCHEMA["parameters"]["properties"]["profile"][
+            "description"
+        ]
+
+        for text in (desc, profile_desc):
+            assert "disabled by default" in text
+            assert "security.session_search_cross_profile_enabled: true" in text
+            assert "Cross-profile DISCOVERY is not supported" in text
+        assert "For cross-profile access, use only with the READ shape" in profile_desc
+
 
 class TestHiddenSources:
     def test_tool_source_hidden(self):
