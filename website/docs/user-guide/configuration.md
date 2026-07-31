@@ -1830,6 +1830,7 @@ Pre-execution security scanning and secret redaction:
 ```yaml
 security:
   redact_secrets: true           # Redact API key patterns in tool output and logs (on by default)
+  session_search_cross_profile_enabled: false  # Allow explicit cross-profile session reads
   tirith_enabled: true           # Enable Tirith security scanning for terminal commands
   tirith_path: "tirith"          # Path to tirith binary (default: "tirith" in $PATH)
   tirith_timeout: 5              # Seconds to wait for tirith scan before timing out
@@ -1841,6 +1842,7 @@ security:
 ```
 
 - `redact_secrets` — when `true`, automatically detects and redacts patterns that look like API keys, tokens, and passwords in tool output before it enters the conversation context and logs. **On by default**. Set to `false` explicitly only when you need raw credential-like strings for debugging or redactor development.
+- `session_search_cross_profile_enabled` — when `true`, allows an explicit `profile` target in `session_search` to read another profile's history. It is `false` by default; same-profile search is unchanged.
 - `tirith_enabled` — when `true`, terminal commands are scanned by [Tirith](https://github.com/sheeki03/tirith) before execution to detect potentially dangerous operations.
 - `tirith_path` — path to the tirith binary. Set this if tirith is installed in a non-standard location.
 - `tirith_timeout` — maximum seconds to wait for a tirith scan. Commands proceed if the scan times out.
