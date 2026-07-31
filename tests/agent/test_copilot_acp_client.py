@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent.copilot_acp_client import CopilotACPClient
+from agent.copilot_acp_client import CopilotACPClient, _format_messages_as_prompt
 
 
 class _FakeProcess:
@@ -21,6 +21,22 @@ class _FakeProcess:
 class CopilotACPClientSafetyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.client = CopilotACPClient(acp_cwd="/tmp")
+
+    def test_tool_content_is_normalized_before_acp_prompt_serialization(self) -> None:
+        bcrypt = "$2b$12$" + "P" * 53
+        incident = "Environment=DB_PASSWORD=s3cr3tValue123"
+
+        prompt = _format_messages_as_prompt(
+            [{"role": "tool", "content": [
+                {"type": "text", "text": f"{bcrypt}\n{incident}"},
+                {"type": "image_url", "image_url": {"url": "synthetic"}},
+            ]}]
+        )
+
+        self.assertNotIn(bcrypt, prompt)
+        self.assertNotIn(incident, prompt)
+        self.assertIn("[REDACTED:BCRYPT_2B]", prompt)
+        self.assertIn("[REDACTED:NAME:DB_PASSWORD]", prompt)
 
     def test_extracted_tool_calls_match_openai_sdk_shape(self) -> None:
         tool_response = (

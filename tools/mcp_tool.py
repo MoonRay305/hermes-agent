@@ -107,7 +107,7 @@ from datetime import datetime
 from typing import Any, Coroutine, Dict, List, Optional
 from urllib.parse import urlparse
 
-from agent.redact import normalize_tool_output
+from agent.redact import normalize_tool_output, normalize_tool_output_content
 
 logger = logging.getLogger(__name__)
 
@@ -1086,7 +1086,10 @@ class SamplingHandler:
                                 type(block).__name__,
                             )
                     if parts:
-                        messages.append({"role": msg.role, "content": parts})
+                        messages.append({
+                            "role": msg.role,
+                            "content": normalize_tool_output_content(parts),
+                        })
 
         return messages
 

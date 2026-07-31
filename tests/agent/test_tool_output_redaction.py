@@ -103,7 +103,7 @@ def test_configured_secret_name_is_resolved_at_runtime_without_a_value_lookup():
     with patch("hermes_cli.config.read_raw_config", return_value=raw_config):
         policy = resolve_tool_output_redaction_policy()
         result = normalize_tool_output(
-            'deployment_credential = "synthetic-literal"',
+            'deployment_credential = "s3cr3t-literal-42"',
             policy=policy,
         )
     assert result == 'deployment_credential = "[REDACTED:NAME:DEPLOYMENT_CREDENTIAL]"'
@@ -123,10 +123,25 @@ def test_literal_incident_systemd_environment_string_is_redacted():
             "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI7MDENGbPxRfiCYEXAMPLEKEY",
             "AWS_SECRET_ACCESS_KEY",
         ),
+        ("export API_TOKEN=abc123randomstring456xyz", "API_TOKEN"),
         ('{"database_password": "hunter2corrhorse"}', "DATABASE_PASSWORD"),
     ],
 )
 def test_compound_secret_names_are_redacted(literal, label):
+    result = normalize_tool_output(literal)
+    assert literal not in result
+    assert f"[REDACTED:NAME:{label}]" in result
+
+
+@pytest.mark.parametrize(
+    ("literal", "label"),
+    [
+        ("dbPassword=s3cr3tValue123", "DB_PASSWORD"),
+        ('{"clientSecret":"s3cr3tValue123"}', "CLIENT_SECRET"),
+        ('{"accessToken":"s3cr3tValue123"}', "ACCESS_TOKEN"),
+    ],
+)
+def test_camel_case_secret_names_are_redacted(literal, label):
     result = normalize_tool_output(literal)
     assert literal not in result
     assert f"[REDACTED:NAME:{label}]" in result
@@ -210,6 +225,28 @@ def test_serializer_normalizes_before_returning_to_model():
     assert "[REDACTED:BCRYPT_2B]" in message["content"]
 
 
+def test_serializer_normalizes_multimodal_text_and_preserves_image_part():
+    bcrypt = "$2b$12$" + "M" * 53
+    incident = "Environment=DB_PASSWORD=s3cr3tValue123"
+    image_part = {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,c3ludGhldGlj"},
+    }
+    content = [
+        {"type": "text", "text": f"{bcrypt}\n{incident}"},
+        image_part,
+    ]
+
+    message = make_tool_result_message("computer_use", content, "call-multimodal")
+
+    assert bcrypt not in message["content"][0]["text"]
+    assert incident not in message["content"][0]["text"]
+    assert "[REDACTED:BCRYPT_2B]" in message["content"][0]["text"]
+    assert "[REDACTED:NAME:DB_PASSWORD]" in message["content"][0]["text"]
+    assert message["content"][1] is image_part
+    assert content[0]["text"] == f"{bcrypt}\n{incident}"
+
+
 def test_verbose_tool_result_log_text_is_normalized():
     from agent.tool_executor import _normalized_tool_result_log_text
 
@@ -272,6 +309,36 @@ def calculate_token_count(document):
     return document, api_key_name, max_tokens, digest
 """
     assert normalize_tool_output(source) == source
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "api_key: Optional[str] = None, timeout: float = 5.0",
+        "token: str",
+        "api_key=api_key",
+        '"access_token": access_token',
+        "token = argv[i]",
+        "const API_KEY_OPTIONS: ApiKeyOption[]",
+        'sep_token="[SEP]"',
+    ],
+)
+def test_named_value_matcher_preserves_source_expressions(source):
+    assert normalize_tool_output(source) == source
+
+
+@pytest.mark.parametrize(
+    "placeholder",
+    [
+        'api_key="your-api-key"',
+        'token="synthetic-token"',
+        'api_key="copilot-acp"',
+        "https://example.invalid/image.png?token=3077792b-90ff-459d-aa52-57abcf219adf",
+        '_OAUTH_TOKEN_USER_AGENT = "axios/1.7.9"',
+    ],
+)
+def test_named_value_matcher_preserves_placeholders_and_urls(placeholder):
+    assert normalize_tool_output(placeholder) == placeholder
 
 
 def test_ordinary_prose_is_not_mangled():
