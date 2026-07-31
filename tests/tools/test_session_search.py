@@ -8,11 +8,13 @@ Three calling shapes:
 All run zero LLM calls.
 """
 import json
+import logging
 import time
 
 import pytest
 
 from hermes_state import SessionDB
+import tools.session_search_tool as session_search_mod
 from tools.session_search_tool import (
     SESSION_SEARCH_SCHEMA,
     _HIDDEN_SESSION_SOURCES,
@@ -501,7 +503,26 @@ class TestCrossProfileRead:
         monkeypatch.setattr(profiles_mod, "profile_exists", lambda n: exists)
         monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: home)
 
-    def test_profile_param_reads_other_db(self, db, tmp_path, monkeypatch):
+    def _set_policy(self, monkeypatch, enabled, caller="current"):
+        from hermes_cli import profiles as profiles_mod
+
+        monkeypatch.setattr(profiles_mod, "get_active_profile_name", lambda: caller)
+        monkeypatch.setattr(
+            session_search_mod,
+            "_cross_profile_access_enabled",
+            lambda: enabled,
+        )
+
+    def test_profile_param_reads_other_db_when_enabled(self, db, tmp_path, monkeypatch):
+        from hermes_cli import config as config_mod
+        from hermes_cli import profiles as profiles_mod
+
+        calling_home = tmp_path / "calling_home"
+        calling_home.mkdir()
+        (calling_home / "config.yaml").write_text(
+            "security:\n  session_search_cross_profile_enabled: true\n",
+            encoding="utf-8",
+        )
         other_home = tmp_path / "other_home"
         other_home.mkdir()
         other = SessionDB(other_home / "state.db")
@@ -513,16 +534,22 @@ class TestCrossProfileRead:
         other._conn.commit()
 
         self._patch_profiles(monkeypatch, other_home)
+        monkeypatch.setattr(profiles_mod, "get_active_profile_name", lambda: "current")
+        monkeypatch.setenv("HERMES_HOME", str(calling_home))
+        config_mod._LOAD_CONFIG_CACHE.clear()
 
         # s_other lives only in the other profile; the current `db` lacks it.
-        result = json.loads(session_search(session_id="s_other", profile="other", db=db))
+        try:
+            result = json.loads(
+                session_search(session_id="s_other", profile="other", db=db)
+            )
+        finally:
+            config_mod._LOAD_CONFIG_CACHE.clear()
         assert result["success"] is True
         assert result["mode"] == "read"
         assert result["session_meta"]["title"] == "Other Profile Chat"
 
-    def test_bare_id_locates_across_profiles(self, db, tmp_path, monkeypatch):
-        # The real-world failure: model dropped the owning profile and passed a
-        # bare id. The tool must scan profiles and find it anyway.
+    def test_bare_id_does_not_scan_other_profiles(self, db, tmp_path, monkeypatch):
         other_home = tmp_path / "asdf_home"
         other_home.mkdir()
         other = SessionDB(other_home / "state.db")
@@ -530,20 +557,23 @@ class TestCrossProfileRead:
         other.append_message("s_far", role="user", content="hi")
         other._conn.commit()
 
-        from collections import namedtuple
         from hermes_cli import profiles as profiles_mod
-        Info = namedtuple("Info", "name path")
         monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: tmp_path / "default_home")
-        monkeypatch.setattr(profiles_mod, "list_profiles", lambda: [Info("asdf", other_home)])
+        monkeypatch.setattr(
+            profiles_mod,
+            "list_profiles",
+            lambda: (_ for _ in ()).throw(AssertionError("cross-profile scan must not run")),
+        )
 
-        # `db` (current profile) lacks s_far; no profile passed → scan finds it.
+        # `db` (current profile) lacks s_far; no profile passed → local not-found.
         result = json.loads(session_search(session_id="s_far", db=db))
-        assert result["success"] is True
-        assert result["mode"] == "read"
-        assert result["profile"] == "asdf"
+        assert result["success"] is False
+        assert "session_id not found: s_far" in result["error"]
+        assert "hi" not in json.dumps(result)
 
     def test_unknown_profile_errors(self, db, monkeypatch, tmp_path):
         self._patch_profiles(monkeypatch, tmp_path, exists=False)
+        self._set_policy(monkeypatch, True)
         result = json.loads(session_search(session_id="x", profile="ghost", db=db))
         assert result["success"] is False
         assert "ghost" in result.get("error", "")
@@ -559,6 +589,7 @@ class TestCrossProfileRead:
         other._conn.commit()
 
         self._patch_profiles(monkeypatch, other_home)
+        self._set_policy(monkeypatch, True)
 
         # Every permutation the model might send must resolve to (asdf, s_other).
         for kwargs in (
@@ -570,6 +601,140 @@ class TestCrossProfileRead:
             assert result["success"] is True, kwargs
             assert result["mode"] == "read"
             assert result["session_id"] == "s_other"
+
+    def test_default_policy_denies_with_operator_instructions(
+        self, db, tmp_path, monkeypatch, caplog
+    ):
+        other_home = tmp_path / "other_home"
+        other_home.mkdir()
+        other = SessionDB(other_home / "state.db")
+        other.create_session("s_other", source="cli")
+        other.append_message("s_other", role="user", content="private other history")
+        other._conn.commit()
+
+        self._patch_profiles(monkeypatch, other_home)
+        self._set_policy(monkeypatch, False)
+
+        with caplog.at_level(logging.INFO, logger="tools.session_search_tool"):
+            result = json.loads(
+                session_search(session_id="s_other", profile="other", db=db)
+            )
+
+        assert result["success"] is False
+        assert "cross-profile history access is disabled" in result["error"]
+        assert "security.session_search_cross_profile_enabled: true" in result["error"]
+        assert "private other history" not in json.dumps(result)
+        assert "calling_profile=current target_profile=other outcome=denied" in caplog.text
+
+    def test_explicit_current_profile_bypasses_cross_profile_policy(
+        self, db, tmp_path, monkeypatch, caplog
+    ):
+        current_home = tmp_path / "current_home"
+        current_home.mkdir()
+        current = SessionDB(current_home / "state.db")
+        current.create_session("s_current", source="cli")
+        current.append_message("s_current", role="user", content="own history")
+        current._conn.commit()
+
+        self._patch_profiles(monkeypatch, current_home)
+        self._set_policy(monkeypatch, False, caller="current")
+        monkeypatch.setattr(
+            session_search_mod,
+            "_cross_profile_access_enabled",
+            lambda: (_ for _ in ()).throw(
+                AssertionError("same-profile access must not consult the cross-profile flag")
+            ),
+        )
+
+        with caplog.at_level(logging.INFO, logger="tools.session_search_tool"):
+            result = json.loads(
+                session_search(session_id="s_current", profile="current", db=current)
+            )
+
+        assert result["success"] is True
+        assert result["messages"][0]["content"] == "own history"
+        assert "cross-profile access attempt" not in caplog.text
+
+    def test_profile_name_collision_cannot_bypass_db_boundary(
+        self, db, tmp_path, monkeypatch, caplog
+    ):
+        other_home = tmp_path / "other_home"
+        other_home.mkdir()
+        other = SessionDB(other_home / "state.db")
+        other.create_session("s_other", source="cli")
+        other.append_message("s_other", role="user", content="other history")
+        other._conn.commit()
+
+        self._patch_profiles(monkeypatch, other_home)
+        self._set_policy(monkeypatch, False, caller="other")
+
+        with caplog.at_level(logging.INFO, logger="tools.session_search_tool"):
+            result = json.loads(
+                session_search(session_id="s_other", profile="other", db=db)
+            )
+
+        assert result["success"] is False
+        assert "cross-profile history access is disabled" in result["error"]
+        assert "outcome=denied" in caplog.text
+
+    @pytest.mark.parametrize(
+        ("enabled", "kwargs", "outcome"),
+        [
+            (False, {"session_id": "s_other", "profile": "other"}, "denied"),
+            (False, {"session_id": "other/s_other"}, "denied"),
+            (True, {"session_id": "s_other", "profile": "other"}, "allowed"),
+            (True, {"session_id": "other/s_other"}, "allowed"),
+        ],
+    )
+    def test_attempt_log_covers_explicit_access_matrix(
+        self, db, tmp_path, monkeypatch, caplog, enabled, kwargs, outcome
+    ):
+        other_home = tmp_path / "other_home"
+        other_home.mkdir()
+        other = SessionDB(other_home / "state.db")
+        other.create_session("s_other", source="cli")
+        other.append_message("s_other", role="user", content="other history")
+        other._conn.commit()
+
+        self._patch_profiles(monkeypatch, other_home)
+        self._set_policy(monkeypatch, enabled)
+
+        with caplog.at_level(logging.INFO, logger="tools.session_search_tool"):
+            result = json.loads(session_search(db=db, **kwargs))
+
+        assert result["success"] is enabled
+        matching = [
+            record.getMessage()
+            for record in caplog.records
+            if "session_search cross-profile access attempt" in record.getMessage()
+        ]
+        assert len(matching) == 1
+        assert "calling_profile=current" in matching[0]
+        assert "target_profile=other" in matching[0]
+        assert f"outcome={outcome}" in matching[0]
+
+
+def test_cross_profile_config_defaults_off():
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["security"]["session_search_cross_profile_enabled"] is False
+
+
+def test_cross_profile_config_flag_loads_from_calling_profile(tmp_path, monkeypatch):
+    from hermes_cli import config as config_mod
+
+    calling_home = tmp_path / "calling_home"
+    calling_home.mkdir()
+    (calling_home / "config.yaml").write_text(
+        "security:\n  session_search_cross_profile_enabled: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(calling_home))
+    config_mod._LOAD_CONFIG_CACHE.clear()
+    try:
+        assert session_search_mod._cross_profile_access_enabled() is True
+    finally:
+        config_mod._LOAD_CONFIG_CACHE.clear()
 
 
 # =========================================================================

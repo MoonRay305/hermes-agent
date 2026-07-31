@@ -33,6 +33,12 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Union
 
+
+logger = logging.getLogger(__name__)
+
+_CROSS_PROFILE_CONFIG_KEY = "session_search_cross_profile_enabled"
+_CROSS_PROFILE_CONFIG_PATH = f"security.{_CROSS_PROFILE_CONFIG_KEY}"
+
 # Sources that are excluded from session browsing/searching by default.
 # Third-party integrations tag their sessions with HERMES_SESSION_SOURCE=tool;
 # delegate subagent runs are tagged "subagent" — neither belongs in the
@@ -164,48 +170,74 @@ def _resolve_profile_db(profile: str):
     return SessionDB(db_path=profiles_mod.get_profile_dir(canon) / "state.db", read_only=True)
 
 
-def _locate_session_db(session_id: str):
-    """Scan every profile's ``state.db`` (read-only) for a session id.
-
-    Returns ``(db, profile_name)`` for the first profile that owns the id, or
-    ``(None, None)``. Session ids are globally unique (timestamp + random hex),
-    so the first hit is authoritative. This is the safety net for linked-session
-    reads where the model dropped the owning profile from the link and passed a
-    bare id — we find it wherever it actually lives instead of failing.
-    """
-    from pathlib import Path
-
+def _active_profile_name() -> str:
+    """Return the calling profile name for policy and audit records."""
     try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        return get_active_profile_name() or "default"
+    except Exception:
+        logger.warning(
+            "session_search could not determine the calling profile; "
+            "cross-profile history access will remain disabled",
+            exc_info=True,
+        )
+        return "unknown"
+
+
+def _db_belongs_to_profile(db, profile: str) -> bool:
+    """Return whether ``db`` is the named profile's current state database."""
+    try:
+        from pathlib import Path
         from hermes_cli import profiles as profiles_mod
-        from hermes_state import SessionDB
-    except Exception:
-        return None, None
 
-    targets = [("default", profiles_mod.get_profile_dir("default"))]
+        db_path = getattr(db, "db_path", None)
+        if db_path is None:
+            return False
+        target_path = profiles_mod.get_profile_dir(profile) / "state.db"
+        return Path(db_path).resolve() == target_path.resolve()
+    except Exception:
+        logger.debug(
+            "session_search could not compare the current DB with profile %s",
+            profile,
+            exc_info=True,
+        )
+        return False
+
+
+def _cross_profile_access_enabled() -> bool:
+    """Read the calling profile's explicit cross-profile opt-in.
+
+    Only the YAML boolean ``true`` enables the capability. Config load errors
+    and non-boolean values fail closed.
+    """
     try:
-        targets += [(info.name, info.path) for info in profiles_mod.list_profiles()]
+        from hermes_cli.config import load_config_readonly
+
+        security = (load_config_readonly() or {}).get("security", {}) or {}
+        return security.get(_CROSS_PROFILE_CONFIG_KEY) is True
     except Exception:
-        logging.debug("list_profiles failed during session locate", exc_info=True)
+        logger.warning(
+            "session_search could not read %s; denying cross-profile history access",
+            _CROSS_PROFILE_CONFIG_PATH,
+            exc_info=True,
+        )
+        return False
 
-    seen: set = set()
-    for name, home in targets:
-        db_path = Path(home) / "state.db"
-        key = str(db_path)
-        if key in seen or not db_path.exists():
-            continue
-        seen.add(key)
-        try:
-            pdb = SessionDB(db_path=db_path, read_only=True)
-        except Exception:
-            continue
-        try:
-            if pdb.get_session(session_id):
-                return pdb, name
-        except Exception:
-            logging.debug("get_session probe failed for %s in %s", session_id, name, exc_info=True)
-        pdb.close()
 
-    return None, None
+def _cross_profile_denied_error(calling_profile: str, target_profile: str) -> str:
+    """Return a plain denial that tells the operator how to opt in."""
+    try:
+        from hermes_constants import display_hermes_home
+
+        config_path = f"{display_hermes_home()}/config.yaml"
+    except Exception:
+        config_path = "the calling profile's config.yaml"
+    return (
+        "cross-profile history access is disabled "
+        f"(calling profile '{calling_profile}', target profile '{target_profile}'). "
+        f"To enable it, set `{_CROSS_PROFILE_CONFIG_PATH}: true` in {config_path}."
+    )
 
 
 def _read_session(db, session_id: str, head: int = 20, tail: int = 10) -> str:
@@ -663,17 +695,44 @@ def session_search(
             if emb_profile and (profile is None or not str(profile).strip()):
                 profile = emb_profile
 
-    # Cross-profile read: swap in the named profile's DB (read-only) for every
-    # shape below. The current-session-lineage guards no longer apply across
+    # Explicit profile selection keeps same-profile behavior unchanged. A true
+    # cross-profile selection is policy-gated and audited before any target DB
+    # is opened. The current-session-lineage guards no longer apply across
     # profiles, but they key off ids that won't collide, so they stay inert.
     if profile is not None and str(profile).strip():
         try:
-            profile_db = _resolve_profile_db(profile)
+            from hermes_cli import profiles as profiles_mod
+
+            target_profile = profiles_mod.normalize_profile_name(profile)
+            profiles_mod.validate_profile_name(target_profile)
         except Exception as e:
             return tool_error(f"profile '{profile}': {e}", success=False)
+
+        calling_profile = _active_profile_name()
+        is_cross_profile = not _db_belongs_to_profile(db, target_profile)
+        if is_cross_profile:
+            allowed = _cross_profile_access_enabled()
+            logger.info(
+                "session_search cross-profile access attempt "
+                "calling_profile=%s target_profile=%s outcome=%s",
+                calling_profile,
+                target_profile,
+                "allowed" if allowed else "denied",
+            )
+            if not allowed:
+                return tool_error(
+                    _cross_profile_denied_error(calling_profile, target_profile),
+                    success=False,
+                )
+
+        try:
+            profile_db = _resolve_profile_db(target_profile)
+        except Exception as e:
+            return tool_error(f"profile '{target_profile}': {e}", success=False)
         if profile_db is not None:
             db = profile_db
-            current_session_id = None
+            if is_cross_profile:
+                current_session_id = None
 
     # Scroll shape takes precedence — explicit anchor beats any query.
     if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:
@@ -688,23 +747,7 @@ def session_search(
     # Read shape: a session_id with no anchor → dump the whole session.
     if isinstance(session_id, str) and session_id.strip():
         sid = session_id.strip()
-        result = _read_session(db, sid)
-        if json.loads(result).get("success"):
-            return result
-
-        # Miss in the target profile — the model may have dropped the owning
-        # profile from the link. Scan every profile and read it from wherever
-        # it lives, tagging the profile it was found in.
-        located, owner = _locate_session_db(sid)
-        if located is not None:
-            try:
-                found = json.loads(_read_session(located, sid))
-            finally:
-                located.close()
-            if found.get("success"):
-                found["profile"] = owner
-                return json.dumps(found, ensure_ascii=False)
-        return result
+        return _read_session(db, sid)
 
     # Limit clamp [1, 10]
     if not isinstance(limit, int):
