@@ -406,8 +406,18 @@ _TOOL_DIGEST_VALUE_RE = re.compile(
     r"sha(?:1|224|256|384|512)-[A-Za-z0-9_+/=-]{20,}",
     re.IGNORECASE,
 )
+_TOOL_SHELL_VARIABLE_RE = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
+_TOOL_SHELL_AUTH_HEADER_RE = re.compile(
+    r"(?:Proxy-)?Authorization:\s*"
+    r"(?:[A-Za-z][\w.+-]*\s+)?"
+    r"\$[A-Za-z_][A-Za-z0-9_]*",
+    re.IGNORECASE,
+)
 _TOOL_PACKAGE_VERSION_RE = re.compile(
     r"^[~^<>=]*\d+(?:\.\d+){1,3}(?:[-+][A-Za-z0-9.-]+)?$"
+)
+_TOOL_PACKAGE_REFERENCE_RE = re.compile(
+    r"^[A-Za-z][A-Za-z0-9_.-]*/\d+(?:\.\d+){1,3}(?:[-+][A-Za-z0-9.-]+)?$"
 )
 
 
@@ -469,6 +479,7 @@ def _is_tool_credential_literal(value: str) -> bool:
         or value.startswith(TOOL_OUTPUT_REDACTED_PREFIX)
         or _TOOL_DYNAMIC_VALUE_RE.match(value)
         or _TOOL_PACKAGE_VERSION_RE.match(value)
+        or _TOOL_PACKAGE_REFERENCE_RE.match(value)
         or value.isdecimal()
     ):
         return False
@@ -540,6 +551,10 @@ def _redact_tool_named_values(text: str, names: Iterable[str]) -> str:
         parts = _tool_name_parts(name)
         if not parts:
             return False
+        is_environment_name = bool(
+            re.fullmatch(r"[A-Z0-9_]+", name)
+            and any(char.isalpha() for char in name)
+        )
         for configured in configured_parts:
             if not configured or len(configured) > len(parts):
                 continue
@@ -548,15 +563,14 @@ def _redact_tool_named_values(text: str, names: Iterable[str]) -> str:
             # source identifiers such as ``api_key_name``.
             if parts[-len(configured):] == configured:
                 return True
-        # AWS_SECRET_ACCESS_KEY and similar vendor compounds carry ``secret``
-        # before a trailing ``key`` rather than as a configured-name suffix.
-        if (
-            name.upper() == name
-            and any(char.isalpha() for char in name)
-            and parts[-1:] == ("key",)
-            and "secret" in parts
-        ):
-            return True
+            # All-uppercase identifiers are environment/config names. Match a
+            # configured name at any component boundary so credential prefixes,
+            # infixes, and deployment suffixes remain covered. The adjacent
+            # value predicate below prevents source expressions from matching.
+            if is_environment_name:
+                for index in range(len(parts) - len(configured) + 1):
+                    if parts[index:index + len(configured)] == configured:
+                        return True
         return False
 
     replacements: list[tuple[int, int, str]] = []
@@ -652,30 +666,47 @@ def _redact_tool_high_entropy(
 
 
 def _legacy_redact_preserving_digests(text: str) -> str:
-    """Run the legacy pass without corrupting package integrity digests."""
-    digests: list[tuple[str, str]] = []
+    """Run the legacy pass without rewriting digests or shell references."""
+    protected_literals: list[tuple[str, str]] = []
     next_marker_index = 0
 
-    def _shield(match: re.Match) -> str:
+    def _new_marker(label: str, literal: str) -> str:
         nonlocal next_marker_index
         marker_index = next_marker_index
-        marker = f"\x00HERMES_TOOL_DIGEST_{marker_index}\x00"
+        marker = f"\x00HERMES_TOOL_{label}_{marker_index}\x00"
         while marker in text:
             marker_index += 1
-            marker = f"\x00HERMES_TOOL_DIGEST_{marker_index}\x00"
+            marker = f"\x00HERMES_TOOL_{label}_{marker_index}\x00"
         next_marker_index = marker_index + 1
-        digests.append((marker, match.group(0)))
+        protected_literals.append((marker, literal))
         return marker
 
-    shielded = _TOOL_DIGEST_VALUE_RE.sub(_shield, text)
+    def _shield_shell_secret_header(match: re.Match) -> str:
+        if _TOOL_SHELL_VARIABLE_RE.fullmatch(match.group(2)):
+            return _new_marker("SHELL_HEADER", match.group(0))
+        return match.group(0)
+
+    shielded = _TOOL_SHELL_AUTH_HEADER_RE.sub(
+        lambda match: _new_marker("SHELL_AUTH", match.group(0)),
+        text,
+    )
+    shielded = _SECRET_HEADER_RE.sub(_shield_shell_secret_header, shielded)
+    shielded = _TOOL_DIGEST_VALUE_RE.sub(
+        lambda match: _new_marker("DIGEST", match.group(0)),
+        shielded,
+    )
+    shielded = _TOOL_SHELL_VARIABLE_RE.sub(
+        lambda match: _new_marker("SHELL", match.group(0)),
+        shielded,
+    )
     redacted = redact_sensitive_text(
         shielded,
         force=True,
         code_file=True,
         file_read=True,
     )
-    for marker, digest in digests:
-        redacted = redacted.replace(marker, digest)
+    for marker, literal in protected_literals:
+        redacted = redacted.replace(marker, literal)
     return redacted
 
 
@@ -731,11 +762,11 @@ def normalize_tool_output_content(
     *,
     policy: ToolOutputRedactionPolicy | None = None,
 ) -> Any:
-    """Normalize string output or text parts in a multimodal content list.
+    """Normalize string output or text-bearing multimodal content parts.
 
-    Non-text parts are preserved by identity, while text dictionaries and the
-    outer list are shallow-copied so callers never mutate a producer-owned
-    multimodal result.
+    Binary and image parts are preserved by identity. Text dictionaries and
+    the outer list are shallow-copied so callers never mutate producer-owned
+    multimodal results.
     """
     if isinstance(content, str):
         return normalize_tool_output(content, policy=policy)
@@ -744,9 +775,13 @@ def normalize_tool_output_content(
 
     normalized_parts: list[Any] = []
     for part in content:
+        if not isinstance(part, dict):
+            normalized_parts.append(part)
+            continue
+
+        part_type = part.get("type")
         if (
-            isinstance(part, dict)
-            and part.get("type") == "text"
+            part_type in {"text", "input_text", "output_text"}
             and isinstance(part.get("text"), str)
         ):
             normalized_parts.append(
@@ -755,6 +790,23 @@ def normalize_tool_output_content(
                     "text": normalize_tool_output(part["text"], policy=policy),
                 }
             )
+        elif part_type == "resource":
+            normalized_part = part
+            if isinstance(part.get("text"), str):
+                normalized_part = {
+                    **normalized_part,
+                    "text": normalize_tool_output(part["text"], policy=policy),
+                }
+            resource = part.get("resource")
+            if isinstance(resource, dict) and isinstance(resource.get("text"), str):
+                normalized_part = {
+                    **normalized_part,
+                    "resource": {
+                        **resource,
+                        "text": normalize_tool_output(resource["text"], policy=policy),
+                    },
+                }
+            normalized_parts.append(normalized_part)
         else:
             normalized_parts.append(part)
     return normalized_parts

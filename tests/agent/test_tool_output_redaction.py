@@ -13,6 +13,7 @@ import pytest
 from agent.redact import (
     ToolOutputRedactionPolicy,
     normalize_tool_output,
+    normalize_tool_output_content,
     resolve_tool_output_redaction_policy,
 )
 from agent.tool_dispatch_helpers import make_tool_result_message
@@ -147,6 +148,34 @@ def test_camel_case_secret_names_are_redacted(literal, label):
     assert f"[REDACTED:NAME:{label}]" in result
 
 
+@pytest.mark.parametrize(
+    ("literal", "label"),
+    [
+        ("API_KEY_V2=8fJ2kD9sLmQ4xZ7v", "API_KEY_V2"),
+        ("MY_API_KEY_PROD=aB3dE5fG7hJ9kL1m", "MY_API_KEY_PROD"),
+        ("DATABASE_PASSWORD_STAGING=Str0ngPassw0rd", "DATABASE_PASSWORD_STAGING"),
+        ("GITHUB_TOKEN_FOR_CI=aB3dE5fG7hJ9kL1m", "GITHUB_TOKEN_FOR_CI"),
+        ("SECRET_VALUE=8fJ2kD9sLmQ4xZ7v", "SECRET_VALUE"),
+        ("API_KEY=8fJ2kD9sLmQ4xZ7v", "API_KEY"),
+        ("DB_PASSWORD=Str0ngPassw0rd", "DB_PASSWORD"),
+        (
+            "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI7MDENGbPxRfiCYEXAMPLEKEY",
+            "AWS_SECRET_ACCESS_KEY",
+        ),
+    ],
+)
+def test_printenv_secret_names_are_redacted(literal, label):
+    result = normalize_tool_output(literal)
+    assert result == f"{literal.partition('=')[0]}=[REDACTED:NAME:{label}]"
+
+
+def test_printenv_known_shape_is_redacted_independently_of_name_matching():
+    literal = "STRIPE_KEY_LIVE=sk_live_1234567890"
+    result = normalize_tool_output(literal)
+    assert literal not in result
+    assert "STRIPE_KEY_LIVE=" in result
+
+
 def test_generic_high_entropy_uses_configurable_thresholds():
     literal = _synthetic_high_entropy()
     assert normalize_tool_output(literal) == "[REDACTED:HIGH_ENTROPY]"
@@ -247,6 +276,61 @@ def test_serializer_normalizes_multimodal_text_and_preserves_image_part():
     assert content[0]["text"] == f"{bcrypt}\n{incident}"
 
 
+@pytest.mark.parametrize("part_type", ["text", "input_text", "output_text"])
+def test_multimodal_text_bearing_part_types_are_normalized(part_type):
+    incident = "Environment=DB_PASSWORD=s3cr3tValue123"
+    part = {"type": part_type, "text": incident, "annotations": []}
+
+    result = normalize_tool_output_content([part])
+
+    assert result[0]["text"] == "Environment=DB_PASSWORD=[REDACTED:NAME:DB_PASSWORD]"
+    assert result[0]["annotations"] == []
+    assert part["text"] == incident
+
+
+@pytest.mark.parametrize("resource_at_top_level", [False, True])
+def test_multimodal_resource_text_is_normalized(resource_at_top_level):
+    incident = "Environment=DB_PASSWORD=s3cr3tValue123"
+    if resource_at_top_level:
+        part = {"type": "resource", "text": incident, "uri": "memory://synthetic"}
+    else:
+        part = {
+            "type": "resource",
+            "resource": {
+                "uri": "memory://synthetic",
+                "mimeType": "text/plain",
+                "text": incident,
+            },
+        }
+
+    result = normalize_tool_output_content([part])
+    result_text = result[0]["text"] if resource_at_top_level else result[0]["resource"]["text"]
+
+    assert result_text == "Environment=DB_PASSWORD=[REDACTED:NAME:DB_PASSWORD]"
+    original_text = part["text"] if resource_at_top_level else part["resource"]["text"]
+    assert original_text == incident
+
+
+def test_multimodal_binary_payloads_with_secret_shapes_are_byte_identical():
+    raw_image = b"synthetic image bytes AKIAIOSFODNN7EXAMPLE ghp_" + b"A" * 40
+    encoded = base64.b64encode(raw_image).decode("ascii")
+    image_url = {
+        "type": "image_url",
+        "image_url": {"url": f"data:image/png;base64,{encoded}"},
+    }
+    anthropic_image = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": encoded},
+    }
+
+    result = normalize_tool_output_content([image_url, anthropic_image])
+
+    assert result[0] is image_url
+    assert result[1] is anthropic_image
+    assert base64.b64decode(result[0]["image_url"]["url"].partition(",")[2]) == raw_image
+    assert base64.b64decode(result[1]["source"]["data"]) == raw_image
+
+
 def test_verbose_tool_result_log_text_is_normalized():
     from agent.tool_executor import _normalized_tool_result_log_text
 
@@ -314,17 +398,31 @@ def calculate_token_count(document):
 @pytest.mark.parametrize(
     "source",
     [
-        "api_key: Optional[str] = None, timeout: float = 5.0",
-        "token: str",
-        "api_key=api_key",
-        '"access_token": access_token',
+        "api_key: Optional[str] = None",
+        "def connect(self, token: str, ...)",
+        "Client(api_key=api_key, ...)",
+        '{"access_token": access_token, ...}',
         "token = argv[i]",
         "const API_KEY_OPTIONS: ApiKeyOption[]",
-        'sep_token="[SEP]"',
+        'AutoTokenizer(sep_token="[SEP]", ...)',
     ],
 )
 def test_named_value_matcher_preserves_source_expressions(source):
     assert normalize_tool_output(source) == source
+
+
+def test_legacy_pass_preserves_bare_shell_variable_references():
+    text = (
+        'curl -H "Authorization: token $GITHUB_TOKEN" https://example.invalid\n'
+        "printf '%s' $API_KEY"
+    )
+
+    result = normalize_tool_output(text)
+
+    assert "$GITHUB_TOKEN" in result
+    assert "$API_KEY" in result
+    literal_header = "Authorization: token opaque-credential-1234567890"
+    assert literal_header not in normalize_tool_output(literal_header)
 
 
 @pytest.mark.parametrize(
