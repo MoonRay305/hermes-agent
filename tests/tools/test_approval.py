@@ -1599,11 +1599,19 @@ class TestChmodExecuteCombo:
         # on chmod +x should still trigger even without the && ./
         assert dangerous is True
 
-    def test_safe_chmod_without_execute_not_flagged(self):
-        """chmod +x alone without immediate execution must not be flagged."""
+    def test_safe_chmod_without_execute_flags_class_not_combo(self):
+        """chmod +x alone gates as a permission change, not as the combo.
+
+        BUI-1100: permission changes now gate as a CLASS, so a bare
+        ``chmod +x`` is flagged — but under the ``permission change`` key,
+        NOT the ``chmod +x followed by immediate execution`` combo key,
+        whose approval grain must stay distinct.
+        """
         cmd = "chmod +x script.sh"
-        dangerous, _, _ = detect_dangerous_command(cmd)
-        assert dangerous is False
+        dangerous, key, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert key == "permission change (chmod)"
+        assert "execution" not in key
 
 
 class TestFailClosedUnderPromptToolkit:

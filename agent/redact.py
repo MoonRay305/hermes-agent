@@ -195,6 +195,11 @@ _PREFIX_PATTERNS = [
     r"pypi-[A-Za-z0-9_-]{10,}",         # PyPI API token
     r"dop_v1_[A-Za-z0-9]{10,}",         # DigitalOcean PAT
     r"doo_v1_[A-Za-z0-9]{10,}",         # DigitalOcean OAuth
+    # Doppler tokens: dp.<type>.<optional dotted config slugs>.<blob> —
+    # service (st), CLI (ct), personal (pt), service-account (sa), SCIM,
+    # and audit token types. The dotted middle segments (e.g. the config
+    # name in dp.st.prd.<blob>) are part of the token.
+    r"dp\.(?:st|ct|pt|sa|scim|audit)\.(?:[A-Za-z0-9_-]+\.)*[A-Za-z0-9_-]{8,}",
     r"am_[A-Za-z0-9_-]{10,}",           # AgentMail API key
     r"sk_[A-Za-z0-9_]{10,}",            # ElevenLabs TTS key (sk_ underscore, not sk- dash)
     r"tvly-[A-Za-z0-9]{10,}",           # Tavily search API key
