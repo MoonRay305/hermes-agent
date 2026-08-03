@@ -2353,6 +2353,22 @@ class TestApprovalPromptRedaction:
                                   approval_callback=cb)
         assert seen["command"] == "rm -rf /var/data"
 
+    def test_prompt_toolkit_no_callback_warning_force_redacts(self, monkeypatch, caplog):
+        """The fail-closed warning never logs the raw command or reason."""
+        secret = "dp.st.prd.FLEET85PromptLogCredential123456789"
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+        monkeypatch.setattr(
+            "prompt_toolkit.application.current.get_app_or_none", lambda: object()
+        )
+        caplog.set_level("WARNING", logger="tools.approval")
+
+        result = prompt_dangerous_approval(
+            f"command:{secret}", f"description:{secret}"
+        )
+
+        assert result == "deny"
+        assert secret not in caplog.text
+
     def test_execute_code_pending_fallback_redacts_script(self):
         """check_execute_code_guard's no-notifier fallback masks an embedded
         secret in both the pending record and the returned approval message."""

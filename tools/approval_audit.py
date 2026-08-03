@@ -26,9 +26,10 @@ detector matches emits nothing here; that is the same blind spot the
 approval gate itself has, and ``hermes approvals coverage`` exists to
 measure it.
 
-Secrets: the command string is passed through
-``agent.redact.redact_sensitive_text(..., force=True)`` before the record
-is built. ``force=True`` deliberately ignores ``security.redact_secrets:
+Secrets: every record string is passed through
+``agent.redact.redact_sensitive_text(..., force=True)`` at each sink boundary,
+including nested values, mapping keys, and future fields. ``force=True``
+deliberately ignores ``security.redact_secrets:
 false`` — an audit artifact must never contain a live credential regardless
 of the user's display preference.
 
@@ -122,6 +123,40 @@ def _redact(text: str) -> str:
         return "<unredactable: redaction module unavailable>"
 
 
+def normalize_audit_payload(value):
+    """Return a JSON-safe copy with every string recursively redacted.
+
+    This is the shared last-mile boundary for the JSONL serializer and the
+    ``approval_bypassed`` hook dispatcher. It deliberately does not enumerate
+    record fields: new fields, nested containers, mapping keys, and objects
+    rendered through ``str`` all pass through the force-mode redactor.
+
+    Redaction fails closed via :func:`_redact`. Primitive JSON scalars retain
+    their types so schema consumers do not lose numeric/boolean semantics.
+    """
+    try:
+        if isinstance(value, str):
+            return _redact(value)
+        if isinstance(value, dict):
+            normalized = {}
+            for key, item in value.items():
+                if isinstance(key, str):
+                    safe_key = _redact(key)
+                elif key is None or isinstance(key, (bool, int, float)):
+                    safe_key = key
+                else:
+                    safe_key = _redact(str(key))
+                normalized[safe_key] = normalize_audit_payload(item)
+            return normalized
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return [normalize_audit_payload(item) for item in value]
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        return _redact(str(value))
+    except Exception:
+        return "<unredactable: payload normalization failed>"
+
+
 def build_bypass_record(
     *,
     reason: str,
@@ -192,17 +227,25 @@ def build_bypass_record(
     }
 
 
-def _append_record(record: dict) -> None:
-    """Append *record* to the JSONL audit log. Best-effort, never raises."""
+def _append_record(record: dict) -> dict:
+    """Normalize and append *record* to JSONL; return the safe record."""
+    safe_record = normalize_audit_payload(record)
+    if not isinstance(safe_record, dict):
+        safe_record = {
+            "schema": 1,
+            "event": "approval_bypass",
+            "error": "<unredactable: record normalization failed>",
+        }
     try:
         path = bypass_log_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(record, ensure_ascii=False, default=str)
+        line = json.dumps(safe_record, ensure_ascii=False, default=str)
         with _write_lock:
             with open(path, "a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
     except Exception as exc:
         logger.warning("Failed to write approval bypass record: %s", exc)
+    return safe_record
 
 
 def record_bypass(
@@ -250,7 +293,7 @@ def record_bypass(
             detail=detail,
             tirith=tirith,
         )
-        _append_record(record)
+        record = _append_record(record)
 
         pattern_keys = [f["pattern_key"] for f in record["findings"]]
         description = "; ".join(
@@ -258,7 +301,7 @@ def record_bypass(
         ) or (record["tirith"] or {}).get("summary", "")
         logger.info(
             "Approval bypass (%s): %s [keys=%s session=%s profile=%s]",
-            reason,
+            record["reason"],
             record["command"][:200],
             ",".join(pattern_keys) or "-",
             record["session_key"],
@@ -271,16 +314,19 @@ def record_bypass(
         try:
             from tools.approval import _fire_approval_hook
 
+            hook_payload = normalize_audit_payload({
+                "command": record["command"],
+                "description": description,
+                "pattern_key": pattern_keys[0] if pattern_keys else "",
+                "pattern_keys": pattern_keys,
+                "session_key": record["session_key"],
+                "surface": record["surface"],
+                "reason": record["reason"],
+                "record": record,
+            })
             _fire_approval_hook(
                 "approval_bypassed",
-                command=record["command"],
-                description=description,
-                pattern_key=pattern_keys[0] if pattern_keys else "",
-                pattern_keys=pattern_keys,
-                session_key=record["session_key"],
-                surface=surface,
-                reason=reason,
-                record=record,
+                **hook_payload,
             )
         except Exception as exc:
             logger.debug("approval_bypassed hook dispatch failed: %s", exc)

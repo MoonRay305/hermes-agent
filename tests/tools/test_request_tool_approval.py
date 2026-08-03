@@ -88,6 +88,66 @@ class TestRequestToolApproval:
         assert persisted["key"] == "plugin_rule:ssh-writes"
         assert persisted["saved"] is True
 
+    def test_plugin_rule_key_is_force_redacted_before_always_persistence(
+        self, monkeypatch
+    ):
+        """A plugin credential cannot become a config.yaml allowlist key."""
+        secret = "dp.st.prd.FLEET85RuleKeyCredential123456789"
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        monkeypatch.setattr(
+            approval, "prompt_dangerous_approval", lambda *a, **k: "always"
+        )
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+
+        persisted = {"session": [], "permanent": [], "config": []}
+        monkeypatch.setattr(
+            approval, "approve_session",
+            lambda session_key, pattern_key: persisted["session"].append(pattern_key),
+        )
+        monkeypatch.setattr(
+            approval, "approve_permanent",
+            lambda pattern_key: persisted["permanent"].append(pattern_key),
+        )
+        monkeypatch.setattr(
+            approval, "save_permanent_allowlist",
+            lambda patterns: persisted["config"].extend(persisted["permanent"]),
+        )
+
+        result = request_tool_approval(
+            "write_file", "synthetic reason", rule_key=f"rule:{secret}"
+        )
+
+        assert result == {"approved": True, "message": None}
+        assert secret not in repr(persisted)
+        assert persisted["permanent"] == persisted["config"]
+        assert persisted["permanent"][0].startswith("plugin_rule:rule:")
+
+    @pytest.mark.parametrize("cron_session", [False, True], ids=["no-human", "cron"])
+    def test_plugin_gate_warning_force_redacts_caller_fields(
+        self, monkeypatch, caplog, cron_session
+    ):
+        """Both shared non-interactive warnings scrub plugin data."""
+        secret = "dp.st.prd.FLEET85GateLogCredential123456789"
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+        monkeypatch.setattr(
+            approval,
+            "env_var_enabled",
+            lambda name: cron_session and name == "HERMES_CRON_SESSION",
+        )
+        monkeypatch.setattr(approval, "_get_cron_approval_mode", lambda: "approve")
+        caplog.set_level("WARNING", logger="tools.approval")
+
+        result = request_tool_approval(
+            "write_file", f"reason:{secret}", rule_key=f"rule:{secret}"
+        )
+
+        assert result["approved"] is cron_session
+        assert secret not in caplog.text
+        assert secret not in repr(result)
+
     def test_gateway_path_submits_pending_and_defers(self, monkeypatch):
         monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
         monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)

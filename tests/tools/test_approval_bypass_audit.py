@@ -10,6 +10,7 @@ records still emit, that records never contain a secret, and that clean
 commands stay silent.
 """
 import json
+import logging
 from unittest.mock import patch
 
 import pytest
@@ -233,6 +234,103 @@ class TestEmissionPolicy:
         raw = json.dumps(records[0])
         assert secret not in raw
         assert doppler_token not in raw
+
+    def test_plugin_reason_credential_absent_from_file_and_hook(
+            self, audit_env, monkeypatch):
+        """Literal counterprobe: a plugin controls the approval reason."""
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+        secret = "dp.st.prd.FLEET83PluginReasonCredential123456789"
+        captured = []
+
+        def fake_invoke_hook(hook_name, **kwargs):
+            captured.append((hook_name, kwargs))
+            return []
+
+        with patch("hermes_cli.plugins.invoke_hook", side_effect=fake_invoke_hook):
+            result = request_tool_approval(
+                "write_file", f"plugin reason credential={secret}")
+
+        assert result["approved"] is True
+        file_payload = audit_module.bypass_log_path().read_text(encoding="utf-8")
+        hook_payload = json.dumps(captured)
+        assert [name for name, _ in captured] == ["approval_bypassed"]
+        assert secret not in file_payload
+        assert secret not in hook_payload
+
+    def test_every_caller_controlled_record_string_is_redacted_at_both_sinks(
+            self, audit_env):
+        """Future fields cannot bypass recursive file/hook normalization."""
+        secrets = {
+            name: f"dp.st.prd.FLEET83{name}Credential123456789"
+            for name in (
+                "reason", "command", "pattern_key", "description",
+                "session_key", "surface", "env_type", "detail_key",
+                "detail_value", "tirith_action", "tirith_summary",
+                "turn_id", "tool_call_id",
+            )
+        }
+        captured = []
+
+        def fake_invoke_hook(hook_name, **kwargs):
+            captured.append((hook_name, kwargs))
+            return []
+
+        context_tokens = approval_module.set_current_observability_context(
+            turn_id=secrets["turn_id"],
+            tool_call_id=secrets["tool_call_id"],
+        )
+        try:
+            with patch("hermes_cli.plugins.invoke_hook",
+                       side_effect=fake_invoke_hook):
+                audit_module.record_bypass(
+                    reason=secrets["reason"],
+                    command=secrets["command"],
+                    findings=[(
+                        secrets["pattern_key"], secrets["description"]
+                    )],
+                    session_key=secrets["session_key"],
+                    surface=secrets["surface"],
+                    env_type=secrets["env_type"],
+                    detail={
+                        secrets["detail_key"]: [secrets["detail_value"]]
+                    },
+                    tirith={
+                        "action": secrets["tirith_action"],
+                        "summary": secrets["tirith_summary"],
+                        "findings": [],
+                    },
+                )
+        finally:
+            approval_module.reset_current_observability_context(context_tokens)
+
+        file_payload = audit_module.bypass_log_path().read_text(encoding="utf-8")
+        hook_payload = json.dumps(captured)
+        assert [name for name, _ in captured] == ["approval_bypassed"]
+        for secret in secrets.values():
+            assert secret not in file_payload
+            assert secret not in hook_payload
+
+    @pytest.mark.parametrize(
+        "writer_error",
+        [
+            OSError(28, "synthetic disk full"),
+            PermissionError(13, "synthetic permission denied"),
+            FileNotFoundError(2, "synthetic path missing"),
+        ],
+        ids=["disk-full", "permission-denied", "path-missing"],
+    )
+    def test_writer_failure_is_visible_and_does_not_block_command(
+            self, audit_env, monkeypatch, caplog, writer_error):
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+        caplog.set_level(logging.WARNING, logger="tools.approval_audit")
+
+        with patch("tools.approval_audit.open", create=True,
+                   side_effect=writer_error):
+            result = request_tool_approval(
+                "write_file", "plugin reason requiring approval")
+
+        assert result["approved"] is True
+        assert "Failed to write approval bypass record" in caplog.text
 
     def test_tirith_fail_open_emits_once_per_process(self, audit_env, monkeypatch):
         import tools.tirith_security as tirith_module

@@ -99,8 +99,9 @@ def _fire_approval_hook(hook_name: str, **kwargs) -> None:
     imported very early, long before plugins are discovered). Never raises --
     plugin errors are logged and swallowed.
 
-    Only fires for the two approval-specific hooks in VALID_HOOKS:
-    pre_approval_request, post_approval_response.
+    Only fires for approval-specific hooks in VALID_HOOKS. Every payload is
+    force-redacted here, after correlation IDs are attached, because plugins
+    are external observers and may persist or forward the kwargs verbatim.
     """
     try:
         from hermes_cli.plugins import invoke_hook
@@ -111,6 +112,12 @@ def _fire_approval_hook(hook_name: str, **kwargs) -> None:
     try:
         kwargs.setdefault("turn_id", _approval_turn_id.get())
         kwargs.setdefault("tool_call_id", _approval_tool_call_id.get())
+        # Normalize after correlation IDs are attached so every current or
+        # future payload string crosses the force-redaction boundary before
+        # any observer (including telemetry plugins) receives it.
+        from tools.approval_audit import normalize_audit_payload
+
+        kwargs = normalize_audit_payload(kwargs)
         invoke_hook(hook_name, **kwargs)
     except Exception as exc:
         # invoke_hook() already swallows per-callback errors, so reaching here
@@ -1803,8 +1810,8 @@ def prompt_dangerous_approval(command: str, description: str,
     # copy is scrubbed. Reuses the same redaction module used for memory
     # and log sanitization so tokens mask consistently across surfaces.
     from agent.redact import redact_sensitive_text
-    display_command = redact_sensitive_text(command)
-    display_description = redact_sensitive_text(description)
+    display_command = redact_sensitive_text(command, force=True)
+    display_description = redact_sensitive_text(description, force=True)
 
     if approval_callback is not None:
         try:
@@ -1832,7 +1839,7 @@ def prompt_dangerous_approval(command: str, description: str,
                 "Dangerous-command approval requested on a thread with no "
                 "approval callback while prompt_toolkit is active; denying "
                 "to avoid stdin deadlock. command=%r description=%r",
-                command, description,
+                display_command, display_description,
             )
             return "deny"
     except Exception:
@@ -2172,6 +2179,31 @@ def _run_approval_gate(
         ``{"approved": bool, "message": str|None, ...}`` — shape shared with
         ``check_dangerous_command`` so all callers handle it uniformly.
     """
+    # This is the last common boundary before caller-controlled approval data
+    # reaches logs, queues, hooks, allowlist state, or config.yaml. Normalize
+    # every string here with force-mode redaction; ``display_target`` is a
+    # display-only copy, never the command that executes.
+    from tools.approval_audit import normalize_audit_payload
+
+    _safe = normalize_audit_payload({
+        "pattern_key": pattern_key,
+        "description": description,
+        "display_target": display_target,
+        "cron_deny_message": cron_deny_message,
+        "autoapprove_log_prefix": autoapprove_log_prefix,
+        "no_human_block_message": no_human_block_message,
+        "audit_surface": audit_surface,
+        "audit_env_type": audit_env_type,
+    })
+    pattern_key = _safe["pattern_key"]
+    description = _safe["description"]
+    display_target = _safe["display_target"]
+    cron_deny_message = _safe["cron_deny_message"]
+    autoapprove_log_prefix = _safe["autoapprove_log_prefix"]
+    no_human_block_message = _safe["no_human_block_message"]
+    audit_surface = _safe["audit_surface"]
+    audit_env_type = _safe["audit_env_type"]
+
     _audit_findings = [(pattern_key, description)]
 
     # --yolo bypasses all approval prompts (session- or process-scoped).
