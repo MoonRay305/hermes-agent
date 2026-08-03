@@ -237,6 +237,75 @@ class TestProviderEnvBlocklist:
         assert result_env["MY_CUSTOM_VAR"] == "keep-this"
 
 
+class TestAmbientCredentialPolicy:
+    """Credential-shaped vars fail closed unless passthrough is explicit."""
+
+    def test_unregistered_credential_names_are_stripped(self):
+        """Doppler/custom credential names must not pass just because the
+        Hermes provider registry has never heard of them."""
+        credential_vars = {
+            "GITHUB_REVIEWER_PAT": "reviewer-token",
+            "MS_GRAPH_CLIENT_SECRET": "graph-secret",
+            "LINEAR_API_KEY": "linear-secret",
+            "DOCUSIGN_PRIVATE_KEY": "private-key",
+            "CUSTOM_DATABASE_URL": "postgres://user:password@example/db",
+            "CUSTOM_DSN": "https://public:secret@example.invalid/1",
+        }
+
+        result_env = _run_with_env(extra_os_env=credential_vars)
+
+        for var in credential_vars:
+            assert var not in result_env, f"{var} leaked into subprocess env"
+
+    def test_noncredential_runtime_metadata_is_preserved(self):
+        """IDs, ordinary URLs, and routing metadata remain ambient."""
+        metadata = {
+            "MS_GRAPH_CLIENT_ID": "client-id",
+            "MS_GRAPH_TENANT_ID": "tenant-id",
+            "MISSION_CONTROL_API_URL": "https://mission.example.invalid",
+            "CUSTOM_FEATURE_FLAG": "enabled",
+        }
+
+        result_env = _run_with_env(extra_os_env=metadata)
+
+        for var, value in metadata.items():
+            assert result_env.get(var) == value
+
+    def test_explicit_passthrough_allows_third_party_credential(self):
+        """A non-Hermes credential passes only after it is named explicitly."""
+        from tools.env_passthrough import (
+            clear_env_passthrough,
+            register_env_passthrough,
+        )
+
+        clear_env_passthrough()
+        try:
+            register_env_passthrough(["MS_GRAPH_CLIENT_SECRET"])
+            result_env = _run_with_env(extra_os_env={
+                "MS_GRAPH_CLIENT_SECRET": "graph-secret",
+            })
+        finally:
+            clear_env_passthrough()
+
+        assert result_env.get("MS_GRAPH_CLIENT_SECRET") == "graph-secret"
+
+    def test_background_spawn_sanitizer_uses_same_default_deny_rule(self):
+        """Background/PTY local spawns must match foreground terminals."""
+        from tools.environments.local import _sanitize_subprocess_env
+
+        result_env = _sanitize_subprocess_env(
+            {
+                "PATH": "/usr/bin:/bin",
+                "GITHUB_REVIEWER_PAT": "reviewer-token",
+            },
+            {"MS_GRAPH_CLIENT_SECRET": "graph-secret"},
+        )
+
+        assert result_env.get("PATH") == "/usr/bin:/bin"
+        assert "GITHUB_REVIEWER_PAT" not in result_env
+        assert "MS_GRAPH_CLIENT_SECRET" not in result_env
+
+
 class TestForceEnvOptIn:
     """Callers can opt in to passing a blocked var via _HERMES_FORCE_ prefix."""
 
@@ -259,6 +328,14 @@ class TestForceEnvOptIn:
         )
 
         assert result_env["OPENAI_BASE_URL"] == "http://intended/v1"
+
+    def test_force_prefix_cannot_promote_github_auth(self):
+        """Tier-1 GitHub auth stays non-ambient even via the force prefix."""
+        result_env = _run_with_env(self_env={
+            f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}GH_TOKEN": "reviewer-token",
+        })
+
+        assert "GH_TOKEN" not in result_env
 
 
 class TestActiveVenvMarkerStripping:

@@ -238,6 +238,89 @@ _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
 # these markers is safe and only prevents the cross-project clobber (#23473).
 _ACTIVE_VENV_MARKER_VARS = ("VIRTUAL_ENV", "CONDA_PREFIX")
 
+# Credentials outside Hermes' provider/tool registries must fail closed too.
+# Doppler, Vault, systemd, and operator wrappers can add new names to the
+# long-lived Hermes process without a corresponding code change.  A static
+# blocklist therefore cannot be the authority for whether a value becomes
+# ambient in terminal children and their persistent shell snapshots.
+_CREDENTIAL_ENV_COMPONENTS = frozenset({
+    "APIKEY",
+    "BEARER",
+    "CREDENTIAL",
+    "CREDENTIALS",
+    "CREDS",
+    "DSN",
+    "PASSWORD",
+    "PASSWD",
+    "PAT",
+    "SECRET",
+    "TOKEN",
+})
+_CREDENTIAL_KEY_PREFIXES = frozenset({
+    "ACCESS",
+    "API",
+    "ENCRYPTION",
+    "HMAC",
+    "INTEGRATION",
+    "PRIVATE",
+    "SECRET",
+    "SIGNING",
+})
+_CREDENTIAL_URL_SUFFIXES = (
+    "DATABASE_URL",
+    "MONGODB_URI",
+    "POSTGRES_URL",
+    "REDIS_URL",
+)
+
+# These operator-owned credentials are deliberately named for ambient local
+# terminal passthrough.  They preserve the established trusted-operator-shell
+# contract (SECURITY.md section 3.2) and the Claude Code login behavior while
+# making every unlisted credential-shaped name default-deny.  Skill/config
+# passthrough remains the explicit opt-in for other non-Hermes credentials.
+_AMBIENT_CREDENTIAL_ALLOWLIST = frozenset({
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_SESSION_TOKEN",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+})
+_NEVER_FORCE_AMBIENT_GITHUB_KEYS = frozenset({"GH_TOKEN", "GITHUB_TOKEN"})
+
+
+def _is_credential_env_name(name: str) -> bool:
+    """Return whether *name* conventionally carries credential material.
+
+    This is intentionally component-aware instead of a raw substring search:
+    names such as ``SSH_AUTH_SOCK`` and ``PATHEXT`` are operational metadata,
+    while ``GITHUB_REVIEWER_PAT``, ``MS_GRAPH_CLIENT_SECRET``, and
+    ``DOCUSIGN_PRIVATE_KEY`` are credentials.  The source of an inherited
+    process variable (Doppler, a profile file, or a service manager) is already
+    lost at this boundary, so the safe default must be based on the name.
+    """
+    upper = name.upper()
+    parts = tuple(part for part in upper.split("_") if part)
+    if any(part in _CREDENTIAL_ENV_COMPONENTS for part in parts):
+        return True
+    if len(parts) == 1 and parts[0] == "KEY":
+        return True
+    if any(
+        parts[index] == "KEY" and parts[index - 1] in _CREDENTIAL_KEY_PREFIXES
+        for index in range(1, len(parts))
+    ):
+        return True
+    return upper.endswith(_CREDENTIAL_URL_SUFFIXES)
+
+
+def _is_ambient_env_allowed(name: str, is_passthrough) -> bool:
+    """Apply the terminal's explicit credential-passthrough policy."""
+    if name in _AMBIENT_CREDENTIAL_ALLOWLIST:
+        return True
+    if name in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_credential_env_name(name):
+        return bool(is_passthrough(name))
+    return True
+
 
 def _is_hermes_internal_secret(key: str) -> bool:
     """Return True for Hermes-internal secrets injected under *dynamic* names.
@@ -357,18 +440,21 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
             continue
         if _is_hermes_internal_secret(key):
             continue
-        if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
+        if _is_ambient_env_allowed(key, _is_passthrough):
             sanitized[key] = value
 
     for key, value in (extra_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
-            if _is_hermes_internal_secret(real_key):
+            if (
+                real_key in _NEVER_FORCE_AMBIENT_GITHUB_KEYS
+                or _is_hermes_internal_secret(real_key)
+            ):
                 continue
             sanitized[real_key] = value
         elif _is_hermes_internal_secret(key):
             continue
-        elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
+        elif _is_ambient_env_allowed(key, _is_passthrough):
             sanitized[key] = value
 
     _inject_context_hermes_home(sanitized)
@@ -443,11 +529,16 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     skill-aware (``env_passthrough``); this helper is for spawns that have no
     skill-passthrough concept.
 
-    Two-tier stripping:
+    Credential stripping:
 
     * **Tier 1 (always):** ``_ALWAYS_STRIP_KEYS`` — gateway bot tokens, GitHub
       auth, and remote-compute secrets are removed regardless of
       ``inherit_credentials``.  No child Hermes spawns legitimately needs them.
+    * **Unregistered credentials (always):** credential-shaped names that are
+      not in the Hermes provider registry or explicit ambient allowlist are
+      removed regardless of ``inherit_credentials``. A newly-added Doppler or
+      service secret cannot become ambient just because the static blocklist
+      has never seen its name.
     * **Tier 2 (conditional):** the rest of ``_HERMES_PROVIDER_ENV_BLOCKLIST``
       (LLM provider API keys, tool secrets) is removed unless the caller passes
       ``inherit_credentials=True``.
@@ -477,6 +568,17 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             env.pop(key, None)
         elif _is_hermes_internal_secret(key):
+            env.pop(key, None)
+
+    # Unknown credential-shaped names are covered by neither static tier.
+    # Provider-registry names are handled by inherit_credentials below; every
+    # other credential must be named in the explicit ambient allowlist.
+    for key in list(env):
+        if (
+            key not in _AMBIENT_CREDENTIAL_ALLOWLIST
+            and key not in _HERMES_PROVIDER_ENV_BLOCKLIST
+            and _is_credential_env_name(key)
+        ):
             env.pop(key, None)
 
     if not inherit_credentials:
@@ -803,12 +905,15 @@ def _make_run_env(env: dict) -> dict:
     for k, v in merged.items():
         if k.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = k[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
-            if _is_hermes_internal_secret(real_key):
+            if (
+                real_key in _NEVER_FORCE_AMBIENT_GITHUB_KEYS
+                or _is_hermes_internal_secret(real_key)
+            ):
                 continue
             run_env[real_key] = v
         elif _is_hermes_internal_secret(k):
             continue
-        elif k not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(k):
+        elif _is_ambient_env_allowed(k, _is_passthrough):
             run_env[k] = v
     path_key = _path_env_key(run_env)
     if path_key is not None:

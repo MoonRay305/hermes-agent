@@ -62,6 +62,14 @@ class TestStripByDefault:
         for var in _TIER1_SAMPLE:
             assert var not in result, f"{var} leaked (Tier-1) with inherit_credentials=False"
 
+    def test_unregistered_credentials_stripped_by_default(self):
+        result = _build({
+            "GITHUB_REVIEWER_PAT": "reviewer-token",
+            "MS_GRAPH_CLIENT_SECRET": "graph-secret",
+        })
+        assert "GITHUB_REVIEWER_PAT" not in result
+        assert "MS_GRAPH_CLIENT_SECRET" not in result
+
     def test_safe_vars_preserved(self):
         result = _build()
         assert result["HOME"] == "/home/user"
@@ -94,6 +102,21 @@ class TestInheritCredentials:
                 f"{var} (Tier-1) must be stripped even with inherit_credentials=True"
             )
         # ...while provider keys survive.
+        for var in _PROVIDER_SAMPLE:
+            assert var in result
+
+    def test_unregistered_credentials_stay_stripped_when_inheriting(self):
+        """The broad provider opt-in only covers registry-named providers."""
+        result = _build(
+            {
+                **_PROVIDER_SAMPLE,
+                "GITHUB_REVIEWER_PAT": "reviewer-token",
+                "MS_GRAPH_CLIENT_SECRET": "graph-secret",
+            },
+            inherit_credentials=True,
+        )
+        assert "GITHUB_REVIEWER_PAT" not in result
+        assert "MS_GRAPH_CLIENT_SECRET" not in result
         for var in _PROVIDER_SAMPLE:
             assert var in result
 
