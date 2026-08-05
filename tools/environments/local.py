@@ -238,88 +238,105 @@ _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
 # these markers is safe and only prevents the cross-project clobber (#23473).
 _ACTIVE_VENV_MARKER_VARS = ("VIRTUAL_ENV", "CONDA_PREFIX")
 
-# Credentials outside Hermes' provider/tool registries must fail closed too.
-# Doppler, Vault, systemd, and operator wrappers can add new names to the
-# long-lived Hermes process without a corresponding code change.  A static
-# blocklist therefore cannot be the authority for whether a value becomes
-# ambient in terminal children and their persistent shell snapshots.
-_CREDENTIAL_ENV_COMPONENTS = frozenset({
-    "APIKEY",
-    "BEARER",
-    "CREDENTIAL",
-    "CREDENTIALS",
-    "CREDS",
-    "DSN",
-    "PASSWORD",
-    "PASSWD",
-    "PAT",
-    "SECRET",
-    "TOKEN",
-})
-_CREDENTIAL_KEY_PREFIXES = frozenset({
-    "ACCESS",
-    "API",
-    "ENCRYPTION",
-    "HMAC",
-    "INTEGRATION",
-    "PRIVATE",
-    "SECRET",
-    "SIGNING",
-})
-_CREDENTIAL_URL_SUFFIXES = (
-    "DATABASE_URL",
-    "MONGODB_URI",
-    "POSTGRES_URL",
-    "REDIS_URL",
-)
-
-# These operator-owned credentials are deliberately named for ambient local
-# terminal passthrough.  They preserve the established trusted-operator-shell
-# contract (SECURITY.md section 3.2) and the Claude Code login behavior while
-# making every unlisted credential-shaped name default-deny.  Skill/config
-# passthrough remains the explicit opt-in for other non-Hermes credentials.
-_AMBIENT_CREDENTIAL_ALLOWLIST = frozenset({
+# Ambient subprocess inheritance is default-deny. These are the only
+# operator-owned credential/config names that retain the established AWS CLI
+# chain and Claude Code subscription login behavior. Everything else requires
+# an explicit terminal.env_passthrough/skill registration.
+_AMBIENT_OPERATOR_ENV_ALLOWLIST = frozenset({
     "AWS_ACCESS_KEY_ID",
+    "AWS_CONFIG_FILE",
+    "AWS_DEFAULT_REGION",
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "AWS_ROLE_ARN",
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SHARED_CREDENTIALS_FILE",
     "AWS_SESSION_TOKEN",
     "AWS_WEB_IDENTITY_TOKEN_FILE",
     "CLAUDE_CODE_OAUTH_TOKEN",
 })
-_NEVER_FORCE_AMBIENT_GITHUB_KEYS = frozenset({"GH_TOKEN", "GITHUB_TOKEN"})
 
-
-def _is_credential_env_name(name: str) -> bool:
-    """Return whether *name* conventionally carries credential material.
-
-    This is intentionally component-aware instead of a raw substring search:
-    names such as ``SSH_AUTH_SOCK`` and ``PATHEXT`` are operational metadata,
-    while ``GITHUB_REVIEWER_PAT``, ``MS_GRAPH_CLIENT_SECRET``, and
-    ``DOCUSIGN_PRIVATE_KEY`` are credentials.  The source of an inherited
-    process variable (Doppler, a profile file, or a service manager) is already
-    lost at this boundary, so the safe default must be based on the name.
-    """
-    upper = name.upper()
-    parts = tuple(part for part in upper.split("_") if part)
-    if any(part in _CREDENTIAL_ENV_COMPONENTS for part in parts):
-        return True
-    if len(parts) == 1 and parts[0] == "KEY":
-        return True
-    if any(
-        parts[index] == "KEY" and parts[index - 1] in _CREDENTIAL_KEY_PREFIXES
-        for index in range(1, len(parts))
-    ):
-        return True
-    return upper.endswith(_CREDENTIAL_URL_SUFFIXES)
+# Small, exact-name runtime set. These values make child processes usable but
+# grant no service identity: executable lookup; home/config discovery;
+# locale/encoding; terminal rendering; temp-file placement; and the Windows
+# process/bootstrap variables required for DLL, executable, and user-path
+# resolution. No prefix or credential-name heuristic participates.
+_SUBPROCESS_RUNTIME_ENV_ALLOWLIST = frozenset({
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "LC_COLLATE",
+    "LC_MONETARY",
+    "LC_PAPER",
+    "LC_NAME",
+    "LC_ADDRESS",
+    "LC_TELEPHONE",
+    "LC_MEASUREMENT",
+    "LC_IDENTIFICATION",
+    "TERM",
+    "COLORTERM",
+    "TZ",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    # Windows process/bootstrap essentials (matched case-insensitively).
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "OS",
+    "PROCESSOR_ARCHITECTURE",
+    "NUMBER_OF_PROCESSORS",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "USERPROFILE",
+    "USERNAME",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    # Git-for-Windows/MSYS argv-conversion controls. Hermes sets secure
+    # defaults, but an operator may explicitly narrow either conversion rule.
+    "MSYS_NO_PATHCONV",
+    "MSYS2_ARG_CONV_EXCL",
+})
 
 
 def _is_ambient_env_allowed(name: str, is_passthrough) -> bool:
-    """Apply the terminal's explicit credential-passthrough policy."""
-    if name in _AMBIENT_CREDENTIAL_ALLOWLIST:
-        return True
-    if name in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_credential_env_name(name):
-        return bool(is_passthrough(name))
-    return True
+    """Return whether an ambient Hermes-process variable may reach a child."""
+    return (
+        name in _AMBIENT_OPERATOR_ENV_ALLOWLIST
+        or name.upper() in _SUBPROCESS_RUNTIME_ENV_ALLOWLIST
+        or bool(is_passthrough(name))
+    )
+
+
+def _snapshot_allowed_env_names(source_env: dict | None = None) -> list[str]:
+    """Return exact shell-variable names that a local snapshot may persist."""
+    try:
+        from tools.env_passthrough import get_all_passthrough
+        passthrough = set(get_all_passthrough())
+    except Exception:
+        passthrough = set()
+
+    names = set(_AMBIENT_OPERATOR_ENV_ALLOWLIST)
+    names.update(_SUBPROCESS_RUNTIME_ENV_ALLOWLIST)
+    names.update(passthrough)
+    for name in (source_env or {}):
+        if _is_ambient_env_allowed(name, passthrough.__contains__):
+            names.add(name)
+    # Bash variable names cannot contain characters such as parentheses even
+    # though Windows' native environment can. Those values still reach Popen;
+    # they simply cannot be represented in a sourceable Bash snapshot.
+    return sorted(name for name in names if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name))
 
 
 def _is_hermes_internal_secret(key: str) -> bool:
@@ -427,7 +444,7 @@ def _inject_session_context_env(env: dict) -> None:
 
 
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
-    """Filter Hermes-managed secrets from a subprocess environment."""
+    """Build the default-deny background/PTY subprocess environment."""
     try:
         from tools.env_passthrough import is_env_passthrough as _is_passthrough
     except Exception:
@@ -446,12 +463,10 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     for key, value in (extra_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
-            if (
-                real_key in _NEVER_FORCE_AMBIENT_GITHUB_KEYS
-                or _is_hermes_internal_secret(real_key)
+            if not _is_hermes_internal_secret(real_key) and _is_ambient_env_allowed(
+                real_key, _is_passthrough
             ):
-                continue
-            sanitized[real_key] = value
+                sanitized[real_key] = value
         elif _is_hermes_internal_secret(key):
             continue
         elif _is_ambient_env_allowed(key, _is_passthrough):
@@ -474,14 +489,9 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     return sanitized
 
 
-# Tier-1 secrets: stripped from EVERY spawned subprocess unconditionally —
-# even when the caller opts into credential inheritance for a model-driving
-# CLI (claude / codex / gemini).  These are not LLM provider credentials; no
-# legitimate child Hermes spawns needs them, and they are the highest-value
-# secrets to keep out of a compromised dependency's reach (gateway bot tokens,
-# GitHub auth, remote-compute tokens, dashboard session secret).  The set is a
-# narrow subset of _HERMES_PROVIDER_ENV_BLOCKLIST; provider keys are handled by
-# the conditional Tier-2 strip in hermes_subprocess_env().
+# Compatibility inventory of high-value Hermes secrets. The default-deny
+# policy excludes these along with every other unallowlisted ambient name; the
+# named set remains importable for security invariants and older callers.
 _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
     # GitHub auth
     "GH_TOKEN",
@@ -518,73 +528,29 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
 
 
 def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str]:
-    """Build a sanitized environment dict for a spawned subprocess.
+    """Build the default-deny centralized non-terminal child environment.
 
-    Centralized helper for the **non-terminal** spawn surface (browser,
-    ACP/CLI executors, computer-use driver, dep-ensure, TUI Node host,
-    detached gateway).  Use this instead of copying ``os.environ`` directly
-    so strip-by-default is the uniform policy across every spawn site, with a
-    single source of truth (``_HERMES_PROVIDER_ENV_BLOCKLIST``).  The terminal
-    / execute_code path keeps using :func:`_sanitize_subprocess_env`, which is
-    skill-aware (``env_passthrough``); this helper is for spawns that have no
-    skill-passthrough concept.
-
-    Credential stripping:
-
-    * **Tier 1 (always):** ``_ALWAYS_STRIP_KEYS`` — gateway bot tokens, GitHub
-      auth, and remote-compute secrets are removed regardless of
-      ``inherit_credentials``.  No child Hermes spawns legitimately needs them.
-    * **Unregistered credentials (always):** credential-shaped names that are
-      not in the Hermes provider registry or explicit ambient allowlist are
-      removed regardless of ``inherit_credentials``. A newly-added Doppler or
-      service secret cannot become ambient just because the static blocklist
-      has never seen its name.
-    * **Tier 2 (conditional):** the rest of ``_HERMES_PROVIDER_ENV_BLOCKLIST``
-      (LLM provider API keys, tool secrets) is removed unless the caller passes
-      ``inherit_credentials=True``.
-
-    Pass ``inherit_credentials=True`` **only** when the child legitimately
-    needs LLM provider credentials — a user-blessed ``claude`` / ``codex`` /
-    ``gemini`` CLI executor, or the TUI Node host that makes model calls.  The
-    flag is grep-able for audit: ``grep -rn 'inherit_credentials=True'`` lists
-    every spawn site that still receives provider credentials.
-
-    Callers that need a *specific* non-provider secret (e.g. the browser worker
-    needs ``BROWSERBASE_API_KEY`` / ``FIRECRAWL_API_KEY``) should call with
-    ``inherit_credentials=False`` and copy just those keys back from
-    ``os.environ`` into the returned dict.
+    ``inherit_credentials`` remains a compatibility-only keyword for callers
+    that used the former broad provider-key opt-in. It no longer widens ambient
+    inheritance: callers must bind required values explicitly, or configure an
+    exact passthrough name.
     """
-    env = os.environ.copy()
+    try:
+        from tools.env_passthrough import is_env_passthrough as _is_passthrough
+    except Exception:
+        _is_passthrough = lambda _: False  # noqa: E731
 
-    # Tier 1 — always strip.
-    for key in _ALWAYS_STRIP_KEYS:
-        env.pop(key, None)
-    # Internal routing hints and Hermes-internal dynamic secrets
-    # (``AUXILIARY_<TASK>_API_KEY`` / ``_BASE_URL`` side-LLM credentials,
-    # ``GATEWAY_RELAY_*`` relay-auth material) must never reach a child,
-    # regardless of ``inherit_credentials`` — a model-driving CLI has no
-    # legitimate use for them. See :func:`_is_hermes_internal_secret`.
-    for key in list(env):
-        if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
-            env.pop(key, None)
-        elif _is_hermes_internal_secret(key):
-            env.pop(key, None)
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX)
+        and not _is_hermes_internal_secret(key)
+        and _is_ambient_env_allowed(key, _is_passthrough)
+    }
 
-    # Unknown credential-shaped names are covered by neither static tier.
-    # Provider-registry names are handled by inherit_credentials below; every
-    # other credential must be named in the explicit ambient allowlist.
-    for key in list(env):
-        if (
-            key not in _AMBIENT_CREDENTIAL_ALLOWLIST
-            and key not in _HERMES_PROVIDER_ENV_BLOCKLIST
-            and _is_credential_env_name(key)
-        ):
-            env.pop(key, None)
-
-    if not inherit_credentials:
-        # Tier 2 — strip provider/tool credentials unless explicitly inherited.
-        for key in _HERMES_PROVIDER_ENV_BLOCKLIST:
-            env.pop(key, None)
+    # Compatibility-only flag: the former broad provider-key inheritance is
+    # intentionally gone. Exact passthrough names are already handled above.
+    del inherit_credentials
 
     # Windows UTF-8 safety for spawned processes (#31420).
     env.setdefault("PYTHONUTF8", "1")
@@ -894,7 +860,7 @@ def _path_env_key(run_env: dict) -> str | None:
 
 
 def _make_run_env(env: dict) -> dict:
-    """Build a run environment with a sane PATH and provider-var stripping."""
+    """Build the default-deny foreground terminal environment."""
     try:
         from tools.env_passthrough import is_env_passthrough as _is_passthrough
     except Exception:
@@ -905,12 +871,10 @@ def _make_run_env(env: dict) -> dict:
     for k, v in merged.items():
         if k.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = k[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
-            if (
-                real_key in _NEVER_FORCE_AMBIENT_GITHUB_KEYS
-                or _is_hermes_internal_secret(real_key)
+            if not _is_hermes_internal_secret(real_key) and _is_ambient_env_allowed(
+                real_key, _is_passthrough
             ):
-                continue
-            run_env[real_key] = v
+                run_env[real_key] = v
         elif _is_hermes_internal_secret(k):
             continue
         elif _is_ambient_env_allowed(k, _is_passthrough):
@@ -1037,6 +1001,21 @@ class LocalEnvironment(BaseEnvironment):
             cwd = os.path.expanduser(cwd)
         super().__init__(cwd=cwd or os.getcwd(), timeout=timeout, env=env)
         self.init_session()
+
+    def _snapshot_export_command(self, target: str) -> str:
+        """Persist only allowlisted names in the local on-disk snapshot."""
+        names = _snapshot_allowed_env_names(dict(os.environ | self.env))
+        patterns = "|".join(
+            f'"declare -x {name}"|"declare -x {name}="*'
+            for name in names
+        )
+        return (
+            "while IFS= read -r __hermes_export; do\n"
+            "  case \"$__hermes_export\" in\n"
+            f"    {patterns}) printf '%s\\n' \"$__hermes_export\" ;;\n"
+            "  esac\n"
+            f"done < <(export -p) > {target}"
+        )
 
     def get_temp_dir(self) -> str:
         """Return a shell-safe writable temp dir for local execution.

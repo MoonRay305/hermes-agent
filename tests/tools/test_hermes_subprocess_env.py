@@ -1,15 +1,4 @@
-"""Tests for hermes_subprocess_env() — the centralized credential-safe env
-builder for the non-terminal subprocess spawn surface.
-
-Covers GHSA-m4m8-xjp4-5rmm / issue #29157: subprocesses spawned by the
-gateway/browser/ACP/installer paths must not blindly inherit the operator's
-full credential environment. Two tiers:
-
-  * Tier 1 (_ALWAYS_STRIP_KEYS): gateway bot tokens, GitHub auth, infra
-    secrets — stripped even when inherit_credentials=True.
-  * Tier 2 (_HERMES_PROVIDER_ENV_BLOCKLIST): LLM provider/tool keys — stripped
-    unless the caller opts into inherit_credentials=True.
-"""
+"""Tests for the centralized default-deny non-terminal subprocess env."""
 
 import os
 from unittest.mock import patch
@@ -39,7 +28,15 @@ _SAFE_SAMPLE = {
     "PATH": "/usr/bin:/bin",
     "HOME": "/home/user",
     "USER": "testuser",
-    "MY_APP_VAR": "keep-me",
+}
+
+_OPAQUE_SAMPLE = {
+    "MS_GRAPH_TENANT_ID": "tenant-secret",
+    "SESSION": "session-secret",
+    "AUTH": "auth-secret",
+    "ORCHARD": "opaque-secret-one",
+    "BLUEBIRD": "opaque-secret-two",
+    "QUARTZ": "opaque-secret-three",
 }
 
 
@@ -62,20 +59,15 @@ class TestStripByDefault:
         for var in _TIER1_SAMPLE:
             assert var not in result, f"{var} leaked (Tier-1) with inherit_credentials=False"
 
-    def test_unregistered_credentials_stripped_by_default(self):
-        result = _build({
-            "GITHUB_REVIEWER_PAT": "reviewer-token",
-            "MS_GRAPH_CLIENT_SECRET": "graph-secret",
-        })
-        assert "GITHUB_REVIEWER_PAT" not in result
-        assert "MS_GRAPH_CLIENT_SECRET" not in result
+    def test_unknown_names_stripped_by_default(self):
+        result = _build(_OPAQUE_SAMPLE)
+        assert not (_OPAQUE_SAMPLE.keys() & result.keys())
 
     def test_safe_vars_preserved(self):
         result = _build()
         assert result["HOME"] == "/home/user"
         assert result["USER"] == "testuser"
         assert "PATH" in result
-        assert result["MY_APP_VAR"] == "keep-me"
 
     def test_force_prefix_hints_stripped(self):
         result = _build({f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}OPENAI_API_KEY": "sk-x"})
@@ -88,10 +80,10 @@ class TestStripByDefault:
 
 
 class TestInheritCredentials:
-    def test_provider_keys_preserved_when_inheriting(self):
+    def test_legacy_inherit_flag_does_not_widen_allowlist(self):
         result = _build(_PROVIDER_SAMPLE, inherit_credentials=True)
-        for var, val in _PROVIDER_SAMPLE.items():
-            assert result.get(var) == val, f"{var} should survive inherit_credentials=True"
+        for var in _PROVIDER_SAMPLE:
+            assert var not in result
 
     def test_tier1_secrets_stripped_even_when_inheriting(self):
         """The whole point of Tier 1: gateway/GitHub/infra secrets never reach
@@ -101,27 +93,31 @@ class TestInheritCredentials:
             assert var not in result, (
                 f"{var} (Tier-1) must be stripped even with inherit_credentials=True"
             )
-        # ...while provider keys survive.
         for var in _PROVIDER_SAMPLE:
-            assert var in result
+            assert var not in result
 
-    def test_unregistered_credentials_stay_stripped_when_inheriting(self):
-        """The broad provider opt-in only covers registry-named providers."""
-        result = _build(
-            {
-                **_PROVIDER_SAMPLE,
-                "GITHUB_REVIEWER_PAT": "reviewer-token",
-                "MS_GRAPH_CLIENT_SECRET": "graph-secret",
-            },
-            inherit_credentials=True,
-        )
-        assert "GITHUB_REVIEWER_PAT" not in result
-        assert "MS_GRAPH_CLIENT_SECRET" not in result
+    def test_unknown_names_stay_stripped_when_inheriting(self):
+        result = _build({**_PROVIDER_SAMPLE, **_OPAQUE_SAMPLE}, inherit_credentials=True)
+        assert not (_OPAQUE_SAMPLE.keys() & result.keys())
         for var in _PROVIDER_SAMPLE:
-            assert var in result
+            assert var not in result
 
     def test_pythonutf8_set_when_inheriting(self):
         assert _build(inherit_credentials=True).get("PYTHONUTF8") == "1"
+
+
+class TestExplicitPassthrough:
+    def test_exact_passthrough_name_reaches_centralized_child(self):
+        from tools.env_passthrough import clear_env_passthrough, register_env_passthrough
+
+        clear_env_passthrough()
+        try:
+            register_env_passthrough(["ORCHARD"])
+            result = _build({"ORCHARD": "explicit-value"})
+        finally:
+            clear_env_passthrough()
+
+        assert result.get("ORCHARD") == "explicit-value"
 
 
 class TestTierInvariants:
@@ -184,9 +180,7 @@ _INTERNAL_DYNAMIC_SAMPLE = {
 
 
 class TestInternalDynamicSecrets:
-    """AUXILIARY_*_API_KEY / _BASE_URL and GATEWAY_RELAY_* auth are stripped on
-    BOTH paths — including inherit_credentials=True — since a model-driving CLI
-    (codex/copilot) never needs them even when it needs provider keys."""
+    """Internal secrets stay denied even through compatibility call paths."""
 
     def test_stripped_by_default(self):
         result = _build(_INTERNAL_DYNAMIC_SAMPLE)
@@ -202,17 +196,15 @@ class TestInternalDynamicSecrets:
             assert var not in result, (
                 f"{var} must be stripped even with inherit_credentials=True"
             )
-        # ...while genuine provider keys survive so codex can authenticate.
         for var in _PROVIDER_SAMPLE:
-            assert var in result
+            assert var not in result
 
-    def test_auxiliary_non_secrets_preserved(self):
-        """AUXILIARY_*_PROVIDER / _MODEL routing config survives (not secrets)."""
+    def test_auxiliary_non_secrets_require_explicit_passthrough(self):
         result = _build(
             {"AUXILIARY_VISION_PROVIDER": "openai", "AUXILIARY_VISION_MODEL": "gpt-4o"},
         )
-        assert result.get("AUXILIARY_VISION_PROVIDER") == "openai"
-        assert result.get("AUXILIARY_VISION_MODEL") == "gpt-4o"
+        assert "AUXILIARY_VISION_PROVIDER" not in result
+        assert "AUXILIARY_VISION_MODEL" not in result
 
     def test_gateway_relay_id_stripped_even_when_inheriting(self):
         """GATEWAY_RELAY_ID has no secret suffix (predicate skips it) but is
@@ -224,9 +216,8 @@ class TestInternalDynamicSecrets:
             inherit_credentials=True,
         )
         assert "GATEWAY_RELAY_ID" not in result
-        # provider keys still flow (codex auth)
         for var in _PROVIDER_SAMPLE:
-            assert var in result
+            assert var not in result
 
     def test_relay_triplet_in_always_strip(self):
         assert {

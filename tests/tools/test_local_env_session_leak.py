@@ -131,21 +131,16 @@ def test_engaged_strips_all_session_vars_when_unset(monkeypatch):
         assert var not in env, f"{var} leaked from a foreign global: {env.get(var)!r}"
 
 
-def test_unengaged_process_preserves_os_environ_fallback(monkeypatch):
-    """A process that never engaged the session-context system keeps the fallback.
-
-    Pure single-process CLI/one-shot sets HERMES_SESSION_* directly in os.environ
-    and relies on the subprocess inheriting them; there is no concurrency to leak
-    across, so the strip must NOT apply.
-    """
+def test_unengaged_process_denies_os_environ_fallback(monkeypatch):
+    """Ambient session routing is denied unless ContextVars bind it explicitly."""
     # _isolate_session_context already forced engaged=False.
     monkeypatch.setenv("HERMES_SESSION_KEY", "cli-session-key")
     monkeypatch.setenv("HERMES_SESSION_ID", "cli-session-id")
 
     env = _make_run_env({})
 
-    assert env.get("HERMES_SESSION_KEY") == "cli-session-key"
-    assert env.get("HERMES_SESSION_ID") == "cli-session-id"
+    assert "HERMES_SESSION_KEY" not in env
+    assert "HERMES_SESSION_ID" not in env
 
 
 def test_engaged_explicit_empty_contextvar_clears(monkeypatch):
@@ -242,8 +237,8 @@ def test_sanitize_subprocess_env_set_contextvar_wins_when_engaged():
     assert sanitized.get("HERMES_SESSION_KEY") == "agent:main:discord:group:REAL_BG:222"
 
 
-def test_sanitize_subprocess_env_unengaged_preserves_fallback(monkeypatch):
-    """Background path in an unengaged process keeps the inherited value."""
+def test_sanitize_subprocess_env_unengaged_denies_fallback(monkeypatch):
+    """Background children do not inherit ambient session routing."""
     stale_base = {
         "PATH": "/usr/bin:/bin",
         "HERMES_SESSION_KEY": "cli-bg-key",
@@ -251,7 +246,7 @@ def test_sanitize_subprocess_env_unengaged_preserves_fallback(monkeypatch):
 
     sanitized = _sanitize_subprocess_env(stale_base)
 
-    assert sanitized.get("HERMES_SESSION_KEY") == "cli-bg-key"
+    assert "HERMES_SESSION_KEY" not in sanitized
 
 
 # --------------------------------------------------------------------------- #
@@ -296,9 +291,9 @@ def test_hermes_subprocess_env_bound_contextvar_wins(monkeypatch):
         clear_session_vars(tokens)
 
 
-def test_hermes_subprocess_env_unengaged_preserves_fallback(monkeypatch):
-    """A pure single-process CLI (never engaged) keeps the inherited fallback."""
+def test_hermes_subprocess_env_unengaged_denies_fallback(monkeypatch):
+    """Centralized children do not inherit ambient session routing."""
     monkeypatch.setenv("HERMES_SESSION_KEY", "cli-fallback-key")
     # not engaged (autouse fixture leaves _session_context_engaged False)
     env = hermes_subprocess_env()
-    assert env.get("HERMES_SESSION_KEY") == "cli-fallback-key"
+    assert "HERMES_SESSION_KEY" not in env

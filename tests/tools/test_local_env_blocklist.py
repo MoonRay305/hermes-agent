@@ -226,50 +226,41 @@ class TestProviderEnvBlocklist:
         assert "PATH" in result_env
 
     def test_self_env_blocked_vars_also_stripped(self):
-        """Blocked vars in self.env are stripped; non-blocked vars pass through."""
+        """self.env is not a second ambient allowlist."""
         result_env = _run_with_env(self_env={
             "OPENAI_BASE_URL": "http://custom:9999/v1",
             "MY_CUSTOM_VAR": "keep-this",
         })
 
         assert "OPENAI_BASE_URL" not in result_env
-        assert "MY_CUSTOM_VAR" in result_env
-        assert result_env["MY_CUSTOM_VAR"] == "keep-this"
+        assert "MY_CUSTOM_VAR" not in result_env
 
 
 class TestAmbientCredentialPolicy:
-    """Credential-shaped vars fail closed unless passthrough is explicit."""
+    """Ambient vars fail closed unless the exact name is allowlisted."""
 
-    def test_unregistered_credential_names_are_stripped(self):
-        """Doppler/custom credential names must not pass just because the
-        Hermes provider registry has never heard of them."""
-        credential_vars = {
-            "GITHUB_REVIEWER_PAT": "reviewer-token",
-            "MS_GRAPH_CLIENT_SECRET": "graph-secret",
-            "LINEAR_API_KEY": "linear-secret",
-            "DOCUSIGN_PRIVATE_KEY": "private-key",
-            "CUSTOM_DATABASE_URL": "postgres://user:password@example/db",
-            "CUSTOM_DSN": "https://public:secret@example.invalid/1",
+    def test_unknown_names_are_stripped_regardless_of_shape(self):
+        hostile_vars = {
+            "MS_GRAPH_TENANT_ID": "tenant-secret",
+            "WEBHOOK_URL": "webhook-secret",
+            "SESSION": "session-secret",
+            "AUTH": "auth-secret",
+            "ORCHARD": "opaque-secret-one",
+            "BLUEBIRD": "opaque-secret-two",
+            "QUARTZ": "opaque-secret-three",
         }
 
-        result_env = _run_with_env(extra_os_env=credential_vars)
+        result_env = _run_with_env(extra_os_env=hostile_vars)
 
-        for var in credential_vars:
+        for var in hostile_vars:
             assert var not in result_env, f"{var} leaked into subprocess env"
 
-    def test_noncredential_runtime_metadata_is_preserved(self):
-        """IDs, ordinary URLs, and routing metadata remain ambient."""
-        metadata = {
-            "MS_GRAPH_CLIENT_ID": "client-id",
-            "MS_GRAPH_TENANT_ID": "tenant-id",
-            "MISSION_CONTROL_API_URL": "https://mission.example.invalid",
-            "CUSTOM_FEATURE_FLAG": "enabled",
-        }
+    def test_runtime_path_and_home_are_preserved(self):
+        runtime = {"PATH": "/usr/bin:/bin", "HOME": "/home/operator"}
+        result_env = _run_with_env(extra_os_env=runtime)
 
-        result_env = _run_with_env(extra_os_env=metadata)
-
-        for var, value in metadata.items():
-            assert result_env.get(var) == value
+        assert result_env.get("PATH")
+        assert result_env.get("HOME") == "/home/operator"
 
     def test_explicit_passthrough_allows_third_party_credential(self):
         """A non-Hermes credential passes only after it is named explicitly."""
@@ -296,46 +287,45 @@ class TestAmbientCredentialPolicy:
         result_env = _sanitize_subprocess_env(
             {
                 "PATH": "/usr/bin:/bin",
-                "GITHUB_REVIEWER_PAT": "reviewer-token",
+                "HOME": "/home/operator",
+                "MS_GRAPH_TENANT_ID": "tenant-secret",
+                "ORCHARD": "opaque-secret",
             },
-            {"MS_GRAPH_CLIENT_SECRET": "graph-secret"},
+            {"AUTH": "auth-secret"},
         )
 
         assert result_env.get("PATH") == "/usr/bin:/bin"
-        assert "GITHUB_REVIEWER_PAT" not in result_env
-        assert "MS_GRAPH_CLIENT_SECRET" not in result_env
+        assert result_env.get("HOME")
+        assert not ({"MS_GRAPH_TENANT_ID", "ORCHARD", "AUTH"} & result_env.keys())
 
 
-class TestForceEnvOptIn:
-    """Callers can opt in to passing a blocked var via _HERMES_FORCE_ prefix."""
+class TestLegacyForcePrefix:
+    """The legacy force prefix cannot bypass the ambient allowlist."""
 
-    def test_force_prefix_passes_blocked_var(self):
-        """_HERMES_FORCE_OPENAI_API_KEY in self.env should inject OPENAI_API_KEY."""
+    def test_force_prefix_does_not_pass_blocked_var(self):
         result_env = _run_with_env(self_env={
             f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}OPENAI_API_KEY": "sk-explicit",
         })
 
-        assert "OPENAI_API_KEY" in result_env
-        assert result_env["OPENAI_API_KEY"] == "sk-explicit"
+        assert "OPENAI_API_KEY" not in result_env
         # The force-prefixed key itself must not appear
         assert f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}OPENAI_API_KEY" not in result_env
 
-    def test_force_prefix_overrides_os_environ_block(self):
-        """Force-prefix in self.env wins even when os.environ has the blocked var."""
+    def test_force_prefix_does_not_override_os_environ_block(self):
         result_env = _run_with_env(
             extra_os_env={"OPENAI_BASE_URL": "http://leaked/v1"},
             self_env={f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}OPENAI_BASE_URL": "http://intended/v1"},
         )
 
-        assert result_env["OPENAI_BASE_URL"] == "http://intended/v1"
+        assert "OPENAI_BASE_URL" not in result_env
 
-    def test_force_prefix_cannot_promote_github_auth(self):
-        """Tier-1 GitHub auth stays non-ambient even via the force prefix."""
+    def test_force_prefix_cannot_promote_unknown_name(self):
+        """The legacy force prefix is not a second ambient allowlist."""
         result_env = _run_with_env(self_env={
-            f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}GH_TOKEN": "reviewer-token",
+            f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}ORCHARD": "opaque-secret",
         })
 
-        assert "GH_TOKEN" not in result_env
+        assert "ORCHARD" not in result_env
 
 
 class TestActiveVenvMarkerStripping:
@@ -780,7 +770,7 @@ class TestHermesInternalDynamicSecrets:
 
     def test_auxiliary_secrets_stripped_from_subprocess(self):
         """AUXILIARY_*_API_KEY / _BASE_URL injected into os.environ must not
-        reach the terminal subprocess, while _PROVIDER / _MODEL survive."""
+        reach the terminal subprocess; unallowlisted routing names fail closed."""
         result_env = _run_with_env(extra_os_env={
             "AUXILIARY_VISION_API_KEY": "sk-vision-secret",
             "AUXILIARY_VISION_BASE_URL": "http://internal:1234/v1",
@@ -791,9 +781,8 @@ class TestHermesInternalDynamicSecrets:
         assert "AUXILIARY_VISION_API_KEY" not in result_env
         assert "AUXILIARY_VISION_BASE_URL" not in result_env
         assert "AUXILIARY_WEB_EXTRACT_API_KEY" not in result_env
-        # Non-secret routing config is preserved.
-        assert result_env.get("AUXILIARY_VISION_PROVIDER") == "openai"
-        assert result_env.get("AUXILIARY_VISION_MODEL") == "gpt-4o"
+        assert "AUXILIARY_VISION_PROVIDER" not in result_env
+        assert "AUXILIARY_VISION_MODEL" not in result_env
 
     def test_gateway_relay_secret_stripped_from_subprocess(self):
         result_env = _run_with_env(extra_os_env={
@@ -803,8 +792,7 @@ class TestHermesInternalDynamicSecrets:
         })
         assert "GATEWAY_RELAY_SECRET" not in result_env
         assert "GATEWAY_RELAY_DELIVERY_KEY" not in result_env
-        # Non-secret routing hint stays visible.
-        assert result_env.get("GATEWAY_RELAY_URL") == "https://relay.example.com"
+        assert "GATEWAY_RELAY_URL" not in result_env
 
     def test_auxiliary_secret_stripped_even_when_passthrough_registered(self):
         """A skill registering AUXILIARY_*_API_KEY as env_passthrough must NOT
@@ -830,7 +818,7 @@ class TestHermesInternalDynamicSecrets:
             run_env = _make_run_env({})
         assert "AUXILIARY_VISION_API_KEY" not in run_env
         assert "GATEWAY_RELAY_SECRET" not in run_env
-        assert run_env.get("AUXILIARY_VISION_PROVIDER") == "openai"
+        assert "AUXILIARY_VISION_PROVIDER" not in run_env
 
     def test_gateway_relay_static_names_in_blocklist(self):
         """The static relay names are also added to the name-based blocklist so

@@ -8,9 +8,13 @@ from tools.environments.local import LocalEnvironment
 
 
 _TARGETS = (
-    "GH_TOKEN",
-    "GITHUB_REVIEWER_PAT",
-    "MS_GRAPH_CLIENT_SECRET",
+    "MS_GRAPH_TENANT_ID",
+    "WEBHOOK_URL",
+    "SESSION",
+    "AUTH",
+    "ORCHARD",
+    "BLUEBIRD",
+    "QUARTZ",
 )
 
 
@@ -29,21 +33,42 @@ def _snapshot_names(env: LocalEnvironment) -> set[str]:
     return set(re.findall(r"(?m)^declare -x ([A-Za-z_][A-Za-z0-9_]*)=", text))
 
 
-def test_fresh_terminal_and_snapshot_exclude_ambient_credentials(tmp_path, monkeypatch):
-    """The real login-shell bootstrap must not persist ambient credentials."""
-    monkeypatch.setenv("GH_TOKEN", "ambient-gateway-token")
-    monkeypatch.setenv("GITHUB_REVIEWER_PAT", "scoped-reviewer-token")
-    monkeypatch.setenv("MS_GRAPH_CLIENT_SECRET", "graph-client-secret")
+def test_fresh_terminal_and_snapshot_are_default_deny(tmp_path, monkeypatch):
+    """The real login-shell bootstrap must persist only allowlisted names."""
+    for index, name in enumerate(_TARGETS):
+        monkeypatch.setenv(name, f"hostile-value-{index}")
 
     env = LocalEnvironment(cwd=str(tmp_path), timeout=10)
     try:
         assert _present_names(env) == set()
         assert not (set(_TARGETS) & _snapshot_names(env))
 
+        runtime = env.execute(
+            "[[ -n $PATH && -n $HOME ]] && printf 'runtime-ok\\n'"
+        )
+        assert runtime["returncode"] == 0, runtime
+        assert runtime["output"].strip() == "runtime-ok"
+        assert {"PATH", "HOME"} <= _snapshot_names(env)
+
         # Sanitizing a child must not mutate the gateway/parent environment.
-        assert os.environ["GH_TOKEN"] == "ambient-gateway-token"
-        assert os.environ["GITHUB_REVIEWER_PAT"] == "scoped-reviewer-token"
-        assert os.environ["MS_GRAPH_CLIENT_SECRET"] == "graph-client-secret"
+        for index, name in enumerate(_TARGETS):
+            assert os.environ[name] == f"hostile-value-{index}"
+    finally:
+        env.cleanup()
+
+
+def test_unknown_export_is_not_persisted_to_next_spawn(tmp_path):
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=10)
+    try:
+        exported = env.execute("export SESSION=command-secret")
+        assert exported["returncode"] == 0, exported
+
+        next_spawn = env.execute(
+            "[[ -v SESSION ]] && printf 'leaked\\n' || printf 'denied\\n'"
+        )
+        assert next_spawn["returncode"] == 0, next_spawn
+        assert next_spawn["output"].strip() == "denied"
+        assert "SESSION" not in _snapshot_names(env)
     finally:
         env.cleanup()
 
