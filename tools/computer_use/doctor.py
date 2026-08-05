@@ -41,32 +41,30 @@ def _cua_child_env() -> Dict[str, str]:
     """cua-driver child env with the Hermes telemetry policy applied.
 
     Delegates to ``cua_backend.cua_driver_child_env`` (telemetry disabled by
-    default unless the user opts in). Falls back to the current environment
-    if that import fails, so doctor never breaks on a telemetry-helper error.
+    default unless the user opts in). Import failures fall back to the shared
+    sanitizer, then to an empty fail-closed environment.
     """
     try:
         from tools.computer_use.cua_backend import cua_driver_child_env
 
         return cua_driver_child_env()
     except Exception:
-        return dict(os.environ)
+        try:
+            from tools.environments.local import _sanitize_subprocess_env
+
+            return _sanitize_subprocess_env(os.environ)
+        except Exception:
+            return {}
 
 
 def _sanitized_cua_env() -> Dict[str, str]:
     """Telemetry-policy env with Hermes provider secrets stripped.
 
     cua-driver is a third-party binary — it must never inherit provider
-    API keys (#53503/#55709/#58889 lineage). Falls back to the unsanitized
-    telemetry env if the sanitizer can't be imported, so doctor keeps
-    working in stripped-down environments.
+    API keys (#53503/#55709/#58889 lineage). The delegated helper sanitizes
+    ambient input before explicitly binding the telemetry policy.
     """
-    env = _cua_child_env()
-    try:
-        from tools.environments.local import _sanitize_subprocess_env
-
-        return _sanitize_subprocess_env(env)
-    except Exception:
-        return env
+    return _cua_child_env()
 
 
 def _drive_health_report(

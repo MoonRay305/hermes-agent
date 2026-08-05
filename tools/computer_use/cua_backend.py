@@ -129,13 +129,16 @@ def _cua_telemetry_disabled() -> bool:
 def cua_driver_child_env(base_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     """Return the environment dict for spawning cua-driver.
 
-    Starts from ``base_env`` (defaults to ``os.environ``) and, when telemetry
-    is disabled (the default), injects ``CUA_DRIVER_RS_TELEMETRY_ENABLED=0``.
-    When the user has opted in, the var is left untouched so cua-driver uses
-    its own default. Used by every cua-driver spawn site (MCP backend, status,
-    doctor, install) so the policy is applied consistently.
+    Sanitizes ``base_env`` (defaults to ``os.environ``) through the shared
+    ambient default-deny policy, then explicitly binds the consumer-owned
+    telemetry switch when telemetry is disabled (the default). When the user
+    has opted in, the var is absent so cua-driver uses its own default. Used by
+    every cua-driver spawn site (MCP backend, status, doctor, install) so both
+    policies are applied consistently.
     """
-    env = dict(base_env if base_env is not None else os.environ)
+    from tools.environments.local import _sanitize_subprocess_env
+
+    env = _sanitize_subprocess_env(base_env if base_env is not None else os.environ)
     if _cua_telemetry_disabled():
         env[_CUA_TELEMETRY_ENV_VAR] = "0"
     return env
@@ -160,7 +163,6 @@ def _resolve_mcp_invocation(
     not refuse to start just because the discovery hop failed.
     """
     try:
-        from tools.environments.local import _sanitize_subprocess_env
         proc = subprocess.run(
             [driver_cmd, "manifest"],
             capture_output=True, text=True, timeout=timeout,
@@ -168,7 +170,7 @@ def _resolve_mcp_invocation(
             # cua-driver is a third-party binary — never hand it provider
             # API keys via inherited env (same policy as the MCP and CLI
             # fallback spawns below; #53503/#55709/#58889 lineage).
-            env=_sanitize_subprocess_env(cua_driver_child_env()),
+            env=cua_driver_child_env(),
         )
     except Exception:
         return driver_cmd, list(_CUA_DRIVER_ARGS)
@@ -251,7 +253,6 @@ def cua_driver_update_check(*, timeout: float = 8.0) -> Optional[Dict[str, Any]]
     raises.
     """
     try:
-        from tools.environments.local import _sanitize_subprocess_env
         proc = subprocess.run(
             [_CUA_DRIVER_CMD, "check-update", "--json"],
             capture_output=True, text=True, timeout=timeout,
@@ -261,7 +262,7 @@ def cua_driver_update_check(*, timeout: float = 8.0) -> Optional[Dict[str, Any]]
             stdin=subprocess.DEVNULL,
             # Sanitized like every other cua-driver spawn: third-party
             # binary, no inherited provider keys (#53503/#55709/#58889).
-            env=_sanitize_subprocess_env(cua_driver_child_env()),
+            env=cua_driver_child_env(),
         )
     except Exception:
         return None
@@ -595,7 +596,6 @@ class _CuaDriverSession:
         import time as _time
         from mcp import ClientSession, StdioServerParameters
         from mcp.client.stdio import stdio_client
-        from tools.environments.local import _sanitize_subprocess_env
 
         # Build the shutdown event on the loop's thread so the asyncio
         # primitive belongs to the correct loop.
@@ -619,9 +619,9 @@ class _CuaDriverSession:
             params = StdioServerParameters(
                 command=command,
                 args=args,
-                # Apply the telemetry policy first (default: disabled), then
-                # sanitize Hermes-managed secrets out of the child env.
-                env=_sanitize_subprocess_env(cua_driver_child_env()),
+                # Sanitize ambient input first, then bind the consumer-owned
+                # telemetry policy (default: disabled).
+                env=cua_driver_child_env(),
             )
 
             async with stdio_client(params) as (read, write):
@@ -902,7 +902,6 @@ class _CuaDriverSession:
         import subprocess as _subprocess
         import tempfile as _tempfile
         import time as _time
-        from tools.environments.local import _sanitize_subprocess_env
 
         call_args = dict(args)
         shot_file: Optional[str] = None
@@ -921,7 +920,7 @@ class _CuaDriverSession:
                 try:
                     proc = _subprocess.run(
                         cmd, capture_output=True, text=True, timeout=max(15.0, timeout),
-                        env=_sanitize_subprocess_env(cua_driver_child_env()),
+                        env=cua_driver_child_env(),
                     )
                 except Exception as e:  # pragma: no cover - subprocess spawn failure
                     raise RuntimeError(f"cua-driver CLI fallback for {name} failed to spawn: {e}") from e

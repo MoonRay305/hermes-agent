@@ -54,16 +54,16 @@ class TestChildEnv:
 
     def test_opt_in_leaves_var_untouched(self):
         # When the user opts in, we must NOT set the var — the driver uses its
-        # own default. If the base env already has a value, it is preserved.
+        # own default. Ambient overrides are denied by the shared policy.
         with patch.object(cua_backend, "_cua_telemetry_disabled", return_value=False):
             env = cua_backend.cua_driver_child_env({"PATH": "/usr/bin"})
             assert _VAR not in env
 
-    def test_opt_in_preserves_user_set_var(self):
+    def test_opt_in_denies_ambient_override(self):
         with patch.object(cua_backend, "_cua_telemetry_disabled", return_value=False):
             env = cua_backend.cua_driver_child_env({_VAR: "1", "PATH": "/usr/bin"})
-            # user opted in and explicitly set it — don't clobber.
-            assert env[_VAR] == "1"
+            # A process-global value is ambient, not an explicit binding.
+            assert _VAR not in env
 
     def test_disabled_overrides_inherited_enabled(self):
         # Even if the parent process had telemetry enabled, the default policy
@@ -72,9 +72,9 @@ class TestChildEnv:
             env = cua_backend.cua_driver_child_env({_VAR: "1"})
             assert env[_VAR] == "0"
 
-    def test_defaults_to_os_environ_when_no_base(self):
+    def test_defaults_to_sanitized_os_environ_when_no_base(self):
         with patch.object(cua_backend, "_cua_telemetry_disabled", return_value=True), \
              patch.dict("os.environ", {"SOME_MARKER": "yes"}, clear=False):
             env = cua_backend.cua_driver_child_env()
-            assert env.get("SOME_MARKER") == "yes"
+            assert "SOME_MARKER" not in env
             assert env[_VAR] == "0"
