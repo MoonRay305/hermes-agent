@@ -11,6 +11,7 @@ import json
 
 import pytest
 
+import tools.approval as approval_module
 from tools.approval_coverage import (
     BUILTIN_OPERATION_CLASSES,
     evaluate_command,
@@ -20,6 +21,38 @@ from tools.approval_coverage import (
 
 def _class(report, name):
     return next(c for c in report["classes"] if c["class"] == name)
+
+
+_BUILTIN_EXEMPLARS = [
+    command
+    for operation_class in BUILTIN_OPERATION_CLASSES
+    for command in operation_class["commands"]
+]
+
+_GATE_PROFILE_CASES = [
+    {
+        "name": "manual-default",
+        "mode": "manual",
+        "deny": [],
+        "allowlist": [],
+    },
+    {
+        "name": "mode-off",
+        "mode": "off",
+        "deny": [],
+        "allowlist": [],
+    },
+    {
+        "name": "smart-mixed-rules",
+        "mode": "smart",
+        "deny": ["*doppler secrets delete*"],
+        "allowlist": [
+            "world/other-writable permissions",
+            "recursive chown to root",
+            "git push*",
+        ],
+    },
+]
 
 
 @pytest.fixture
@@ -185,21 +218,103 @@ class TestEvaluateCommandPrimitives:
         assert verdict["outcome"] == "blocked_deny_rule"
         assert verdict["gates"] is True
 
-    def test_partial_allowlist_still_gates(self):
-        """A command matching TWO keys with only one allowlisted must still
-        prompt — the unapproved key keeps the gate armed."""
+    def test_primary_allowlist_bypasses_secondary_match(self):
+        """The real gate checks only the first detector key.
+
+        ``approve_permanent`` stores that primary key after an ``always``
+        response, so later detector matches are audit context and do not keep
+        the gate armed.
+        """
         verdict = evaluate_command(
-            "rm -rf /tmp/scratch",
+            "chmod 777 app.sh",
             approvals_mode="manual",
-            allowlist_entries=["recursive delete"],
+            allowlist_entries=["world/other-writable permissions"],
         )
-        assert verdict["outcome"] == "gated"
-        assert "delete in root path" in verdict["unapproved_keys"]
+        assert verdict["outcome"] == "bypass"
+        assert verdict["reason"] == "pattern_key_allowlist"
+        assert verdict["findings"] == [
+            "world/other-writable permissions",
+            "permission change (chmod)",
+        ]
 
     def test_smart_mode_annotated(self):
         verdict = evaluate_command("rm -rf build", approvals_mode="smart")
         assert verdict["outcome"] == "gated"
         assert verdict["smart_mediated"] is True
+
+
+@pytest.mark.parametrize(
+    "profile_case",
+    _GATE_PROFILE_CASES,
+    ids=[case["name"] for case in _GATE_PROFILE_CASES],
+)
+@pytest.mark.parametrize("command", _BUILTIN_EXEMPLARS)
+def test_evaluator_matches_real_gate_for_every_builtin_exemplar(
+    command, profile_case, monkeypatch
+):
+    """Coverage must agree with the gate, not a reimplemented assumption.
+
+    The callback always denies, turning every real prompt into
+    ``approved=False``. Smart mode deterministically escalates to that human
+    callback. Therefore ``evaluate_command(...)["gates"]`` must equal the
+    inverse of the real guard's ``approved`` result for every built-in
+    exemplar under manual, off, and smart profile shapes.
+    """
+    mode = profile_case["mode"]
+    deny = profile_case["deny"]
+    allowlist = profile_case["allowlist"]
+    config = {"mode": mode, "deny": deny}
+
+    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+    monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+    monkeypatch.setattr(approval_module, "_get_approval_config", lambda: config)
+    monkeypatch.setattr(
+        approval_module,
+        "_smart_approve",
+        lambda command, description: "escalate",
+    )
+    monkeypatch.setattr(approval_module, "_audit_bypass", lambda **kwargs: None)
+    monkeypatch.setattr(
+        approval_module,
+        "_fire_approval_hook",
+        lambda *args, **kwargs: None,
+    )
+
+    import tools.tirith_security as tirith_module
+
+    monkeypatch.setattr(
+        tirith_module,
+        "check_command_security",
+        lambda command: {"action": "allow", "findings": [], "summary": ""},
+    )
+
+    saved_permanent = approval_module._permanent_approved.copy()
+    approval_module._permanent_approved.clear()
+    approval_module._permanent_approved.update(allowlist)
+    try:
+        table = evaluate_command(
+            command,
+            approvals_mode=mode,
+            deny_globs=deny,
+            allowlist_entries=allowlist,
+        )
+        real_gate = approval_module.check_all_command_guards(
+            command,
+            "local",
+            approval_callback=lambda *args, **kwargs: "deny",
+        )
+    finally:
+        approval_module._permanent_approved.clear()
+        approval_module._permanent_approved.update(saved_permanent)
+
+    assert table["gates"] is (not real_gate["approved"]), (
+        f"profile={profile_case['name']} command={command!r} "
+        f"table={table} real_gate={real_gate}"
+    )
 
 
 class TestCliRendering:

@@ -36,6 +36,7 @@ from tools.approval import (
     _command_detection_variants,
     _normalize_approval_mode,
     detect_all_dangerous_patterns,
+    detect_dangerous_command,
     detect_hardline_command,
     match_command_allowlist_entry,
 )
@@ -187,6 +188,7 @@ def evaluate_command(
         }
 
     findings = [key for key, _ in detect_all_dangerous_patterns(command)]
+    is_dangerous, primary_key, _ = detect_dangerous_command(command)
 
     if mode == "off":
         return {
@@ -206,15 +208,13 @@ def evaluate_command(
             "detail": allow_entry,
         }
 
-    if not findings:
+    if not is_dangerous:
         return {"outcome": "ungated", "gates": False, "findings": []}
 
+    assert primary_key is not None
     entry_set = {e for e in allowlist_entries if isinstance(e, str)}
-    unapproved = [
-        key for key in findings
-        if not (_approval_key_aliases(key) & entry_set)
-    ]
-    if not unapproved:
+    primary_approved = bool(_approval_key_aliases(primary_key) & entry_set)
+    if primary_approved:
         return {
             "outcome": "bypass",
             "gates": False,
@@ -226,7 +226,9 @@ def evaluate_command(
         "outcome": "gated",
         "gates": True,
         "findings": findings,
-        "unapproved_keys": unapproved,
+        # The runtime gate checks only detect_dangerous_command's first match.
+        # Later matches are audit context, not independent approval gates.
+        "unapproved_keys": [primary_key],
         # smart mode still prompts only when the aux LLM escalates; flag it
         # so the report can annotate that gating there is LLM-mediated.
         "smart_mediated": mode == "smart",
