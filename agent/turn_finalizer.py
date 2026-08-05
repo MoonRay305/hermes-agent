@@ -23,6 +23,7 @@ keep the exact logger name (``"agent.conversation_loop"``).
 from __future__ import annotations
 
 import os
+from typing import cast
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
@@ -206,13 +207,20 @@ def finalize_turn(
     _gateway_response_truncated = False
     _gateway_response_original_chars = len(final_response or "")
     _gateway_response_limit_chars = 0
-    if final_response and not interrupted:
+    _gateway_guardrail = getattr(
+        agent, "_apply_gateway_final_response_guardrail", None
+    )
+    if final_response and not interrupted and callable(_gateway_guardrail):
+        _gateway_guardrail_result = cast(
+            tuple[str, bool, int, int],
+            _gateway_guardrail(final_response, messages),
+        )
         (
             final_response,
             _gateway_response_truncated,
             _gateway_response_original_chars,
             _gateway_response_limit_chars,
-        ) = agent._apply_gateway_final_response_guardrail(final_response, messages)
+        ) = _gateway_guardrail_result
 
     # Preflight can seed the display count before the provider receives the
     # request. Roll that estimate back only when an interrupt wins the race
@@ -577,16 +585,21 @@ def finalize_turn(
 
         # A plugin can expand a capped model answer again. Re-apply the cap
         # before post-call hooks, external-memory sync, and gateway delivery.
-        (
-            final_response,
-            _post_transform_truncated,
-            _post_transform_original_chars,
-            _post_transform_limit_chars,
-        ) = agent._apply_gateway_final_response_guardrail(final_response, messages)
-        if _post_transform_truncated:
-            _gateway_response_truncated = True
-            _gateway_response_original_chars = _post_transform_original_chars
-            _gateway_response_limit_chars = _post_transform_limit_chars
+        if callable(_gateway_guardrail):
+            _post_transform_guardrail_result = cast(
+                tuple[str, bool, int, int],
+                _gateway_guardrail(final_response, messages),
+            )
+            (
+                final_response,
+                _post_transform_truncated,
+                _post_transform_original_chars,
+                _post_transform_limit_chars,
+            ) = _post_transform_guardrail_result
+            if _post_transform_truncated:
+                _gateway_response_truncated = True
+                _gateway_response_original_chars = _post_transform_original_chars
+                _gateway_response_limit_chars = _post_transform_limit_chars
 
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.
