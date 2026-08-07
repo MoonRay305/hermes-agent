@@ -429,6 +429,41 @@ class TestSegmentedDispatchIntegration:
         assert len(search_ends) == 2
         assert all(i < terminal_start for i in search_ends)
 
+    def test_stale_cached_executor_without_segmented_symbol_falls_back_sequentially(
+        self, agent, monkeypatch, caplog
+    ):
+        """An in-place source update must not crash an already-running process.
+
+        A long-lived gateway can retain a pre-segmentation ``agent.tool_executor``
+        module in ``sys.modules`` while ``run_agent.py`` on disk has advanced to
+        the segmented dispatcher.  The mixed path must preserve correctness by
+        falling back to the old module's sequential executor instead of raising
+        ``ImportError``.
+        """
+        import agent.tool_executor as tool_executor
+
+        calls = [
+            _tc("web_search", '{"query":"a"}', call_id="s1"),
+            _tc("web_search", '{"query":"b"}', call_id="s2"),
+            _tc("terminal", '{"command":"echo done"}', call_id="t1"),
+        ]
+        msg = SimpleNamespace(content="", tool_calls=calls)
+        messages = []
+        executed = []
+
+        def fake_handle(name, args, task_id, **kwargs):
+            executed.append(kwargs["tool_call_id"])
+            return json.dumps({"ok": name})
+
+        monkeypatch.delattr(tool_executor, "execute_tool_calls_segmented")
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls(msg, messages, "task-1")
+
+        assert executed == ["s1", "s2", "t1"]
+        assert [m["tool_call_id"] for m in messages] == ["s1", "s2", "t1"]
+        assert "cached agent.tool_executor lacks execute_tool_calls_segmented" in caplog.text
+
     def test_mixed_batch_preserves_order_with_barrier_in_middle(self, agent):
         calls = [
             _tc("web_search", '{"query":"a"}', call_id="s1"),

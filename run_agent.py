@@ -7790,7 +7790,24 @@ class AIAgent:
                     assistant_message, messages, effective_task_id, api_call_count
                 )
 
-            from agent.tool_executor import execute_tool_calls_segmented
+            # A gateway may outlive an in-place source update. In that state
+            # ``run_agent`` can contain the segmented dispatch call while the
+            # already-cached executor module predates that symbol. Reloading a
+            # shared module mid-turn is unsafe; preserve correctness by running
+            # the untouched batch sequentially until the process is restarted.
+            from agent import tool_executor as _tool_executor
+            execute_tool_calls_segmented = getattr(
+                _tool_executor, "execute_tool_calls_segmented", None
+            )
+            if execute_tool_calls_segmented is None:
+                logger.warning(
+                    "cached agent.tool_executor lacks execute_tool_calls_segmented; "
+                    "falling back to sequential mixed-batch execution (module=%s)",
+                    getattr(_tool_executor, "__file__", "<unknown>"),
+                )
+                return self._execute_tool_calls_sequential(
+                    assistant_message, messages, effective_task_id, api_call_count
+                )
             return execute_tool_calls_segmented(
                 self, assistant_message, messages, effective_task_id, api_call_count,
                 segments=segments,
