@@ -100,9 +100,9 @@ def _resolve_home_dir() -> str:
 
 
 def _build_subprocess_env() -> dict[str, str]:
-    # Copilot ACP is a model-driving CLI executor: it legitimately needs LLM
-    # provider credentials. Route through the central helper so Tier-1 secrets
-    # (gateway bot tokens, GitHub auth, infra) are still stripped (#29157).
+    # ``inherit_credentials=True`` is compatibility-only and does not widen the
+    # default-deny environment. Copilot authenticates through its own auth store;
+    # ambient provider and AWS operator credentials stay outside this child.
     env = hermes_subprocess_env(inherit_credentials=True)
     home = _resolve_home_dir()
     env["HOME"] = home

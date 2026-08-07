@@ -1,8 +1,36 @@
-"""Tests for gh-copilot CLI deprecation detection and GitHub Models Azure URL mapping."""
+"""Tests for gh-copilot CLI deprecation detection and subprocess isolation."""
+
+import os
+from unittest.mock import patch
 
 import pytest
 
-from agent.copilot_acp_client import _is_gh_copilot_deprecation_message
+from agent.copilot_acp_client import (
+    _build_subprocess_env,
+    _is_gh_copilot_deprecation_message,
+)
+
+
+def test_copilot_subprocess_observes_aws_operator_chain_absent():
+    aws_names = {
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        "AWS_CONFIG_FILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+        "AWS_ROLE_ARN",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+    }
+    ambient = {name: f"sentinel-{name}" for name in aws_names}
+    ambient.update({"PATH": os.environ.get("PATH", ""), "HOME": "/sentinel/home"})
+
+    with patch.dict(os.environ, ambient, clear=True):
+        child_env = _build_subprocess_env()
+
+    assert not (aws_names & child_env.keys())
 
 
 class TestDeprecationPatternDetection:

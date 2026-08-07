@@ -190,7 +190,7 @@ class TestSnapshotEndToEnd:
     """Spin up a real LocalEnvironment and confirm the snapshot sources
     extra init files."""
 
-    def test_exported_env_changes_persist_between_commands(self, tmp_path):
+    def test_snapshot_persists_allowed_exports_only(self, tmp_path):
         env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
         try:
             first = env.execute(
@@ -208,10 +208,11 @@ class TestSnapshotEndToEnd:
         assert second["returncode"] == 0
         assert "first=sticky" in first.get("output", "")
         output = second.get("output", "")
-        assert "second=sticky" in output
+        assert "second=" in output
+        assert "second=sticky" not in output
         assert "/tmp/hermes-session-bin" in output
 
-    def test_venv_style_activation_persists_between_commands(self, tmp_path):
+    def test_venv_activation_persists_path_not_marker(self, tmp_path):
         venv_bin = tmp_path / ".venv" / "bin"
         venv_bin.mkdir(parents=True)
         activate = venv_bin / "activate"
@@ -230,10 +231,11 @@ class TestSnapshotEndToEnd:
         assert first["returncode"] == 0
         assert second["returncode"] == 0
         output = second.get("output", "")
-        assert f"venv={tmp_path / '.venv'}" in output
+        assert "venv=" in output
+        assert f"venv={tmp_path / '.venv'}" not in output
         assert str(venv_bin) in output
 
-    def test_snapshot_picks_up_init_file_exports(self, tmp_path, monkeypatch):
+    def test_snapshot_picks_up_only_allowed_init_exports(self, tmp_path, monkeypatch):
         init_file = tmp_path / "custom-init.sh"
         init_file.write_text(
             'export HERMES_SHELL_INIT_PROBE="probe-ok"\n'
@@ -253,7 +255,8 @@ class TestSnapshotEndToEnd:
                 env.cleanup()
 
         output = result.get("output", "")
-        assert "PROBE=probe-ok" in output
+        assert "PROBE=" in output
+        assert "PROBE=probe-ok" not in output
         assert "/opt/shell-init-probe/bin" in output
 
     def test_profile_path_export_survives_bashrc_interactive_guard(
@@ -268,9 +271,8 @@ class TestSnapshotEndToEnd:
             non-interactive source short-circuits.
           - ``~/.profile`` exports ``$HOME/fake-n/bin`` onto PATH, no guard.
 
-        Expectation: auto-sourced rc list picks up ``~/.profile`` before
-        ``~/.bashrc``, so the snapshot ends up with ``fake-n/bin`` on PATH
-        even though the bashrc export is silently skipped.
+        Expectation: auto-sourced rc files may update allowlisted PATH, while
+        arbitrary exported names remain excluded from the snapshot.
         """
         fake_n_bin = tmp_path / "fake-n" / "bin"
         fake_n_bin.mkdir(parents=True)
@@ -306,7 +308,8 @@ class TestSnapshotEndToEnd:
                 env.cleanup()
 
         output = result.get("output", "")
-        assert "FROM_PROFILE=profile-ok" in output
+        assert "FROM_PROFILE=" in output
+        assert "FROM_PROFILE=profile-ok" not in output
         assert str(fake_n_bin) in output
         # bashrc short-circuited on the interactive guard — its export never ran
         assert "FROM_BASHRC=bashrc-should-not-appear" not in output

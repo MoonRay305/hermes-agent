@@ -301,18 +301,13 @@ class TestSpawnEnvSecretStripping:
     """codex app-server routes its spawn env through hermes_subprocess_env(
     inherit_credentials=True) instead of a raw os.environ.copy().
 
-    codex is a model-driving CLI executor: it legitimately needs LLM provider
-    credentials to authenticate, but it must NOT inherit Tier-1 Hermes secrets
-    (gateway bot tokens, GitHub/infra auth, dashboard session token) or the
-    dynamic-internal secrets (AUXILIARY_*_API_KEY / _BASE_URL side-LLM keys,
-    GATEWAY_RELAY_* relay-auth) — a coding subprocess has no use for those and
-    a model-controlled action could exfiltrate them. This closes the #29157
-    sibling spawn-site gap (copilot_acp_client already routes through the
-    helper; codex app-server predated it).
+    Ambient provider credentials are denied with every other non-allowlisted
+    name. A caller that needs one must bind it through the explicit ``env``
+    argument; Codex's own auth store remains available through HOME.
     """
 
     @staticmethod
-    def _capture_spawn_env(monkeypatch):
+    def _capture_spawn_env(monkeypatch, explicit_env=None):
         import subprocess
         from agent.transports import codex_app_server as cas
 
@@ -340,7 +335,7 @@ class TestSpawnEnvSecretStripping:
                 pass
 
         monkeypatch.setattr(subprocess, "Popen", FakePopen)
-        client = cas.CodexAppServerClient(codex_bin="codex")
+        client = cas.CodexAppServerClient(codex_bin="codex", env=explicit_env)
         client._closed = True
         return captured["env"]
 
@@ -365,12 +360,37 @@ class TestSpawnEnvSecretStripping:
         ):
             assert var not in env, f"{var} leaked into codex app-server spawn env"
 
-    def test_provider_credentials_still_reach_codex(self, monkeypatch):
-        """codex authenticates against the model endpoint — provider keys must
-        still flow through (inherit_credentials=True)."""
+    def test_ambient_provider_credentials_do_not_reach_codex(self, monkeypatch):
         monkeypatch.setenv("OPENAI_API_KEY", "sk-codex-needs-this")
         env = self._capture_spawn_env(monkeypatch)
-        assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"
+        assert "OPENAI_API_KEY" not in env
+
+    def test_aws_operator_chain_does_not_reach_codex(self, monkeypatch):
+        aws_names = {
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_PROFILE",
+            "AWS_CONFIG_FILE",
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+            "AWS_ROLE_ARN",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+        }
+        for name in aws_names:
+            monkeypatch.setenv(name, f"sentinel-{name}")
+
+        env = self._capture_spawn_env(monkeypatch)
+
+        assert not (aws_names & env.keys())
+
+    def test_explicit_provider_binding_reaches_codex(self, monkeypatch):
+        env = self._capture_spawn_env(
+            monkeypatch,
+            explicit_env={"OPENAI_API_KEY": "sk-explicit"},
+        )
+        assert env.get("OPENAI_API_KEY") == "sk-explicit"
 
     def test_home_still_preserved_through_helper(self, monkeypatch):
         """Regression guard: routing through hermes_subprocess_env must not

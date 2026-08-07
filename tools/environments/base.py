@@ -350,6 +350,15 @@ class BaseEnvironment(ABC):
     # Session snapshot (init_session)
     # ------------------------------------------------------------------
 
+    def _snapshot_export_command(self, target: str) -> str:
+        """Return the shell command that writes exported vars to *target*.
+
+        Remote/container backends preserve their existing full-shell snapshot.
+        The local backend overrides this hook because its process environment
+        comes from the long-lived Hermes host and must be default-deny.
+        """
+        return f"export -p > {target}"
+
     def init_session(self):
         """Capture login shell environment into a snapshot file.
 
@@ -396,7 +405,7 @@ class BaseEnvironment(ABC):
         _snap_tmp = shlex.quote(self._snapshot_path + ".tmp.") + "$BASHPID"
         bootstrap = (
             f"umask 077\n"
-            f"export -p > {_snap_tmp}\n"
+            f"{self._snapshot_export_command(_snap_tmp)}\n"
             # Dump function definitions, filtering out private (``_``-prefixed)
             # helpers — mainly bash-completion internals (``_git``, ``_make``…)
             # — by NAME, not by line.  A naive ``declare -f | grep -vE '^_[^_]'``
@@ -512,8 +521,9 @@ class BaseEnvironment(ABC):
         # replaces a good snapshot; drop the temp on failure so it isn't
         # orphaned (cleaned up wholesale in LocalEnvironment.cleanup too).
         if self._snapshot_ready:
+            snapshot_export = self._snapshot_export_command(_snap_tmp)
             parts.append(
-                f"{{ export -p > {_snap_tmp} && mv -f {_snap_tmp} {_quoted_snap}; }} "
+                f"{{ {snapshot_export} && mv -f {_snap_tmp} {_quoted_snap}; }} "
                 f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true"
             )
 

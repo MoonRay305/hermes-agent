@@ -76,18 +76,20 @@ class CodexAppServerClient:
         env: Optional[dict[str, str]] = None,
     ) -> None:
         self._codex_bin = codex_bin
-        # codex app-server is a model-driving CLI executor: it runs a
-        # model-chosen agentic loop that executes shell commands, so it
-        # legitimately needs LLM provider credentials (inherit_credentials=True)
-        # to authenticate against the model endpoint. But the previous
-        # `os.environ.copy()` also handed it every Tier-1 Hermes secret — gateway
-        # bot tokens, GitHub auth, Modal/Daytona infra tokens, the dashboard
-        # session token, AUXILIARY_* side-LLM keys, GATEWAY_RELAY_* auth — none
-        # of which a coding subprocess has any use for. Route through the
-        # centralized helper so Tier-1 + dynamic-internal secrets are always
-        # stripped while provider creds still flow, matching copilot_acp_client
-        # (#29157 sibling spawn-site gap).
+        # The centralized helper is ambient-default-deny. Model-provider values
+        # must arrive through the explicit ``env`` argument or Codex's own auth
+        # store; the compatibility flag no longer forwards the provider registry.
         spawn_env = hermes_subprocess_env(inherit_credentials=True)
+        # Kanban context is operational routing state that this consumer reads
+        # immediately below. Bind only the three exact names it needs instead
+        # of widening the shared ambient allowlist.
+        for key in (
+            "HERMES_KANBAN_TASK",
+            "HERMES_KANBAN_DB",
+            "HERMES_KANBAN_ROOT",
+        ):
+            if key in os.environ:
+                spawn_env[key] = os.environ[key]
         if env:
             spawn_env.update(env)
         if codex_home:
