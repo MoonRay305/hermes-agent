@@ -99,8 +99,9 @@ def _fire_approval_hook(hook_name: str, **kwargs) -> None:
     imported very early, long before plugins are discovered). Never raises --
     plugin errors are logged and swallowed.
 
-    Only fires for the two approval-specific hooks in VALID_HOOKS:
-    pre_approval_request, post_approval_response.
+    Only fires for approval-specific hooks in VALID_HOOKS. Every payload is
+    force-redacted here, after correlation IDs are attached, because plugins
+    are external observers and may persist or forward the kwargs verbatim.
     """
     try:
         from hermes_cli.plugins import invoke_hook
@@ -111,6 +112,12 @@ def _fire_approval_hook(hook_name: str, **kwargs) -> None:
     try:
         kwargs.setdefault("turn_id", _approval_turn_id.get())
         kwargs.setdefault("tool_call_id", _approval_tool_call_id.get())
+        # Normalize after correlation IDs are attached so every current or
+        # future payload string crosses the force-redaction boundary before
+        # any observer (including telemetry plugins) receives it.
+        from tools.approval_audit import normalize_audit_payload
+
+        kwargs = normalize_audit_payload(kwargs)
         invoke_hook(hook_name, **kwargs)
     except Exception as exc:
         # invoke_hook() already swallows per-callback errors, so reaching here
@@ -755,6 +762,42 @@ DANGEROUS_PATTERNS = [
     # into a single -X token. Catches the same threat class.
     (r'\bsudo\b[^;|&\n]*?\s+-[a-z]*[sa][a-z]*\b',
      "sudo with combined-flag privilege escalation"),
+    # =====================================================================
+    # Doppler credential operations (BUI-1100). Keyed on the OPERATION —
+    # `doppler … secrets … <op>` with any flags in between — not on one
+    # literal spelling, so `doppler --project api --config prd secrets get
+    # DATABASE_URL --plain` and `doppler secrets get DATABASE_URL` hit the
+    # same detector. The lazy `[^;|&\n]*?` fragments bound matching to a
+    # single command segment (same idiom as the sudo rules above) so a
+    # later command in a `;`/`&&` chain cannot satisfy the operation word.
+    #
+    # READ: get/download/substitute expose secret values directly;
+    # `doppler run` injects the entire config's secrets into a child
+    # process's environment, which is the same read surface rephrased.
+    (r'\bdoppler\b[^;|&\n]*?\bsecrets\b[^;|&\n]*?\b(?:get|download|substitute)\b',
+     "Doppler credential read (secrets get/download/substitute)"),
+    (r'\bdoppler\b[^;|&\n]*?\brun\b',
+     "Doppler credential read (doppler run injects secrets into child env)"),
+    # WRITE: set/upload mutate secret values, delete destroys them, and
+    # `configs tokens create` mints a durable service token — a credential
+    # write that grants standing read access out-of-band.
+    (r'\bdoppler\b[^;|&\n]*?\bsecrets\b[^;|&\n]*?\b(?:set|delete|upload)\b',
+     "Doppler credential write (secrets set/delete/upload)"),
+    (r'\bdoppler\b[^;|&\n]*?\btokens?\b[^;|&\n]*?\bcreate\b',
+     "Doppler credential write (service token create)"),
+    # =====================================================================
+    # Permission/ownership changes as a CLASS (BUI-1100 item 4). The
+    # mode-specific rules above (777/666/o+w, recursive chown to root)
+    # stay first so their established allowlist keys keep matching those
+    # shapes; these catch-alls make every other chmod/chown gate too —
+    # `chmod 700`, `chmod +x`, `chown user file` — instead of only the
+    # world-writable/root shapes. Anchored to _CMDPOS (like the
+    # shutdown/reboot rules) so prose mentioning chmod — commit messages,
+    # `--title "fix chmod"` — does not trip the gate; the cost is that
+    # chmod nested inside find -exec/xargs is only caught by the specific
+    # rules above.
+    (_CMDPOS + r'chmod\s+\S', "permission change (chmod)"),
+    (_CMDPOS + r'chown\s+\S', "ownership change (chown)"),
 ]
 
 
@@ -1398,6 +1441,53 @@ def detect_dangerous_command(command: str) -> tuple:
     return (False, None, None)
 
 
+def detect_all_dangerous_patterns(command: str) -> list:
+    """Return ALL dangerous-pattern matches as (pattern_key, description) pairs.
+
+    ``detect_dangerous_command`` stops at the first match because the approval
+    prompt only needs one headline. Audit records and coverage introspection
+    need the full picture — which detector classes flag this command — so this
+    variant collects every matching pattern across all detection variants,
+    deduplicated in pattern-list order. Pattern key and description are the
+    same string (the canonical human-readable key).
+    """
+    matched: dict[str, str] = {}
+    for command_variant in _command_detection_variants(command):
+        command_lower = command_variant.lower()
+        for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
+            if description not in matched and pattern_re.search(command_lower):
+                matched[description] = description
+    return [(key, key) for key in matched]
+
+
+def _audit_bypass(*, reason: str, command: str, findings: list | None,
+                  surface: str, env_type: str = "",
+                  detail: dict | None = None,
+                  tirith: dict | None = None) -> None:
+    """Emit a bypass audit record for an approval that skipped the prompt.
+
+    Thin, never-raising wrapper around ``tools.approval_audit.record_bypass``
+    (lazy import — approval.py loads very early). The audit layer decides
+    whether the command was actually flagged; unflagged commands produce no
+    record. See tools/approval_audit.py for the record schema and the
+    emission policy.
+    """
+    try:
+        from tools.approval_audit import record_bypass
+        record_bypass(
+            reason=reason,
+            command=command,
+            findings=findings,
+            session_key=get_current_session_key(default=""),
+            surface=surface,
+            env_type=env_type,
+            detail=detail,
+            tirith=tirith,
+        )
+    except Exception as exc:  # pragma: no cover -- defensive
+        logger.debug("Bypass audit emission failed: %s", exc)
+
+
 # =========================================================================
 # Per-session approval state (thread-safe)
 # =========================================================================
@@ -1593,33 +1683,69 @@ def _has_allowlist_shell_operator(command: str) -> bool:
     return bool(_ALLOWLIST_SHELL_OPERATOR_RE.search(command or ""))
 
 
-def _command_matches_permanent_allowlist(command: str) -> bool:
-    """Return True when command_allowlist contains this command or a glob.
+def match_command_allowlist_entry(command: str, entries) -> str | None:
+    """Return the entry in *entries* matching *command* text, or None.
 
-    Permanent approvals historically store dangerous-pattern keys such as
-    ``recursive delete``. Manual entries in ``command_allowlist`` are command
-    text, and may include shell-style wildcards like ``podman *``.
+    Pure core of the exact-command allowlist shortcut, parameterized on the
+    entry collection so the coverage introspection command can evaluate an
+    arbitrary profile's ``command_allowlist`` without touching this process's
+    approval state. Entries are exact command text or shell-style globs
+    (``podman *``); compound commands never match (shell-operator guard).
     """
     command = (command or "").strip()
     if not command:
-        return False
+        return None
     if _has_allowlist_shell_operator(command):
-        return False
+        return None
 
-    with _lock:
-        patterns = tuple(_permanent_approved)
-
-    for pattern in patterns:
+    for pattern in entries:
         if not isinstance(pattern, str):
             continue
         pattern = pattern.strip()
         if not pattern:
             continue
         if command == pattern:
-            return True
+            return pattern
         if any(ch in pattern for ch in "*?[") and fnmatch.fnmatchcase(command, pattern):
-            return True
-    return False
+            return pattern
+    return None
+
+
+def _matching_permanent_allowlist_entry(command: str) -> str | None:
+    """Return the ``command_allowlist`` entry matching *command*, or None.
+
+    Permanent approvals historically store dangerous-pattern keys such as
+    ``recursive delete``. Manual entries in ``command_allowlist`` are command
+    text, and may include shell-style wildcards like ``podman *``. Returning
+    the matched entry (rather than a bare bool) lets the bypass audit record
+    name exactly which allowlist entry let the command through.
+    """
+    with _lock:
+        patterns = tuple(_permanent_approved)
+    return match_command_allowlist_entry(command, patterns)
+
+
+def _command_matches_permanent_allowlist(command: str) -> bool:
+    """Return True when command_allowlist contains this command or a glob."""
+    return _matching_permanent_allowlist_entry(command) is not None
+
+
+def _approved_scope(session_key: str, pattern_key: str) -> str | None:
+    """Return how *pattern_key* is currently approved, for audit records.
+
+    ``"permanent"`` when the key (or a legacy alias) sits in the persistent
+    ``command_allowlist``, ``"session"`` when it was granted for this session
+    only, ``None`` when it is not approved at all. Mirrors ``is_approved``'s
+    alias handling and lock discipline.
+    """
+    aliases = _approval_key_aliases(pattern_key)
+    with _lock:
+        if any(alias in _permanent_approved for alias in aliases):
+            return "permanent"
+        session_approvals = _session_approved.get(session_key, set())
+        if any(alias in session_approvals for alias in aliases):
+            return "session"
+    return None
 
 
 
@@ -1684,8 +1810,8 @@ def prompt_dangerous_approval(command: str, description: str,
     # copy is scrubbed. Reuses the same redaction module used for memory
     # and log sanitization so tokens mask consistently across surfaces.
     from agent.redact import redact_sensitive_text
-    display_command = redact_sensitive_text(command)
-    display_description = redact_sensitive_text(description)
+    display_command = redact_sensitive_text(command, force=True)
+    display_description = redact_sensitive_text(description, force=True)
 
     if approval_callback is not None:
         try:
@@ -1713,7 +1839,7 @@ def prompt_dangerous_approval(command: str, description: str,
                 "Dangerous-command approval requested on a thread with no "
                 "approval callback while prompt_toolkit is active; denying "
                 "to avoid stdin deadlock. command=%r description=%r",
-                command, description,
+                display_command, display_description,
             )
             return "deny"
     except Exception:
@@ -2006,6 +2132,8 @@ def _run_approval_gate(
     autoapprove_log_prefix: str,
     fail_closed_when_no_human: bool = False,
     no_human_block_message: str = "",
+    audit_surface: str = "tool_approval",
+    audit_env_type: str = "",
 ) -> dict:
     """Shared human-approval gate for a flagged action (command or tool).
 
@@ -2042,19 +2170,68 @@ def _run_approval_gate(
             plugin-flagged action never runs ungated without a human.
         no_human_block_message: Message returned when
             ``fail_closed_when_no_human`` blocks.
+        audit_surface: Label identifying the calling gate in bypass audit
+            records ("dangerous_command" or "tool_approval").
+        audit_env_type: Terminal backend type for audit records, when the
+            caller has one.
 
     Returns:
         ``{"approved": bool, "message": str|None, ...}`` — shape shared with
         ``check_dangerous_command`` so all callers handle it uniformly.
     """
+    # This is the last common boundary before caller-controlled approval data
+    # reaches logs, queues, hooks, allowlist state, or config.yaml. Normalize
+    # every string here with force-mode redaction; ``display_target`` is a
+    # display-only copy, never the command that executes.
+    from tools.approval_audit import normalize_audit_payload
+
+    _safe = normalize_audit_payload({
+        "pattern_key": pattern_key,
+        "description": description,
+        "display_target": display_target,
+        "cron_deny_message": cron_deny_message,
+        "autoapprove_log_prefix": autoapprove_log_prefix,
+        "no_human_block_message": no_human_block_message,
+        "audit_surface": audit_surface,
+        "audit_env_type": audit_env_type,
+    })
+    pattern_key = _safe["pattern_key"]
+    description = _safe["description"]
+    display_target = _safe["display_target"]
+    cron_deny_message = _safe["cron_deny_message"]
+    autoapprove_log_prefix = _safe["autoapprove_log_prefix"]
+    no_human_block_message = _safe["no_human_block_message"]
+    audit_surface = _safe["audit_surface"]
+    audit_env_type = _safe["audit_env_type"]
+
+    _audit_findings = [(pattern_key, description)]
+
     # --yolo bypasses all approval prompts (session- or process-scoped).
     # Hardline blocks are handled by the caller BEFORE this gate, so yolo
     # here only skips the recoverable approval layer.
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+        _audit_bypass(
+            reason="process_yolo" if _YOLO_MODE_FROZEN else "session_yolo",
+            command=display_target,
+            findings=_audit_findings,
+            surface=audit_surface,
+            env_type=audit_env_type,
+        )
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
     if is_approved(session_key, pattern_key):
+        _audit_bypass(
+            reason="pattern_key_allowlist",
+            command=display_target,
+            findings=_audit_findings,
+            surface=audit_surface,
+            env_type=audit_env_type,
+            detail={"approved_keys": {
+                pattern_key: _approved_scope(session_key, pattern_key)
+                or "unknown",
+            }},
+        )
         return {"approved": True, "message": None}
 
     if approval_callback is None:
@@ -2102,6 +2279,15 @@ def _run_approval_gate(
             "%s (pattern: %s): %s — set HERMES_INTERACTIVE or "
             "HERMES_GATEWAY_SESSION to require approval.",
             autoapprove_log_prefix, pattern_key, description,
+        )
+        _audit_bypass(
+            reason=("cron_approve_mode"
+                    if env_var_enabled("HERMES_CRON_SESSION")
+                    else "non_interactive_auto_approve"),
+            command=display_target,
+            findings=_audit_findings,
+            surface=audit_surface,
+            env_type=audit_env_type,
         )
         return {"approved": True, "message": None}
 
@@ -2271,9 +2457,25 @@ def check_dangerous_command(command: str, env_type: str,
     # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
     # CLI --yolo remains process-scoped via the env var for local use.
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+        _audit_bypass(
+            reason="process_yolo" if _YOLO_MODE_FROZEN else "session_yolo",
+            command=command,
+            findings=detect_all_dangerous_patterns(command),
+            surface="dangerous_command",
+            env_type=env_type,
+        )
         return {"approved": True, "message": None}
 
-    if _command_matches_permanent_allowlist(command):
+    _allowlist_entry = _matching_permanent_allowlist_entry(command)
+    if _allowlist_entry is not None:
+        _audit_bypass(
+            reason="exact_command_allowlist",
+            command=command,
+            findings=detect_all_dangerous_patterns(command),
+            surface="dangerous_command",
+            env_type=env_type,
+            detail={"matched_entry": _allowlist_entry},
+        )
         return {"approved": True, "message": None}
 
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
@@ -2295,6 +2497,8 @@ def check_dangerous_command(command: str, env_type: str,
         autoapprove_log_prefix=(
             "AUTO-APPROVED dangerous command in non-interactive non-gateway context"
         ),
+        audit_surface="dangerous_command",
+        audit_env_type=env_type,
     )
 
 
@@ -2376,6 +2580,7 @@ def request_tool_approval(
             f"plugin-escalated tool call '{tool_name}' in "
             "non-interactive non-gateway context"
         ),
+        audit_surface="tool_approval",
         fail_closed_when_no_human=True,
         no_human_block_message=(
             f"BLOCKED: Tool '{tool_name}' requires approval ({description}) "
@@ -2586,9 +2791,31 @@ def check_all_command_guards(command: str, env_type: str,
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+        if _YOLO_MODE_FROZEN:
+            _bypass_reason = "process_yolo"
+        elif is_current_session_yolo_enabled():
+            _bypass_reason = "session_yolo"
+        else:
+            _bypass_reason = "mode_off"
+        _audit_bypass(
+            reason=_bypass_reason,
+            command=command,
+            findings=detect_all_dangerous_patterns(command),
+            surface="terminal",
+            env_type=env_type,
+        )
         return {"approved": True, "message": None}
 
-    if _command_matches_permanent_allowlist(command):
+    _allowlist_entry = _matching_permanent_allowlist_entry(command)
+    if _allowlist_entry is not None:
+        _audit_bypass(
+            reason="exact_command_allowlist",
+            command=command,
+            findings=detect_all_dangerous_patterns(command),
+            surface="terminal",
+            env_type=env_type,
+            detail={"matched_entry": _allowlist_entry},
+        )
         return {"approved": True, "message": None}
 
     is_cli = _is_interactive_cli()
@@ -2598,9 +2825,17 @@ def check_all_command_guards(command: str, env_type: str,
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
     if not is_cli and not is_gateway and not is_ask:
+        # Bypass audit bookkeeping for this fall-through: which reason the
+        # (possible) record carries, and the tirith result when one exists.
+        # A cron-deny session only reaches the tail return when nothing was
+        # flagged, so its only recordable outcome is a tirith fail-open.
+        _bypass_reason = "non_interactive_auto_approve"
+        _bypass_tirith = None
         # Cron sessions: respect cron_mode config
         if env_var_enabled("HERMES_CRON_SESSION"):
+            _bypass_reason = "cron_approve_mode"
             if _get_cron_approval_mode() == "deny":
+                _bypass_reason = "tirith_fail_open"
                 # Run detection to get a description for the block message
                 is_dangerous, _pk, description = detect_dangerous_command(command)
                 if is_dangerous:
@@ -2621,6 +2856,7 @@ def check_all_command_guards(command: str, env_type: str,
                 try:
                     from tools.tirith_security import check_command_security
                     _cron_tirith = check_command_security(command)
+                    _bypass_tirith = _cron_tirith
                     if _cron_tirith.get("action") in ("block", "warn"):
                         _cron_desc = _format_tirith_description(_cron_tirith)
                         return {
@@ -2661,6 +2897,20 @@ def check_all_command_guards(command: str, env_type: str,
                             ),
                         }
                     # else: tirith_fail_open is True — allow as before
+                    _bypass_tirith = {
+                        "action": "allow",
+                        "findings": [],
+                        "summary": "tirith import failed",
+                        "fail_open": True,
+                    }
+        _audit_bypass(
+            reason=_bypass_reason,
+            command=command,
+            findings=detect_all_dangerous_patterns(command),
+            surface="terminal",
+            env_type=env_type,
+            tirith=_bypass_tirith,
+        )
         return {"approved": True, "message": None}
 
     # --- Phase 1: Gather findings from both checks ---
@@ -2733,8 +2983,47 @@ def check_all_command_guards(command: str, env_type: str,
         if not is_approved(session_key, pattern_key):
             warnings.append((pattern_key, description, False))
 
-    # Nothing to warn about
+    # Nothing to warn about — but distinguish "clean" from "flagged and
+    # silently waved through". Detection or tirith may have flagged this
+    # command while every flagged key was already approved (a permanent
+    # command_allowlist entry or an earlier session-scoped grant), or tirith
+    # may have failed open (scan never ran). Both complete without a prompt;
+    # both must leave an audit record. A genuinely clean command emits
+    # nothing (record_bypass no-ops on empty findings).
     if not warnings:
+        _preapproved_keys: dict[str, str] = {}
+        _bypass_findings: list = []
+        if is_dangerous:
+            _bypass_findings = detect_all_dangerous_patterns(command)
+            for _fk, _ in _bypass_findings:
+                _scope = _approved_scope(session_key, _fk)
+                if _scope:
+                    _preapproved_keys[_fk] = _scope
+        if tirith_result["action"] in {"block", "warn"}:
+            _t_findings = tirith_result.get("findings") or []
+            _t_rule = (_t_findings[0].get("rule_id", "unknown")
+                       if _t_findings else "unknown")
+            _t_key = f"tirith:{_t_rule}"
+            _scope = _approved_scope(session_key, _t_key)
+            if _scope:
+                _preapproved_keys[_t_key] = _scope
+            _bypass_findings.append(
+                (_t_key, _format_tirith_description(tirith_result)))
+        if _preapproved_keys or tirith_result.get("fail_open"):
+            _audit_bypass(
+                reason=("pattern_key_allowlist" if _preapproved_keys
+                        else "tirith_fail_open"),
+                command=command,
+                findings=_bypass_findings,
+                surface="terminal",
+                env_type=env_type,
+                detail=({"approved_keys": _preapproved_keys}
+                        if _preapproved_keys else None),
+                tirith=(tirith_result
+                        if (tirith_result.get("fail_open")
+                            or tirith_result["action"] != "allow")
+                        else None),
+            )
         return {"approved": True, "message": None}
 
     # --- Phase 2.5: Smart approval (auxiliary LLM risk assessment) ---
@@ -2750,6 +3039,15 @@ def check_all_command_guards(command: str, env_type: str,
                 approve_session(session_key, key)
             logger.debug("Smart approval: auto-approved '%s' (%s)",
                          command[:60], combined_desc_for_llm)
+            # The aux LLM granted this without a human prompt — that is a
+            # bypass of the interactive gate and gets a record like any other.
+            _audit_bypass(
+                reason="smart_approval",
+                command=command,
+                findings=[(key, desc) for key, desc, _ in warnings],
+                surface="terminal",
+                env_type=env_type,
+            )
             return {"approved": True, "message": None,
                     "smart_approved": True,
                     "description": combined_desc_for_llm}
@@ -2986,12 +3284,29 @@ def check_execute_code_guard(code: str, env_type: str,
         return {"approved": True, "message": None}
 
     # --yolo or approvals.mode=off: bypass (session- or process-scoped).
+    # is_gateway/is_ask are needed first: a bypass audit record is emitted
+    # only when this guard WOULD have gated (gateway/ask/cron contexts). In
+    # a purely local session the guard is documented as out of scope — the
+    # script's terminal() calls are approved per-call — so no record there.
     approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
-        return {"approved": True, "message": None}
-
     is_gateway = _is_gateway_approval_context()
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
+    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+        if is_gateway or is_ask or env_var_enabled("HERMES_CRON_SESSION"):
+            if _YOLO_MODE_FROZEN:
+                _bypass_reason = "process_yolo"
+            elif is_current_session_yolo_enabled():
+                _bypass_reason = "session_yolo"
+            else:
+                _bypass_reason = "mode_off"
+            _audit_bypass(
+                reason=_bypass_reason,
+                command=f"execute_code <<'PY'\n{code}\nPY",
+                findings=[(pattern_key, description)],
+                surface="execute_code",
+                env_type=env_type,
+            )
+        return {"approved": True, "message": None}
 
     # Cron: no user is present to approve arbitrary code.
     if env_var_enabled("HERMES_CRON_SESSION"):
@@ -3011,6 +3326,13 @@ def check_execute_code_guard(code: str, env_type: str,
                 "outcome": "blocked",
                 "user_consent": False,
             }
+        _audit_bypass(
+            reason="cron_approve_mode",
+            command=f"execute_code <<'PY'\n{code}\nPY",
+            findings=[(pattern_key, description)],
+            surface="execute_code",
+            env_type=env_type,
+        )
         return {"approved": True, "message": None}
 
     # Only gateway/ask contexts get the one-shot whole-script approval.
@@ -3041,6 +3363,17 @@ def check_execute_code_guard(code: str, env_type: str,
     # Without this, "Approve session" / "Always" choices are stored but never
     # consulted, so every execute_code call re-prompts the user (#39275).
     if is_approved(session_key, pattern_key):
+        _audit_bypass(
+            reason="pattern_key_allowlist",
+            command=command,
+            findings=[(pattern_key, description)],
+            surface="execute_code",
+            env_type=env_type,
+            detail={"approved_keys": {
+                pattern_key: _approved_scope(session_key, pattern_key)
+                or "unknown",
+            }},
+        )
         return {"approved": True, "message": None}
 
     # Smart mode: ask the aux LLM about the whole script. An APPROVE here only
@@ -3051,6 +3384,13 @@ def check_execute_code_guard(code: str, env_type: str,
         if verdict == "approve":
             logger.debug("Smart approval: auto-approved execute_code for session %s",
                          session_key)
+            _audit_bypass(
+                reason="smart_approval",
+                command=command,
+                findings=[(pattern_key, description)],
+                surface="execute_code",
+                env_type=env_type,
+            )
             return {"approved": True, "message": None,
                     "smart_approved": True, "description": description}
         if verdict == "deny":

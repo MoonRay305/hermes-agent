@@ -45,10 +45,18 @@ class TestChownRecursiveLongOptionAbbreviation:
         dangerous, _, _ = detect_dangerous_command("chown --recursi root /etc")
         assert dangerous is True
 
-    def test_chown_recur_non_root_not_flagged(self):
-        """--recur* chown to a non-root user must not be flagged."""
-        dangerous, _, _ = detect_dangerous_command("chown --recur nobody /opt/app")
-        assert dangerous is False
+    def test_chown_recur_non_root_flags_class_not_root_key(self):
+        """--recur* chown to a non-root user gates as the ownership class.
+
+        BUI-1100: ownership changes now gate as a CLASS, so this is flagged
+        — but it must carry the generic ``ownership change`` key, NOT the
+        ``recursive chown to root`` key, whose approval grain (and any
+        existing allowlist entries for it) must stay root-specific.
+        """
+        dangerous, key, _ = detect_dangerous_command("chown --recur nobody /opt/app")
+        assert dangerous is True
+        assert key == "ownership change (chown)"
+        assert "root" not in key
 
 
 class TestGitPushForceLongOptionAbbreviation:

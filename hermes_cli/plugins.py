@@ -185,6 +185,19 @@ VALID_HOOKS: Set[str] = {
     #   choice: "once" | "session" | "always" | "deny" | "timeout"
     "pre_approval_request",
     "post_approval_response",
+    # Fired by tools/approval.py when a command or action that the dangerous-
+    # command detectors flagged proceeds WITHOUT an approval prompt being
+    # shown — approvals.mode=off, --yolo / /yolo, a command_allowlist match
+    # (exact command text or detector pattern key), cron approve-mode, the
+    # non-interactive auto-approve path, a smart-approval LLM grant, or a
+    # Tirith fail-open. Observers only: return values are ignored; the
+    # command has already been approved when this fires.
+    #
+    # Kwargs: command: str (secret-redacted), description: str,
+    #   pattern_key: str, pattern_keys: list[str], session_key: str,
+    #   surface: str, reason: str, record: dict (the full structured audit
+    #   record as written to logs/approval_bypass.jsonl).
+    "approval_bypassed",
     # Kanban task lifecycle hooks. Fired by hermes_cli.kanban_db when a task
     # transitions state, AFTER the change is committed to the board DB (so the
     # hook always sees durable state and a slow plugin can never hold the

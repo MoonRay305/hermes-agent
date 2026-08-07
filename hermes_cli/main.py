@@ -282,6 +282,7 @@ from hermes_cli.subcommands.webhook import build_webhook_parser
 from hermes_cli.subcommands.hooks import build_hooks_parser
 from hermes_cli.subcommands.doctor import build_doctor_parser
 from hermes_cli.subcommands.security import build_security_parser
+from hermes_cli.subcommands.approvals import build_approvals_parser
 from hermes_cli.subcommands.dump import build_dump_parser
 from hermes_cli.subcommands.debug import build_debug_parser
 from hermes_cli.subcommands.backup import build_backup_parser
@@ -4286,6 +4287,13 @@ def cmd_security(args):
         sys.exit(int(code or 0))
     print(f"unknown security subcommand: {sub}", file=sys.stderr)
     sys.exit(2)
+
+
+def cmd_approvals(args):
+    """Dispatch `hermes approvals <subcmd>`."""
+    from hermes_cli.approvals_cmd import cmd_approvals as _cmd_approvals_impl
+
+    sys.exit(int(_cmd_approvals_impl(args) or 0))
 
 
 def cmd_dump(args):
@@ -11010,6 +11018,7 @@ def _coalesce_session_name_args(argv: list) -> list:
     or a known top-level subcommand.
     """
     _SUBCOMMANDS = {
+        "approvals",
         "chat",
         "model",
         "gateway",
@@ -12228,7 +12237,7 @@ def _build_provider_choices() -> list[str]:
 # to parse.
 _BUILTIN_SUBCOMMANDS = frozenset(
     {
-        "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
+        "acp", "approvals", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
@@ -13036,6 +13045,11 @@ def main():
     # security command  (parser built in hermes_cli/subcommands/security.py)
     # =========================================================================
     build_security_parser(subparsers, cmd_security=cmd_security)
+
+    # =========================================================================
+    # approvals command  (parser built in hermes_cli/subcommands/approvals.py)
+    # =========================================================================
+    build_approvals_parser(subparsers, cmd_approvals=cmd_approvals)
 
     # =========================================================================
     # dump command  (parser built in hermes_cli/subcommands/dump.py)

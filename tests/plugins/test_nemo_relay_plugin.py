@@ -311,6 +311,49 @@ def test_nemo_relay_plugin_emits_approval_marks(monkeypatch):
     assert "hermes.approval.response" in mark_names
 
 
+def test_nemo_relay_approval_marks_receive_force_redacted_kwargs(monkeypatch):
+    """Approval hook dispatch scrubs kwargs before Nemo Relay forwards them."""
+    from tools import approval
+
+    fake = _FakeNemoRelay()
+    plugin = _fresh_plugin(monkeypatch, fake)
+    secret = "dp.st.prd.FLEET85NemoCredential123456789"
+    monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+
+    def dispatch(hook_name, **kwargs):
+        callback = {
+            "pre_approval_request": plugin.on_pre_approval_request,
+            "post_approval_response": plugin.on_post_approval_response,
+        }[hook_name]
+        callback(**kwargs)
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", dispatch)
+    approval._fire_approval_hook(
+        "pre_approval_request",
+        command=f"command:{secret}",
+        description=f"description:{secret}",
+        session_key="synthetic-session",
+    )
+    approval._fire_approval_hook(
+        "post_approval_response",
+        command=f"command:{secret}",
+        description=f"description:{secret}",
+        session_key="synthetic-session",
+        choice="deny",
+    )
+
+    approval_marks = [
+        event for event in fake.events
+        if event[0] == "scope.event" and event[1].startswith("hermes.approval.")
+    ]
+    assert [event[1] for event in approval_marks] == [
+        "hermes.approval.request",
+        "hermes.approval.response",
+    ]
+    assert secret not in json.dumps(approval_marks)
+
+
 def test_nemo_relay_plugin_emits_unmatched_fallback_marks(monkeypatch):
     fake = _FakeNemoRelay()
     plugin = _fresh_plugin(monkeypatch, fake)

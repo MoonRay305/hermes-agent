@@ -1599,11 +1599,19 @@ class TestChmodExecuteCombo:
         # on chmod +x should still trigger even without the && ./
         assert dangerous is True
 
-    def test_safe_chmod_without_execute_not_flagged(self):
-        """chmod +x alone without immediate execution must not be flagged."""
+    def test_safe_chmod_without_execute_flags_class_not_combo(self):
+        """chmod +x alone gates as a permission change, not as the combo.
+
+        BUI-1100: permission changes now gate as a CLASS, so a bare
+        ``chmod +x`` is flagged — but under the ``permission change`` key,
+        NOT the ``chmod +x followed by immediate execution`` combo key,
+        whose approval grain must stay distinct.
+        """
         cmd = "chmod +x script.sh"
-        dangerous, _, _ = detect_dangerous_command(cmd)
-        assert dangerous is False
+        dangerous, key, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert key == "permission change (chmod)"
+        assert "execution" not in key
 
 
 class TestFailClosedUnderPromptToolkit:
@@ -2344,6 +2352,22 @@ class TestApprovalPromptRedaction:
         prompt_dangerous_approval("rm -rf /var/data", "recursive delete",
                                   approval_callback=cb)
         assert seen["command"] == "rm -rf /var/data"
+
+    def test_prompt_toolkit_no_callback_warning_force_redacts(self, monkeypatch, caplog):
+        """The fail-closed warning never logs the raw command or reason."""
+        secret = "dp.st.prd.FLEET85PromptLogCredential123456789"
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+        monkeypatch.setattr(
+            "prompt_toolkit.application.current.get_app_or_none", lambda: object()
+        )
+        caplog.set_level("WARNING", logger="tools.approval")
+
+        result = prompt_dangerous_approval(
+            f"command:{secret}", f"description:{secret}"
+        )
+
+        assert result == "deny"
+        assert secret not in caplog.text
 
     def test_execute_code_pending_fallback_redacts_script(self):
         """check_execute_code_guard's no-notifier fallback masks an embedded
