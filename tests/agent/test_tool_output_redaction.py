@@ -6,6 +6,7 @@ live or previously issued secret.
 
 import base64
 import json
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -108,6 +109,21 @@ def test_configured_secret_name_is_resolved_at_runtime_without_a_value_lookup():
             policy=policy,
         )
     assert result == 'deployment_credential = "[REDACTED:NAME:DEPLOYMENT_CREDENTIAL]"'
+
+
+def test_truncated_escaped_json_does_not_backtrack_pathologically():
+    escaped_markdown = (
+        '---\\nname: synthetic-skill\\ndescription: \\"quoted words\\"\\n'
+        * 500
+    )
+    truncated_tool_result = json.dumps({"content": escaped_markdown})[:-2]
+
+    started = time.monotonic()
+    result = normalize_tool_output(truncated_tool_result)
+    elapsed = time.monotonic() - started
+
+    assert result == truncated_tool_result
+    assert elapsed < 1.0
 
 
 def test_literal_incident_systemd_environment_string_is_redacted():
