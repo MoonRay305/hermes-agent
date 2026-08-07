@@ -651,7 +651,10 @@ def _redact_tool_named_values(text: str, names: Iterable[str]) -> str:
         rf"(?=(?<![A-Za-z0-9_.-])"
         rf"(?P<key_quote>['\"]?)(?P<name>[A-Za-z0-9_.-]{{1,128}})(?P=key_quote)"
         rf"(?P<separator>\s*(?:=|:)\s*)"
-        rf"(?:(?P<value_quote>['\"])(?P<quoted>(?:\\.|(?!['\"]).)*)(?P=value_quote)"
+        # Keep the alternatives disjoint and atomic. The previous pattern also
+        # allowed a backslash through its second alternative, which caused
+        # catastrophic backtracking on long, truncated escaped JSON strings.
+        rf"(?:(?P<value_quote>['\"])(?P<quoted>(?>\\.|[^\\'\"])*)(?P=value_quote)"
         rf"|(?P<bare>[^\s,;'\"}}\]]+)))",
     )
 
