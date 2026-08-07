@@ -14721,7 +14721,13 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
         return f"origin_mismatch origin={origin} bound={bound_host}"
 
     if not _is_accepted_host(parsed.netloc, bound_host):
-        return f"origin_mismatch origin={origin} bound={bound_host}"
+        # Desktop/WebView shells may render from a loopback origin even when
+        # the server is bound to an explicit LAN or Tailscale address. Keep
+        # unrelated web origins rejected while allowing that local bridge.
+        bound_is_loopback = bound_host.lower() in _LOOPBACK_HOST_VALUES
+        origin_is_loopback = _is_accepted_host(parsed.netloc, "localhost")
+        if bound_is_loopback or not origin_is_loopback:
+            return f"origin_mismatch origin={origin} bound={bound_host}"
     return None
 
 

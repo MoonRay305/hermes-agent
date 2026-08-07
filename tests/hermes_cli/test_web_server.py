@@ -3651,6 +3651,30 @@ class TestDashboardWebSocketOriginGuard:
             self._fake_ws("100.67.239.114:9119", "null")
         )
 
+    @pytest.mark.parametrize(
+        "origin",
+        ["http://localhost:9119", "https://127.0.0.1:9119"],
+    )
+    def test_allows_loopback_http_origin_on_non_loopback_bound_dashboard(
+        self, monkeypatch, origin
+    ):
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws.app.state, "bound_host", "100.67.239.114", raising=False)
+
+        assert ws._ws_host_origin_is_allowed(
+            self._fake_ws("100.67.239.114:9119", origin)
+        )
+
+    def test_rejects_unrelated_http_origin_on_non_loopback_bound_dashboard(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws.app.state, "bound_host", "100.67.239.114", raising=False)
+
+        assert not ws._ws_host_origin_is_allowed(
+            self._fake_ws("100.67.239.114:9119", "http://evil.example:9119")
+        )
+
 
 # ---------------------------------------------------------------------------
 # /api/pty WebSocket — terminal bridge for the dashboard "Chat" tab.
