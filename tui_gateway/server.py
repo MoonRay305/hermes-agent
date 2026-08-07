@@ -294,8 +294,10 @@ class _SlashWorker:
         self._closed = False
         from hermes_cli._subprocess_compat import windows_hide_flags
 
-        # slash_worker runs the Hermes agent → needs provider credentials.
-        # Tier-1 secrets (gateway/GitHub/infra) are still stripped (#29157).
+        # ``inherit_credentials=True`` is a compatibility no-op. The worker's
+        # imports re-hydrate provider credentials from its active profile .env
+        # with override=True (or from a configured secret source); ambient
+        # provider/AWS values stay denied.
         env = hermes_subprocess_env(inherit_credentials=True)
         if profile_home:
             # Global-remote / multi-profile sessions: the worker must resolve
@@ -11476,8 +11478,10 @@ def _(rid, params: dict) -> dict:
             text=True,
             timeout=min(int(params.get("timeout", 240)), 600),
             cwd=os.getcwd(),
-            # cli.exec runs `python -m hermes_cli.main` (can drive the agent) →
-            # needs provider credentials. Tier-1 secrets still stripped (#29157).
+            # ``inherit_credentials=True`` is a compatibility no-op. Importing
+            # hermes_cli.main re-hydrates provider credentials from the active
+            # profile .env with override=True (or from a configured secret source);
+            # ambient provider/AWS values stay denied.
             env=hermes_subprocess_env(inherit_credentials=True),
             stdin=subprocess.DEVNULL,
         )

@@ -707,6 +707,12 @@ class ProcessRegistry:
             started_at=time.time(),
         )
 
+        # Security note: both background launch paths below use ``-lic`` so the
+        # operator's login/interactive rc files (typically ~/.profile and
+        # ~/.bashrc) are re-sourced after the default-deny Popen env is applied.
+        # Secrets hardcoded there can therefore reach these children. The
+        # foreground LocalEnvironment path instead runs ``bash -c`` and sources
+        # only its filtered snapshot.
         if use_pty:
             # Try PTY mode for interactive CLI tools
             try:

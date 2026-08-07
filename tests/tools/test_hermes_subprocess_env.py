@@ -39,6 +39,19 @@ _OPAQUE_SAMPLE = {
     "QUARTZ": "opaque-secret-three",
 }
 
+_AWS_OPERATOR_SAMPLE = {
+    "AWS_ACCESS_KEY_ID": "sentinel-access",
+    "AWS_SECRET_ACCESS_KEY": "sentinel-secret",
+    "AWS_SESSION_TOKEN": "sentinel-session",
+    "AWS_PROFILE": "sentinel-profile",
+    "AWS_DEFAULT_REGION": "sentinel-default-region",
+    "AWS_REGION": "sentinel-region",
+    "AWS_SHARED_CREDENTIALS_FILE": "/sentinel/credentials",
+    "AWS_CONFIG_FILE": "/sentinel/config",
+    "AWS_WEB_IDENTITY_TOKEN_FILE": "/sentinel/web-token",
+    "AWS_ROLE_ARN": "sentinel-role",
+}
+
 
 def _build(extra=None, *, inherit_credentials=False):
     env = dict(_SAFE_SAMPLE)
@@ -120,6 +133,33 @@ class TestExplicitPassthrough:
         assert result.get("ORCHARD") == "explicit-value"
 
 
+class TestAwsOperatorBoundary:
+    def test_chain_observe_absent_at_boundary_four(self):
+        """Central non-terminal children never inherit the AWS operator chain."""
+        for inherit in (False, True):
+            result = _build(_AWS_OPERATOR_SAMPLE, inherit_credentials=inherit)
+            assert not (_AWS_OPERATOR_SAMPLE.keys() & result.keys())
+
+    def test_passthrough_cannot_promote_aws_at_boundary_four(self):
+        """Generic passthrough is not an escape hatch for boundary-4 AWS."""
+        from tools.env_passthrough import clear_env_passthrough, register_env_passthrough
+
+        clear_env_passthrough()
+        try:
+            register_env_passthrough(list(_AWS_OPERATOR_SAMPLE))
+            result = _build(_AWS_OPERATOR_SAMPLE)
+        finally:
+            clear_env_passthrough()
+
+        assert not (_AWS_OPERATOR_SAMPLE.keys() & result.keys())
+
+    def test_chain_observe_absent_from_snapshot_boundary(self):
+        from tools.environments.local import _snapshot_allowed_env_names
+
+        names = set(_snapshot_allowed_env_names(_AWS_OPERATOR_SAMPLE))
+        assert not (_AWS_OPERATOR_SAMPLE.keys() & names)
+
+
 class TestTierInvariants:
     def test_tier1_always_stripped_both_paths(self):
         """Behavioral invariant: every Tier-1 key is stripped on BOTH the
@@ -148,7 +188,7 @@ class TestBrowserPassthroughPattern:
     def test_browser_keys_recoverable_after_strip(self):
         """Browser tool pattern: strip everything, then re-add the browser
         backend keys agent-browser actually needs."""
-        from tools.browser_tool import _BROWSER_PASSTHROUGH_KEYS
+        from tools.browser_tool import _build_browser_env
 
         leaked = {
             "BROWSERBASE_API_KEY": "bb-key",
@@ -156,18 +196,17 @@ class TestBrowserPassthroughPattern:
             "FIRECRAWL_API_KEY": "fc-key",
             "ANTHROPIC_API_KEY": "ant-should-go",
             "TELEGRAM_BOT_TOKEN": "bot-should-go",
+            **_AWS_OPERATOR_SAMPLE,
         }
         with patch.dict(os.environ, {**_SAFE_SAMPLE, **leaked}, clear=True):
-            env = hermes_subprocess_env(inherit_credentials=False)
-            for key in _BROWSER_PASSTHROUGH_KEYS:
-                if key in os.environ:
-                    env[key] = os.environ[key]
+            env = _build_browser_env()
 
         assert env["BROWSERBASE_API_KEY"] == "bb-key"
         assert env["FIRECRAWL_API_KEY"] == "fc-key"
         # Provider + gateway secrets must NOT come back.
         assert "ANTHROPIC_API_KEY" not in env
         assert "TELEGRAM_BOT_TOKEN" not in env
+        assert not (_AWS_OPERATOR_SAMPLE.keys() & env.keys())
 
 
 _INTERNAL_DYNAMIC_SAMPLE = {

@@ -238,11 +238,13 @@ _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
 # these markers is safe and only prevents the cross-project clobber (#23473).
 _ACTIVE_VENV_MARKER_VARS = ("VIRTUAL_ENV", "CONDA_PREFIX")
 
-# Ambient subprocess inheritance is default-deny. These are the only
-# operator-owned credential/config names that retain the established AWS CLI
-# chain and Claude Code subscription login behavior. Everything else requires
-# an explicit terminal.env_passthrough/skill registration.
-_AMBIENT_OPERATOR_ENV_ALLOWLIST = frozenset({
+# The general AWS operator chain is available only at the two live terminal
+# boundaries: foreground ``_make_run_env`` and background/PTY
+# ``_sanitize_subprocess_env``. It is deliberately absent from the on-disk
+# snapshot and centralized non-terminal ``hermes_subprocess_env`` boundary.
+# A boundary-4 consumer that genuinely needs AWS must bind the exact values
+# after sanitization instead of widening the shared allowlist.
+_AWS_OPERATOR_ENV_VARS = frozenset({
     "AWS_ACCESS_KEY_ID",
     "AWS_CONFIG_FILE",
     "AWS_DEFAULT_REGION",
@@ -253,6 +255,13 @@ _AMBIENT_OPERATOR_ENV_ALLOWLIST = frozenset({
     "AWS_SHARED_CREDENTIALS_FILE",
     "AWS_SESSION_TOKEN",
     "AWS_WEB_IDENTITY_TOKEN_FILE",
+})
+
+# Ambient terminal inheritance is default-deny. These are the only
+# operator-owned credential/config names that retain established terminal
+# behavior. Everything else requires an exact terminal.env_passthrough/skill
+# registration.
+_AMBIENT_OPERATOR_ENV_ALLOWLIST = _AWS_OPERATOR_ENV_VARS | frozenset({
     "CLAUDE_CODE_OAUTH_TOKEN",
 })
 
@@ -320,18 +329,28 @@ def _is_ambient_env_allowed(name: str, is_passthrough) -> bool:
 
 
 def _snapshot_allowed_env_names(source_env: dict | None = None) -> list[str]:
-    """Return exact shell-variable names that a local snapshot may persist."""
+    """Return exact shell-variable names that a local snapshot may persist.
+
+    The AWS operator chain is live-terminal-only. Foreground commands receive
+    it independently in each filtered ``Popen`` environment, so persisting it
+    here is unnecessary and would expand the credential surface to boundary 3.
+    """
     try:
         from tools.env_passthrough import get_all_passthrough
         passthrough = set(get_all_passthrough())
     except Exception:
         passthrough = set()
 
-    names = set(_AMBIENT_OPERATOR_ENV_ALLOWLIST)
+    names = set(_AMBIENT_OPERATOR_ENV_ALLOWLIST - _AWS_OPERATOR_ENV_VARS)
     names.update(_SUBPROCESS_RUNTIME_ENV_ALLOWLIST)
-    names.update(passthrough)
+    names.update(
+        name for name in passthrough if name.upper() not in _AWS_OPERATOR_ENV_VARS
+    )
     for name in (source_env or {}):
-        if _is_ambient_env_allowed(name, passthrough.__contains__):
+        if (
+            name.upper() not in _AWS_OPERATOR_ENV_VARS
+            and _is_ambient_env_allowed(name, passthrough.__contains__)
+        ):
             names.add(name)
     # Bash variable names cannot contain characters such as parentheses even
     # though Windows' native environment can. Those values still reach Popen;
@@ -444,7 +463,11 @@ def _inject_session_context_env(env: dict) -> None:
 
 
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
-    """Build the default-deny background/PTY subprocess environment."""
+    """Build the default-deny background/PTY terminal environment.
+
+    This is terminal boundary 2, so the operator-owned AWS chain remains
+    available. Non-terminal children must use :func:`hermes_subprocess_env`.
+    """
     try:
         from tools.env_passthrough import is_env_passthrough as _is_passthrough
     except Exception:
@@ -527,13 +550,32 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
 })
 
 
-def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str]:
+def hermes_subprocess_env(
+    *,
+    inherit_credentials: bool = False,
+    base_env: dict[str, str] | None = None,
+) -> dict[str, str]:
     """Build the default-deny centralized non-terminal child environment.
 
     ``inherit_credentials`` remains a compatibility-only keyword for callers
     that used the former broad provider-key opt-in. It no longer widens ambient
     inheritance: callers must bind required values explicitly, or configure an
-    exact passthrough name.
+    exact passthrough name. ``base_env`` lets a consumer submit a prebuilt map
+    to the same policy; it is input to sanitize, not an explicit binding.
+
+    The AWS operator chain is denied at this boundary even when a generic
+    passthrough registration names it. CUA, browser, Codex, Copilot, and package
+    bootstrap children have no AWS consumer; any future consumer must add an
+    exact binding after this helper returns.
+
+    Model-driving Python children re-hydrate provider credentials at import
+    from the active ``HERMES_HOME/.env`` (loaded with ``override=True``) and
+    configured secret sources. A
+    deployment that supplies provider credentials only through ambient service
+    or shell environment (for example systemd ``Environment=``, ``docker -e``,
+    or ``export``) will therefore lose TUI-slash and ``cli.exec`` model access.
+    That is fail-closed behavior: persist the credentials to the profile .env
+    or configure a Hermes secret source.
     """
     try:
         from tools.env_passthrough import is_env_passthrough as _is_passthrough
@@ -542,9 +584,10 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
 
     env = {
         key: value
-        for key, value in os.environ.items()
+        for key, value in (os.environ if base_env is None else base_env).items()
         if not key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX)
         and not _is_hermes_internal_secret(key)
+        and key.upper() not in _AWS_OPERATOR_ENV_VARS
         and _is_ambient_env_allowed(key, _is_passthrough)
     }
 
@@ -1078,8 +1121,11 @@ class LocalEnvironment(BaseEnvironment):
         # environment snapshot), prepend sources for the user's bashrc /
         # custom init files so tools registered outside bash_profile
         # (nvm, asdf, pyenv, …) end up on PATH in the captured snapshot.
-        # Non-login invocations are already sourcing the snapshot and
-        # don't need this.
+        # Non-login invocations are already sourcing the snapshot and don't
+        # need this. Provider and AWS credentials hardcoded in rc files can
+        # exist during bootstrap, but the snapshot allowlist excludes them;
+        # foreground operator AWS values come only from the per-spawn filtered
+        # Popen environment; ambient provider values remain denied.
         if login:
             init_files = _resolve_shell_init_files()
             if init_files:

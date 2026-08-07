@@ -136,9 +136,9 @@ def cua_driver_child_env(base_env: Optional[Dict[str, str]] = None) -> Dict[str,
     every cua-driver spawn site (MCP backend, status, doctor, install) so both
     policies are applied consistently.
     """
-    from tools.environments.local import _sanitize_subprocess_env
+    from tools.environments.local import hermes_subprocess_env
 
-    env = _sanitize_subprocess_env(base_env if base_env is not None else os.environ)
+    env = hermes_subprocess_env(base_env=base_env)
     if _cua_telemetry_disabled():
         env[_CUA_TELEMETRY_ENV_VAR] = "0"
     return env

@@ -78,3 +78,23 @@ class TestChildEnv:
             env = cua_backend.cua_driver_child_env()
             assert "SOME_MARKER" not in env
             assert env[_VAR] == "0"
+
+    def test_aws_operator_chain_is_absent(self):
+        aws_names = {
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_PROFILE",
+            "AWS_CONFIG_FILE",
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+            "AWS_ROLE_ARN",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+        }
+        base = {name: f"sentinel-{name}" for name in aws_names}
+
+        with patch.object(cua_backend, "_cua_telemetry_disabled", return_value=True):
+            env = cua_backend.cua_driver_child_env(base)
+
+        assert not (aws_names & env.keys())

@@ -50,9 +50,9 @@ def _cua_child_env() -> Dict[str, str]:
         return cua_driver_child_env()
     except Exception:
         try:
-            from tools.environments.local import _sanitize_subprocess_env
+            from tools.environments.local import hermes_subprocess_env
 
-            return _sanitize_subprocess_env(os.environ)
+            return hermes_subprocess_env()
         except Exception:
             return {}
 

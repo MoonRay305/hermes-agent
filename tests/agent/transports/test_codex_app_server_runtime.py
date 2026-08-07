@@ -365,6 +365,26 @@ class TestSpawnEnvSecretStripping:
         env = self._capture_spawn_env(monkeypatch)
         assert "OPENAI_API_KEY" not in env
 
+    def test_aws_operator_chain_does_not_reach_codex(self, monkeypatch):
+        aws_names = {
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_PROFILE",
+            "AWS_CONFIG_FILE",
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+            "AWS_ROLE_ARN",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+        }
+        for name in aws_names:
+            monkeypatch.setenv(name, f"sentinel-{name}")
+
+        env = self._capture_spawn_env(monkeypatch)
+
+        assert not (aws_names & env.keys())
+
     def test_explicit_provider_binding_reaches_codex(self, monkeypatch):
         env = self._capture_spawn_env(
             monkeypatch,

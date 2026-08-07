@@ -137,8 +137,7 @@ class TestProviderEnvBlocklist:
         assert "GOOGLE_APPLICATION_CREDENTIALS" not in result_env
 
     def test_general_aws_credential_chain_is_preserved(self):
-        """The GENERAL AWS credential chain must STILL pass through to
-        subprocesses — this is the no-regression guard for #32314.
+        """Terminal boundary 1 preserves the general AWS credential chain.
 
         Per SECURITY.md §3.2 the local terminal is the user's trusted operator
         shell. A user running ``aws``/``terraform``/``cdk``/``boto3`` in the
@@ -169,6 +168,27 @@ class TestProviderEnvBlocklist:
                 f"{var} was stripped from subprocess env — this is a "
                 f"capability regression (see #32314 discussion)"
             )
+
+    def test_general_aws_chain_is_preserved_for_background_and_pty(self):
+        """Terminal boundary 2 keeps AWS for both background launch shapes."""
+        from tools.environments.local import _sanitize_subprocess_env
+
+        general_chain = {
+            "AWS_ACCESS_KEY_ID": "sentinel-access",
+            "AWS_SECRET_ACCESS_KEY": "sentinel-secret",
+            "AWS_SESSION_TOKEN": "sentinel-session",
+            "AWS_PROFILE": "sentinel-profile",
+            "AWS_DEFAULT_REGION": "sentinel-default-region",
+            "AWS_REGION": "sentinel-region",
+            "AWS_SHARED_CREDENTIALS_FILE": "/sentinel/credentials",
+            "AWS_CONFIG_FILE": "/sentinel/config",
+            "AWS_WEB_IDENTITY_TOKEN_FILE": "/sentinel/web-token",
+            "AWS_ROLE_ARN": "sentinel-role",
+        }
+
+        result_env = _sanitize_subprocess_env(general_chain)
+
+        assert {name: result_env.get(name) for name in general_chain} == general_chain
 
     def test_non_registry_provider_vars_are_stripped(self):
         """Extra provider vars not in PROVIDER_REGISTRY must also be blocked."""
