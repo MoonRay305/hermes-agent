@@ -1251,6 +1251,107 @@ def run_conversation(
                 except Exception:
                     pass
 
+                # Pre-send sensitivity gate for local providers (BUI-370).
+                #
+                # Deliberately placed *after* apply_llm_request_middleware and
+                # the pre_api_request hook: both can rewrite api_kwargs, so this
+                # is the earliest point at which classifying is meaningful.
+                # Gating before them would let a middleware or plugin inject
+                # sensitive content past the gate.
+                #
+                # It is NOT the last point, though, and this check alone is not
+                # sufficient.  run_llm_execution_middleware() (below) wraps the
+                # provider call, and its contract lets a callback rewrite the
+                # payload via next_call(modified_request) — i.e. after this
+                # check has already cleared the request.  The authoritative
+                # check is therefore the one at the terminal send boundary, in
+                # _perform_api_call; this one runs first so that an obviously
+                # sensitive request is refused before any middleware observes
+                # it at all, and so a denial still happens when the failure is
+                # in the gate itself rather than in the payload.
+                #
+                # Fails closed: if the gate cannot reach a decision, the send is
+                # blocked rather than allowed.  _sensitivity_block is set instead
+                # of returning from inside the except clause so the block path is
+                # identical whether the gate denied or failed to evaluate.
+                _gate_module = None
+                _gate_import_block = None
+                try:
+                    from agent import local_provider_sensitivity_gate as _gate_module
+                except Exception as _gate_import_error:  # pragma: no cover - module ships with the agent
+                    _gate_import_block = (
+                        "Local provider sensitivity gate could not be loaded "
+                        f"({type(_gate_import_error).__name__}); refusing to send. "
+                        "The gate fails closed by design."
+                    )
+
+                def _gate_messages_for(candidate_kwargs):
+                    _msgs = candidate_kwargs.get("messages")
+                    if not isinstance(_msgs, list):
+                        _msgs = candidate_kwargs.get("input")
+                    if not isinstance(_msgs, list):
+                        _msgs = api_messages
+                    return _msgs
+
+                def _gate_failure(candidate_kwargs):
+                    """Return the exception blocking *candidate_kwargs*, or None.
+
+                    Shared by the pre-chain check and the terminal re-check so
+                    that a payload cannot be cleared by one and skipped by the
+                    other: both classify through exactly this code path.
+                    """
+                    if _gate_module is None:
+                        return RuntimeError(_gate_import_block)
+                    try:
+                        _gate_module.assert_local_provider_request_allowed(
+                            provider=agent.provider,
+                            base_url=agent.base_url,
+                            model=agent.model,
+                            messages=_gate_messages_for(candidate_kwargs),
+                        )
+                    except _gate_module.LocalProviderSensitivityBlocked as _exc:
+                        return _exc
+                    return None
+
+                def _gate_fingerprint(candidate_kwargs):
+                    """Canonical gate text for *candidate_kwargs*, or None.
+
+                    None means "could not be computed", which callers must treat
+                    as "assume it changed" — never as "unchanged".
+                    """
+                    if _gate_module is None:
+                        return None
+                    try:
+                        return _gate_module.canonical_request_text(
+                            _gate_messages_for(candidate_kwargs)
+                        )
+                    except Exception:
+                        return None
+
+                _sensitivity_exc = _gate_failure(api_kwargs)
+                _sensitivity_block = (
+                    str(_sensitivity_exc) if _sensitivity_exc is not None else None
+                )
+                _gated_fingerprint = (
+                    _gate_fingerprint(api_kwargs) if _sensitivity_block is None else None
+                )
+
+                if _sensitivity_block is not None:
+                    if thinking_spinner:
+                        thinking_spinner.stop("")
+                        thinking_spinner = None
+                    if agent.thinking_callback:
+                        agent.thinking_callback("")
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": _sensitivity_block,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "error": _sensitivity_block,
+                    }
+
                 if env_var_enabled("HERMES_DUMP_REQUESTS"):
                     agent._dump_api_request_debug(api_kwargs, reason="preflight")
 
@@ -1308,7 +1409,37 @@ def run_conversation(
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
 
+                # Terminal send boundary for the sensitivity gate (BUI-370).
+                #
+                # This is the last line of Hermes' own code before the payload
+                # is handed to the provider client, so it is the only place a
+                # gate decision is binding.  Every execution-middleware frame
+                # between the pre-chain check and here may hand a *different*
+                # dict down next_call(), so the exact next_api_kwargs is
+                # re-classified rather than trusting the earlier verdict.
+                #
+                # The re-check is skipped only when the canonical gate text is
+                # byte-identical to what was already cleared — the common case
+                # of no execution middleware registered, where the same object
+                # arrives unchanged.  A fingerprint that differs, or that could
+                # not be computed at all, re-runs the full gate.
+                _terminal_gate = {"reached": False, "block": None}
+
                 def _perform_api_call(next_api_kwargs):
+                    _terminal_gate["reached"] = True
+                    _next_fingerprint = _gate_fingerprint(next_api_kwargs)
+                    if (
+                        _gated_fingerprint is None
+                        or _next_fingerprint is None
+                        or _next_fingerprint != _gated_fingerprint
+                    ):
+                        _late_failure = _gate_failure(next_api_kwargs)
+                        if _late_failure is not None:
+                            # Recorded as well as raised: a middleware frame is
+                            # allowed to swallow downstream exceptions, and a
+                            # swallowed block must not read as a successful send.
+                            _terminal_gate["block"] = str(_late_failure)
+                            raise _late_failure
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -1317,23 +1448,70 @@ def run_conversation(
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
-                response = run_llm_execution_middleware(
-                    api_kwargs,
-                    _perform_api_call,
-                    original_request=_original_api_kwargs,
-                    task_id=effective_task_id,
-                    turn_id=turn_id,
-                    api_request_id=api_request_id,
-                    session_id=agent.session_id or "",
-                    platform=agent.platform or "",
-                    model=agent.model,
-                    provider=agent.provider,
-                    base_url=agent.base_url,
-                    api_mode=agent.api_mode,
-                    api_call_count=api_call_count,
-                    middleware_trace=list(_llm_middleware_trace),
-                )
-                
+                response = None
+                try:
+                    response = run_llm_execution_middleware(
+                        api_kwargs,
+                        _perform_api_call,
+                        original_request=_original_api_kwargs,
+                        task_id=effective_task_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        session_id=agent.session_id or "",
+                        platform=agent.platform or "",
+                        model=agent.model,
+                        provider=agent.provider,
+                        base_url=agent.base_url,
+                        api_mode=agent.api_mode,
+                        api_call_count=api_call_count,
+                        middleware_trace=list(_llm_middleware_trace),
+                    )
+                except Exception as _chain_exc:
+                    # A terminal-gate denial normally propagates out of the chain
+                    # unless a middleware swallowed it.  Catch it here so both
+                    # outcomes land on the identical block path below; anything
+                    # else is a real transport failure and keeps its own handling.
+                    if _terminal_gate["block"] is None:
+                        raise
+                    del _chain_exc
+
+                if _terminal_gate["block"] is not None:
+                    # The terminal check denied.  Authoritative even if a
+                    # middleware caught the exception and returned a response of
+                    # its own: that response describes a send that did not happen.
+                    _sensitivity_block = _terminal_gate["block"]
+                elif not _terminal_gate["reached"]:
+                    # No frame ever called next_call() through to the agent's own
+                    # send, so an llm_execution middleware performed the provider
+                    # call itself. Whatever it sent, Hermes never saw it and could
+                    # not have gated it -- this is detection after the fact, not
+                    # prevention. See evaluate_unmediated_execution().
+                    if _gate_module is not None:
+                        try:
+                            _gate_module.assert_mediated_execution(
+                                provider=agent.provider,
+                                base_url=agent.base_url,
+                                model=agent.model,
+                            )
+                        except _gate_module.LocalProviderSensitivityBlocked as _unmediated_exc:
+                            _sensitivity_block = str(_unmediated_exc)
+
+                if _sensitivity_block is not None:
+                    if thinking_spinner:
+                        thinking_spinner.stop("")
+                        thinking_spinner = None
+                    if agent.thinking_callback:
+                        agent.thinking_callback("")
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": _sensitivity_block,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "error": _sensitivity_block,
+                    }
+
                 api_duration = time.time() - api_start_time
                 
                 # Stop thinking spinner silently -- the response box or tool

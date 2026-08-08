@@ -654,6 +654,47 @@ model:
   context_length: 64000   # See warning below
 ```
 
+:::caution Local-route sensitivity gate — read what it does and does not guarantee
+Before Hermes sends a request to a local provider (Ollama, LM Studio, llama.cpp, localhost/private-IP custom endpoints), it classifies the outbound request and denies sensitive data classes — client, legal, financial, trading, personal health, private, production, and secrets — unless the current worker contract or `local_provider_sensitivity.approved_routes` explicitly approves that provider/model/base URL for every detected class.
+
+**What this does not mean.** On a stock install, nothing declares a data class, so the gate is running on **content matching alone — a best-effort backstop that will miss things**. It is not a guarantee that sensitive data cannot reach a local model. Treat an undeclared local route as filtered, not as safe. If that is not good enough for your deployment, turn on strict mode (below).
+
+Two signals feed the classification:
+
+- **The declared data class** — `HERMES_DATA_CLASS`, or `worker_contract.data_class` — is authoritative and applies regardless of message content. **If you route sensitive work to a local model, declare it here.** This is the signal to rely on. Hermes never sets it for you; it is operator input, and it is unset until you set it.
+- **Content matching** is the backstop when nothing is declared. It looks for credential shapes (private keys, bearer tokens, `KEY=value` assignments, provider tokens, AWS keys, connection strings), topic phrases such as `client file`, `medical record`, `wire transfer`, `production credentials`, and a small set of high-signal bare words (`counsel`, `subpoena`, `invoice`, `prognosis`, …).
+
+  Most matching is phrase-anchored on purpose. Bare words like `client`, `production`, `options` and `symptom` appear in `AGENTS.md`, which is embedded verbatim into Hermes' own system prompt — matching them denied **100% of local requests**, which is an outage, not a control. Bare words are only used where they were measured to be absent from the system prompt and effectively absent from ordinary source and docs. The practical consequence: ordinary-sounding sensitive prose (*"the client asked about the production rollout"*) **passes an undeclared local route**. Declare the data class if that matters to you.
+
+**Strict mode — require an explicit declaration.** Set `local_provider_sensitivity.require_declared_data_class: true` (or `HERMES_REQUIRE_DECLARED_DATA_CLASS=1`) and any local route with no declared data class is denied outright, before content matching gets a vote. This is the setting that turns "best-effort filtering" into an actual guarantee. It is **off by default** deliberately: because nothing declares out of the box, defaulting it on would deny every local-provider request on a fresh install.
+
+The gate **fails closed**. If it cannot reach a decision — unreadable or unparseable config, an unexpected payload shape, an internal error — the request is blocked rather than sent, and the block is reported separately from a policy denial. A failure evaluating a *non-local* route is allowed through, since this gate has no jurisdiction over cloud providers.
+
+**Where the gate runs, and the one gap it cannot close.** The decision is made at the *terminal send boundary* — the last point in Hermes' own code before the payload reaches the provider client. That is deliberately after request middleware, after the `pre_api_request` hook, and after every `llm_execution` middleware frame, so the bytes that are classified are the bytes that actually leave. A middleware that rewrites the request and passes it down `next_call()` is fully covered: its rewritten payload is re-classified before it goes anywhere.
+
+An `llm_execution` middleware is not obliged to call `next_call()`. One that opens its own connection to the provider and returns a response never routes through any code Hermes controls, so **there is no interposition point and that send cannot be gated**. Hermes only learns it happened once the middleware chain returns, by which time the request is gone. Such a turn is always written to the audit log, so it is visible rather than silently assumed clean. Setting `local_provider_sensitivity.require_mediated_execution: true` (or `HERMES_REQUIRE_MEDIATED_EXECUTION=1`) additionally fails the turn and discards the middleware's response — containment, not prevention. It is off by default because a response cache or offline-replay middleware legitimately answers without calling `next_call()`, and Hermes cannot distinguish that from a self-send. If you need the strong guarantee, do not register unmediated execution middleware on a local route; treat a block from this flag as a plugin to remove, not a setting to switch off.
+
+Set `local_provider_sensitivity.enabled: false` (or `HERMES_LOCAL_PROVIDER_SENSITIVITY_GATE=0`) to turn the gate off entirely. That is an explicit operator decision and is honoured; it is not the same as the gate failing.
+
+Example approval shape:
+
+```yaml
+worker_contract:
+  data_class: personal_health
+  allowed_model_routes:
+    - provider: custom
+      base_url: http://localhost:11434/v1
+      model: qwen2.5-coder:32b
+      data_classes: [personal_health, private]
+      approved: true
+      approval_id: local-personal-health-route-approval
+```
+
+Approval entries must declare non-empty `data_classes`/`allowed_data_classes` coverage. Use `data_classes: ["*"]` only for an intentionally broad local-route approval.
+
+Denials write only hashes, counts, host/model metadata, and sanitized class labels to `~/.hermes/logs/local_provider_sensitivity_gate.jsonl` and the central agent log. Raw prompts, secret values, config-specific labels, and raw approval IDs are not logged.
+:::
+
 :::caution Ollama defaults to very low context lengths
 Ollama does **not** use your model's full context window by default. Depending on your VRAM, the default is:
 
