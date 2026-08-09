@@ -16,6 +16,46 @@ def _ensure_redaction_enabled(monkeypatch):
 
 
 class TestKnownPrefixes:
+    SYNTHETIC_GLUED_TOKEN = "sk-proj-abc123def456ghi789jkl012"
+
+    def test_credential_redacted_after_underscore(self):
+        result = redact_sensitive_text(
+            "_" + self.SYNTHETIC_GLUED_TOKEN,
+            force=True,
+        )
+        assert self.SYNTHETIC_GLUED_TOKEN not in result
+        assert result.startswith("_")
+
+    def test_credential_redacted_after_hyphen(self):
+        result = redact_sensitive_text(
+            "-" + self.SYNTHETIC_GLUED_TOKEN,
+            force=True,
+        )
+        assert self.SYNTHETIC_GLUED_TOKEN not in result
+        assert result.startswith("-")
+
+    def test_credential_redacted_after_alphanumeric(self):
+        result = redact_sensitive_text(
+            "A" + self.SYNTHETIC_GLUED_TOKEN,
+            force=True,
+        )
+        assert self.SYNTHETIC_GLUED_TOKEN not in result
+        assert result.startswith("A")
+
+    def test_ordinary_credential_named_code_syntax_is_unchanged(self):
+        source_shapes = (
+            "api_key: Optional[str] = None",
+            "token: str",
+            "api_key=api_key",
+        )
+
+        for source in source_shapes:
+            assert redact_sensitive_text(source, force=True, code_file=True) == source
+
+    def test_letter_only_identifier_suffix_is_not_a_glued_credential(self):
+        source = "program_state_identifier = upstream_state_identifier"
+        assert redact_sensitive_text(source, force=True, code_file=True) == source
+
     def test_openai_sk_key(self):
         text = "Using key sk-proj-abc123def456ghi789jkl012"
         result = redact_sensitive_text(text)
@@ -378,6 +418,24 @@ class TestRedactingFormatter:
 
         assert bcrypt not in result
         assert "[REDACTED:BCRYPT_2B]" in result
+
+    def test_redacts_when_preferences_are_disabled(self, monkeypatch):
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+        token = "sk-proj-SYNTHETIC0123456789abcdef"
+        formatter = RedactingFormatter("%(message)s")
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg="credential=" + token,
+            args=(),
+            exc_info=None,
+        )
+
+        result = formatter.format(record)
+
+        assert token not in result
 
 
 class TestPrintenvSimulation:

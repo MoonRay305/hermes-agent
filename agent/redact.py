@@ -853,10 +853,24 @@ _FORM_BODY_RE = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_.-]*=[^&\s]*(?:&[A-Za-z_][A-Za-z0-9_.-]*=[^&\s]*)+$"
 )
 
-# Compile known prefix patterns into one alternation
+# Compile known prefix patterns into one alternation. The left edge is
+# intentionally unanchored so an adjacent character cannot hide a credential.
+# A replacement-time credential-shape guard below preserves ordinary source
+# identifiers whose suffix happens to look like a letter-only token prefix.
 _PREFIX_RE = re.compile(
-    r"(?<![A-Za-z0-9_-])(" + "|".join(_PREFIX_PATTERNS) + r")(?![A-Za-z0-9_-])"
+    r"(" + "|".join(_PREFIX_PATTERNS) + r")(?![A-Za-z0-9_-])"
 )
+_PREFIX_GLUE_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+)
+
+
+def _is_redactable_prefix_match(match: re.Match) -> bool:
+    """Require a digit when a known-prefix token is glued on the left."""
+    start = match.start(1)
+    if start == 0 or match.string[start - 1] not in _PREFIX_GLUE_CHARS:
+        return True
+    return any(char.isdigit() for char in match.group(1))
 
 
 def mask_secret(
@@ -1097,7 +1111,14 @@ def redact_sensitive_text(
     # Known prefixes (sk-, ghp_, etc.) — gate on substring presence
     if _has_known_prefix_substring(text):
         _prefix_sub = _mask_token_nonreusable if file_read else _mask_token
-        text = _PREFIX_RE.sub(lambda m: _prefix_sub(m.group(1)), text)
+        text = _PREFIX_RE.sub(
+            lambda m: (
+                _prefix_sub(m.group(1))
+                if _is_redactable_prefix_match(m)
+                else m.group(1)
+            ),
+            text,
+        )
 
     # ENV assignments: OPENAI_API_KEY=***  (skip for code files — false positives)
     if not code_file:
@@ -1363,7 +1384,7 @@ class RedactingFormatter(logging.Formatter):
         original = super().format(record)
         # Preserve the formatter's established legacy placeholders, then add
         # the tool-output-only classes that the legacy pass does not cover.
-        redacted = redact_sensitive_text(original)
+        redacted = redact_sensitive_text(original, force=True)
         return _redact_tool_output_classes(
             redacted,
             resolve_tool_output_redaction_policy(),
