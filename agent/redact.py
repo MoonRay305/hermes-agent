@@ -853,24 +853,120 @@ _FORM_BODY_RE = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_.-]*=[^&\s]*(?:&[A-Za-z_][A-Za-z0-9_.-]*=[^&\s]*)+$"
 )
 
-# Compile known prefix patterns into one alternation. The left edge is
-# intentionally unanchored so an adjacent character cannot hide a credential.
-# A replacement-time credential-shape guard below preserves ordinary source
-# identifiers whose suffix happens to look like a letter-only token prefix.
+# Compile known prefix patterns into one alternation. The left edge stays
+# unanchored because credentials can be concatenated with punctuation or an
+# identifier. Replacement-time context and credential-shape checks distinguish
+# those values from prefix-like substrings in ordinary repository content.
 _PREFIX_RE = re.compile(
     r"(" + "|".join(_PREFIX_PATTERNS) + r")(?![A-Za-z0-9_-])"
 )
-_PREFIX_GLUE_CHARS = frozenset(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+_PREFIX_IDENTIFIER_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_"
 )
+_PREFIX_BASE64_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_+/=-"
+)
+_PREFIX_GLUED_MIN_BODY_LENGTH = 16
+_PREFIX_GLUED_ENTROPY_FLOOR = 4.25
+_PREFIX_GLUED_SINGLE_CLASS_ENTROPY_FLOOR = 4.5
+_PREFIX_GAAAA_MIN_BODY_LENGTH = 32
+_PREFIX_GAAAA_ENTROPY_FLOOR = 4.25
+
+
+def _prefix_literal_and_body(token: str) -> tuple[str, str]:
+    """Split a matched token at its longest mandatory literal prefix."""
+    prefix = max(
+        (item for item in _PREFIX_SUBSTRINGS if item and token.startswith(item)),
+        key=len,
+        default="",
+    )
+    return prefix, token[len(prefix):].lstrip("._-")
+
+
+def _prefix_token_span(text: str, start: int, end: int) -> tuple[int, int]:
+    """Return the surrounding non-whitespace token span for context checks."""
+    delimiters = frozenset(" \t\r\n\"'`<>{}[]()")
+    left = start
+    while left > 0 and text[left - 1] not in delimiters:
+        left -= 1
+    right = end
+    while right < len(text) and text[right] not in delimiters:
+        right += 1
+    return left, right
+
+
+def _is_prefix_match_in_url_or_path(match: re.Match) -> bool:
+    text = match.string
+    start, end = match.span(1)
+    left, right = _prefix_token_span(text, start, end)
+    surrounding = text[left:right]
+    relative_start = start - left
+    if "://" in surrounding[:relative_start]:
+        return True
+    if "/" in surrounding or "\\" in surrounding:
+        return True
+    return bool(
+        re.match(r"sha(?:1|224|256|384|512)-", surrounding, re.IGNORECASE)
+    )
+
+
+def _is_prefix_match_in_base64_run(match: re.Match) -> bool:
+    text = match.string
+    start, end = match.span(1)
+    left = start
+    while left > 0 and text[left - 1] in _PREFIX_BASE64_CHARS:
+        left -= 1
+    right = end
+    while right < len(text) and text[right] in _PREFIX_BASE64_CHARS:
+        right += 1
+    # A short glue character is allowed. A long adjacent alphabet run means
+    # the vendor-looking prefix was found inside a larger encoded payload.
+    return start - left >= 12 or right - end >= 12
+
+
+def _prefix_body_charset_classes(value: str) -> int:
+    return sum(
+        (
+            any(char.islower() for char in value),
+            any(char.isupper() for char in value),
+            any(char.isdigit() for char in value),
+            any(char in "_+/=-." for char in value),
+        )
+    )
+
+
+def _has_glued_credential_shape(body: str) -> bool:
+    if len(body) < _PREFIX_GLUED_MIN_BODY_LENGTH:
+        return False
+    entropy = _shannon_entropy_per_character(body)
+    if entropy < _PREFIX_GLUED_ENTROPY_FLOOR:
+        return False
+    return (
+        _prefix_body_charset_classes(body) >= 2
+        or entropy >= _PREFIX_GLUED_SINGLE_CLASS_ENTROPY_FLOOR
+    )
 
 
 def _is_redactable_prefix_match(match: re.Match) -> bool:
-    """Require a digit when a known-prefix token is glued on the left."""
+    """Reject repository substrings while retaining glued credentials."""
+    prefix, body = _prefix_literal_and_body(match.group(1))
     start = match.start(1)
-    if start == 0 or match.string[start - 1] not in _PREFIX_GLUE_CHARS:
+    if start >= 2 and match.string[start - 2:start] == "--":
+        # CSS custom properties such as ``--sk-focus-color`` are identifiers,
+        # not a secret glued to a single hyphen.
+        return False
+    if prefix == "gAAAA":
+        if (
+            len(body) < _PREFIX_GAAAA_MIN_BODY_LENGTH
+            or _shannon_entropy_per_character(body) < _PREFIX_GAAAA_ENTROPY_FLOOR
+        ):
+            return False
+
+    if start == 0 or match.string[start - 1] not in _PREFIX_IDENTIFIER_CHARS:
         return True
-    return any(char.isdigit() for char in match.group(1))
+    if _is_prefix_match_in_url_or_path(match) or _is_prefix_match_in_base64_run(match):
+        return False
+    return _has_glued_credential_shape(body)
 
 
 def mask_secret(

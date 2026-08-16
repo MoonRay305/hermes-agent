@@ -1,10 +1,62 @@
 """Tests for agent.redact -- secret masking in logs and output."""
 
 import logging
+import subprocess
+from collections import Counter
+from pathlib import Path
 
 import pytest
 
+from agent import redact as redact_module
 from agent.redact import redact_cdp_url, redact_sensitive_text, RedactingFormatter
+
+
+PREFIX_CREDENTIAL_SAMPLES = (
+    "sk-proj-Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "ghp_Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "github_pat_Ab3Cd4Ef5Gh6_Ij7Kl8Mn9Op0",
+    "gho_Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "ghu_Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "ghs_Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "ghr_Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "xapp-1-Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "xoxb-Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "AIzaAb3Cd4Ef5Gh6Ij7Kl8Mn9Op0Qr1St2Uv3",
+    "pplx-Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "fal_Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "fc-Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "bb_live_Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "gAAAAAb3Cd4Ef5Gh6Ij7Kl8Mn9Op0Qr1St2Uv3Wx4Yz5_-",
+    "AKIAAB3CD4EF5GH6IJ7K",
+    "sk" + "_live_Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "sk" + "_test_Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "rk" + "_live_Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "SG.Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "hf_Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "r8_Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "npm_Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "pypi-Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "dop_v1_Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "doo_v1_Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "dp.st.prd.Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "am_Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "sk_Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "tvly-Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "exa_Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "gsk_Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "syt_Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "retaindb_Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "hsk-Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "mem0_Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "brv_Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "xai-Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0Qr1St2Uv3",
+    "ntn_Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0",
+    "fw-Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0Qr1St2Uv3",
+    "fw_Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0Qr1St2Uv3",
+    "fpk_Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0Qr1St2Uv3",
+)
+
+assert len(PREFIX_CREDENTIAL_SAMPLES) == len(redact_module._PREFIX_PATTERNS)
 
 
 @pytest.fixture(autouse=True)
@@ -17,6 +69,7 @@ def _ensure_redaction_enabled(monkeypatch):
 
 class TestKnownPrefixes:
     SYNTHETIC_GLUED_TOKEN = "sk-proj-abc123def456ghi789jkl012"
+    SYNTHETIC_NO_DIGIT_GLUED_TOKEN = "sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz"
 
     def test_credential_redacted_after_underscore(self):
         result = redact_sensitive_text(
@@ -42,6 +95,23 @@ class TestKnownPrefixes:
         assert self.SYNTHETIC_GLUED_TOKEN not in result
         assert result.startswith("A")
 
+    def test_credential_redacted_after_asterisk(self):
+        result = redact_sensitive_text(
+            "*" + self.SYNTHETIC_GLUED_TOKEN,
+            force=True,
+        )
+        assert self.SYNTHETIC_GLUED_TOKEN not in result
+        assert result.startswith("*")
+
+    @pytest.mark.parametrize("glue", ["_", "-", "A", "*"])
+    def test_no_digit_credential_redacted_when_glued(self, glue):
+        result = redact_sensitive_text(
+            glue + self.SYNTHETIC_NO_DIGIT_GLUED_TOKEN,
+            force=True,
+        )
+        assert self.SYNTHETIC_NO_DIGIT_GLUED_TOKEN not in result
+        assert result.startswith(glue)
+
     def test_ordinary_credential_named_code_syntax_is_unchanged(self):
         source_shapes = (
             "api_key: Optional[str] = None",
@@ -52,8 +122,35 @@ class TestKnownPrefixes:
         for source in source_shapes:
             assert redact_sensitive_text(source, force=True, code_file=True) == source
 
-    def test_letter_only_identifier_suffix_is_not_a_glued_credential(self):
-        source = "program_state_identifier = upstream_state_identifier"
+    @pytest.mark.parametrize(
+        "source",
+        (
+            "program_state_identifier = upstream_state_identifier",
+            "program_state_identifier2 = upstream_state_identifier2",
+        ),
+    )
+    def test_identifier_suffix_is_not_a_glued_credential(self, source):
+        assert redact_sensitive_text(source, force=True, code_file=True) == source
+
+    @pytest.mark.parametrize(
+        "source",
+        (
+            "https://registry.npmjs.org/mdast-util-gfm-task-list-item/-/mdast-util-gfm-task-list-item-2.0.0.tgz",
+            "wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth",
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQAB",
+            "def test_seam_rejects_missing_token_401():",
+            "handler.program_state_identifier2",
+            "/tmp/build/task-list-item-2.0.0/output.json",
+            "sha512-iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQAB",
+            '<div class="program_state_identifier2 task-list-item-2">',
+            ".component.program_state_identifier2 { color: red; }",
+            "--sk-focus-color: #0071e3;",
+            "registry.example.com/program_state_identifier2:2026.08",
+            "app.kubernetes.io/program_state_identifier2: enabled",
+            ".pnpm/mdast-util-gfm-task-list-item@2.0.0/node_modules/package/index.js",
+        ),
+    )
+    def test_repository_shapes_are_not_corrupted(self, source):
         assert redact_sensitive_text(source, force=True, code_file=True) == source
 
     def test_openai_sk_key(self):
@@ -436,6 +533,82 @@ class TestRedactingFormatter:
         result = formatter.format(record)
 
         assert token not in result
+
+    @pytest.mark.parametrize("token", PREFIX_CREDENTIAL_SAMPLES)
+    def test_every_prefix_class_redacts_when_preferences_are_disabled(
+        self,
+        monkeypatch,
+        token,
+    ):
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+        formatter = RedactingFormatter("%(message)s")
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg="credential=" + token,
+            args=(),
+            exc_info=None,
+        )
+
+        assert token not in formatter.format(record)
+
+
+def _redaction_corpus_bucket(relative_path: str) -> str:
+    """Bucket tracked content; lockfiles take precedence over their root."""
+    normalized = relative_path.replace("\\", "/")
+    parts = normalized.split("/")
+    basename = parts[-1].casefold()
+    if (
+        basename in {"package-lock.json", "pnpm-lock.yaml", "yarn.lock", "uv.lock"}
+        or parts[0].casefold() in {"vendor", "third_party", "node_modules"}
+    ):
+        return "vendor"
+    if parts[0].casefold() == "tests":
+        return "test"
+    if (
+        parts[0].casefold() in {"docs", "website"}
+        or Path(basename).suffix in {".md", ".mdx", ".rst"}
+    ):
+        return "docs"
+    return "source"
+
+
+def test_tracked_tree_prefix_redaction_ceiling():
+    """Prevent source/vendor false positives from exceeding the base tree.
+
+    Counts one accepted known-prefix regex match as one hit. UTF-8 tracked
+    files are scanned; binary and non-UTF-8 files are skipped. The pinned
+    ceilings are the counts measured at base commit 71ad038e under these exact
+    bucket rules. Test and docs totals remain visible in the failure message
+    but are not ceilings because those buckets intentionally contain examples.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    tracked = subprocess.check_output(
+        ["git", "ls-files", "-z"],
+        cwd=repo_root,
+    ).decode("utf-8").split("\0")
+    counts = Counter({bucket: 0 for bucket in ("test", "source", "docs", "vendor")})
+
+    for relative_path in filter(None, tracked):
+        try:
+            text = (repo_root / relative_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for match in redact_module._PREFIX_RE.finditer(text):
+            if redact_module._is_redactable_prefix_match(match):
+                counts[_redaction_corpus_bucket(relative_path)] += 1
+
+    ceilings = {"source": 19, "vendor": 0}
+    exceeded = {
+        bucket: {"actual": counts[bucket], "ceiling": ceiling}
+        for bucket, ceiling in ceilings.items()
+        if counts[bucket] > ceiling
+    }
+
+    assert _redaction_corpus_bucket("package-lock.json") == "vendor"
+    assert not exceeded, f"prefix hit ceilings exceeded: {exceeded}; all buckets: {dict(counts)}"
 
 
 class TestPrintenvSimulation:
