@@ -868,6 +868,7 @@ _PREFIX_BASE64_CHARS = frozenset(
 )
 _PREFIX_GLUED_MIN_BODY_LENGTH = 16
 _PREFIX_GLUED_ENTROPY_FLOOR = 4.25
+_PREFIX_GLUED_LETTER_ONLY_ENTROPY_FLOOR = 4.0
 _PREFIX_GLUED_SINGLE_CLASS_ENTROPY_FLOOR = 4.5
 _PREFIX_GAAAA_MIN_BODY_LENGTH = 32
 _PREFIX_GAAAA_ENTROPY_FLOOR = 4.25
@@ -913,14 +914,19 @@ def _is_prefix_match_in_url_or_path(match: re.Match) -> bool:
 def _is_prefix_match_in_base64_run(match: re.Match) -> bool:
     text = match.string
     start, end = match.span(1)
+    if start > 0 and text[start - 1] in "=:":
+        # Assignment and mapping separators introduce a value; characters in
+        # the name on their left are not part of an encoded payload.
+        return False
     left = start
     while left > 0 and text[left - 1] in _PREFIX_BASE64_CHARS:
         left -= 1
     right = end
     while right < len(text) and text[right] in _PREFIX_BASE64_CHARS:
         right += 1
-    # A short glue character is allowed. A long adjacent alphabet run means
-    # the vendor-looking prefix was found inside a larger encoded payload.
+    # Exclude a match with at least 12 adjacent characters from the accepted
+    # base64/base64url alphabet (including padding) on either side. Shorter
+    # identifier glue remains eligible for the credential-shape checks.
     return start - left >= 12 or right - end >= 12
 
 
@@ -939,6 +945,11 @@ def _has_glued_credential_shape(body: str) -> bool:
     if len(body) < _PREFIX_GLUED_MIN_BODY_LENGTH:
         return False
     entropy = _shannon_entropy_per_character(body)
+    # Letter-only values are in scope: vendor formats permit them, and legacy
+    # or synthetic credentials can use them. Their separate floor admits a
+    # diverse 16-letter body without admitting low-diversity identifier tails.
+    if body.isalpha():
+        return entropy >= _PREFIX_GLUED_LETTER_ONLY_ENTROPY_FLOOR
     if entropy < _PREFIX_GLUED_ENTROPY_FLOOR:
         return False
     return (
@@ -955,6 +966,11 @@ def _is_redactable_prefix_match(match: re.Match) -> bool:
         # CSS custom properties such as ``--sk-focus-color`` are identifiers,
         # not a secret glued to a single hyphen.
         return False
+    if (
+        _is_prefix_match_in_url_or_path(match)
+        or _is_prefix_match_in_base64_run(match)
+    ):
+        return False
     if prefix == "gAAAA":
         if (
             len(body) < _PREFIX_GAAAA_MIN_BODY_LENGTH
@@ -964,8 +980,6 @@ def _is_redactable_prefix_match(match: re.Match) -> bool:
 
     if start == 0 or match.string[start - 1] not in _PREFIX_IDENTIFIER_CHARS:
         return True
-    if _is_prefix_match_in_url_or_path(match) or _is_prefix_match_in_base64_run(match):
-        return False
     return _has_glued_credential_shape(body)
 
 
@@ -1477,11 +1491,38 @@ class RedactingFormatter(logging.Formatter):
         super().__init__(fmt, datefmt, style, **kwargs)
 
     def format(self, record: logging.LogRecord) -> str:
+        policy = resolve_tool_output_redaction_policy()
+
+        def redact_text(value: str) -> str:
+            # Preserve the formatter's established legacy placeholders, then
+            # add tool-output-only classes the legacy pass does not cover.
+            redacted = redact_sensitive_text(value, force=True)
+            return _redact_tool_output_classes(redacted, policy)
+
+        def redact_value(value: Any) -> Any:
+            if isinstance(value, str):
+                return redact_text(value)
+            if isinstance(value, tuple):
+                return tuple(redact_value(item) for item in value)
+            if isinstance(value, list):
+                return [redact_value(item) for item in value]
+            if isinstance(value, dict):
+                return {key: redact_value(item) for key, item in value.items()}
+            return value
+
+        # Render msg+args once, then replace both attributes. Scrubbing a raw
+        # %-style template first could erase a placeholder before interpolation.
+        # A later handler therefore sees the safe rendered message and no args.
+        record.msg = redact_text(record.getMessage())
+        record.args = ()
+        if record.exc_info:
+            record.exc_text = redact_text(self.formatException(record.exc_info))
+            record.exc_info = None
+        elif record.exc_text:
+            record.exc_text = redact_text(record.exc_text)
+        for key, value in list(record.__dict__.items()):
+            if key not in {"msg", "args", "exc_info", "exc_text"}:
+                record.__dict__[key] = redact_value(value)
+
         original = super().format(record)
-        # Preserve the formatter's established legacy placeholders, then add
-        # the tool-output-only classes that the legacy pass does not cover.
-        redacted = redact_sensitive_text(original, force=True)
-        return _redact_tool_output_classes(
-            redacted,
-            resolve_tool_output_redaction_policy(),
-        )
+        return redact_text(original)
