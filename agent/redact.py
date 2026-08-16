@@ -853,10 +853,134 @@ _FORM_BODY_RE = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_.-]*=[^&\s]*(?:&[A-Za-z_][A-Za-z0-9_.-]*=[^&\s]*)+$"
 )
 
-# Compile known prefix patterns into one alternation
+# Compile known prefix patterns into one alternation. The left edge stays
+# unanchored because credentials can be concatenated with punctuation or an
+# identifier. Replacement-time context and credential-shape checks distinguish
+# those values from prefix-like substrings in ordinary repository content.
 _PREFIX_RE = re.compile(
-    r"(?<![A-Za-z0-9_-])(" + "|".join(_PREFIX_PATTERNS) + r")(?![A-Za-z0-9_-])"
+    r"(" + "|".join(_PREFIX_PATTERNS) + r")(?![A-Za-z0-9_-])"
 )
+_PREFIX_IDENTIFIER_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_"
+)
+_PREFIX_BASE64_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_+/=-"
+)
+_PREFIX_GLUED_MIN_BODY_LENGTH = 16
+_PREFIX_GLUED_ENTROPY_FLOOR = 4.25
+_PREFIX_GLUED_LETTER_ONLY_ENTROPY_FLOOR = 4.0
+_PREFIX_GLUED_SINGLE_CLASS_ENTROPY_FLOOR = 4.5
+_PREFIX_GAAAA_MIN_BODY_LENGTH = 32
+_PREFIX_GAAAA_ENTROPY_FLOOR = 4.25
+
+
+def _prefix_literal_and_body(token: str) -> tuple[str, str]:
+    """Split a matched token at its longest mandatory literal prefix."""
+    prefix = max(
+        (item for item in _PREFIX_SUBSTRINGS if item and token.startswith(item)),
+        key=len,
+        default="",
+    )
+    return prefix, token[len(prefix):].lstrip("._-")
+
+
+def _prefix_token_span(text: str, start: int, end: int) -> tuple[int, int]:
+    """Return the surrounding non-whitespace token span for context checks."""
+    delimiters = frozenset(" \t\r\n\"'`<>{}[]()")
+    left = start
+    while left > 0 and text[left - 1] not in delimiters:
+        left -= 1
+    right = end
+    while right < len(text) and text[right] not in delimiters:
+        right += 1
+    return left, right
+
+
+def _is_prefix_match_in_url_or_path(match: re.Match) -> bool:
+    text = match.string
+    start, end = match.span(1)
+    left, right = _prefix_token_span(text, start, end)
+    surrounding = text[left:right]
+    relative_start = start - left
+    if "://" in surrounding[:relative_start]:
+        return True
+    if "/" in surrounding or "\\" in surrounding:
+        return True
+    return bool(
+        re.match(r"sha(?:1|224|256|384|512)-", surrounding, re.IGNORECASE)
+    )
+
+
+def _is_prefix_match_in_base64_run(match: re.Match) -> bool:
+    text = match.string
+    start, end = match.span(1)
+    if start > 0 and text[start - 1] in "=:":
+        # Assignment and mapping separators introduce a value; characters in
+        # the name on their left are not part of an encoded payload.
+        return False
+    left = start
+    while left > 0 and text[left - 1] in _PREFIX_BASE64_CHARS:
+        left -= 1
+    right = end
+    while right < len(text) and text[right] in _PREFIX_BASE64_CHARS:
+        right += 1
+    # Exclude a match with at least 12 adjacent characters from the accepted
+    # base64/base64url alphabet (including padding) on either side. Shorter
+    # identifier glue remains eligible for the credential-shape checks.
+    return start - left >= 12 or right - end >= 12
+
+
+def _prefix_body_charset_classes(value: str) -> int:
+    return sum(
+        (
+            any(char.islower() for char in value),
+            any(char.isupper() for char in value),
+            any(char.isdigit() for char in value),
+            any(char in "_+/=-." for char in value),
+        )
+    )
+
+
+def _has_glued_credential_shape(body: str) -> bool:
+    if len(body) < _PREFIX_GLUED_MIN_BODY_LENGTH:
+        return False
+    entropy = _shannon_entropy_per_character(body)
+    # Letter-only values are in scope: vendor formats permit them, and legacy
+    # or synthetic credentials can use them. Their separate floor admits a
+    # diverse 16-letter body without admitting low-diversity identifier tails.
+    if body.isalpha():
+        return entropy >= _PREFIX_GLUED_LETTER_ONLY_ENTROPY_FLOOR
+    if entropy < _PREFIX_GLUED_ENTROPY_FLOOR:
+        return False
+    return (
+        _prefix_body_charset_classes(body) >= 2
+        or entropy >= _PREFIX_GLUED_SINGLE_CLASS_ENTROPY_FLOOR
+    )
+
+
+def _is_redactable_prefix_match(match: re.Match) -> bool:
+    """Reject repository substrings while retaining glued credentials."""
+    prefix, body = _prefix_literal_and_body(match.group(1))
+    start = match.start(1)
+    if start >= 2 and match.string[start - 2:start] == "--":
+        # CSS custom properties such as ``--sk-focus-color`` are identifiers,
+        # not a secret glued to a single hyphen.
+        return False
+    if (
+        _is_prefix_match_in_url_or_path(match)
+        or _is_prefix_match_in_base64_run(match)
+    ):
+        return False
+    if prefix == "gAAAA":
+        if (
+            len(body) < _PREFIX_GAAAA_MIN_BODY_LENGTH
+            or _shannon_entropy_per_character(body) < _PREFIX_GAAAA_ENTROPY_FLOOR
+        ):
+            return False
+
+    if start == 0 or match.string[start - 1] not in _PREFIX_IDENTIFIER_CHARS:
+        return True
+    return _has_glued_credential_shape(body)
 
 
 def mask_secret(
@@ -1097,7 +1221,14 @@ def redact_sensitive_text(
     # Known prefixes (sk-, ghp_, etc.) — gate on substring presence
     if _has_known_prefix_substring(text):
         _prefix_sub = _mask_token_nonreusable if file_read else _mask_token
-        text = _PREFIX_RE.sub(lambda m: _prefix_sub(m.group(1)), text)
+        text = _PREFIX_RE.sub(
+            lambda m: (
+                _prefix_sub(m.group(1))
+                if _is_redactable_prefix_match(m)
+                else m.group(1)
+            ),
+            text,
+        )
 
     # ENV assignments: OPENAI_API_KEY=***  (skip for code files — false positives)
     if not code_file:
@@ -1360,11 +1491,38 @@ class RedactingFormatter(logging.Formatter):
         super().__init__(fmt, datefmt, style, **kwargs)
 
     def format(self, record: logging.LogRecord) -> str:
+        policy = resolve_tool_output_redaction_policy()
+
+        def redact_text(value: str) -> str:
+            # Preserve the formatter's established legacy placeholders, then
+            # add tool-output-only classes the legacy pass does not cover.
+            redacted = redact_sensitive_text(value, force=True)
+            return _redact_tool_output_classes(redacted, policy)
+
+        def redact_value(value: Any) -> Any:
+            if isinstance(value, str):
+                return redact_text(value)
+            if isinstance(value, tuple):
+                return tuple(redact_value(item) for item in value)
+            if isinstance(value, list):
+                return [redact_value(item) for item in value]
+            if isinstance(value, dict):
+                return {key: redact_value(item) for key, item in value.items()}
+            return value
+
+        # Render msg+args once, then replace both attributes. Scrubbing a raw
+        # %-style template first could erase a placeholder before interpolation.
+        # A later handler therefore sees the safe rendered message and no args.
+        record.msg = redact_text(record.getMessage())
+        record.args = ()
+        if record.exc_info:
+            record.exc_text = redact_text(self.formatException(record.exc_info))
+            record.exc_info = None
+        elif record.exc_text:
+            record.exc_text = redact_text(record.exc_text)
+        for key, value in list(record.__dict__.items()):
+            if key not in {"msg", "args", "exc_info", "exc_text"}:
+                record.__dict__[key] = redact_value(value)
+
         original = super().format(record)
-        # Preserve the formatter's established legacy placeholders, then add
-        # the tool-output-only classes that the legacy pass does not cover.
-        redacted = redact_sensitive_text(original)
-        return _redact_tool_output_classes(
-            redacted,
-            resolve_tool_output_redaction_policy(),
-        )
+        return redact_text(original)

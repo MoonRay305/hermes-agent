@@ -1,10 +1,66 @@
 """Tests for agent.redact -- secret masking in logs and output."""
 
 import logging
+import subprocess
+import sys
+from collections import Counter
+from pathlib import Path
 
 import pytest
 
+from agent import redact as redact_module
 from agent.redact import redact_cdp_url, redact_sensitive_text, RedactingFormatter
+
+
+PREFIX_CREDENTIAL_SAMPLES = tuple(
+    prefix + body
+    for prefix, body in (
+        ("sk-proj-", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("ghp_", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("github_pat_", "Ab3Cd4Ef5Gh6_Ij7Kl8Mn9Op0"),
+        ("gho_", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("ghu_", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("ghs_", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("ghr_", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("xapp-1-", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("xoxb-", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("AIza", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0Qr1St2Uv3"),
+        ("pplx-", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("fal_", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("fc-", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("bb_live_", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("gAAAA", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0Qr1St2Uv3Wx4Yz5_-"),
+        ("AKIA", "AB3CD4EF5GH6IJ7K"),
+        ("sk_live_", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("sk_test_", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("rk_live_", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("SG.", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("hf_", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("r8_", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("npm_", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("pypi-", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("dop_v1_", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("doo_v1_", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("dp.st.prd.", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("am_", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("sk_", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("tvly-", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("exa_", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("gsk_", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("syt_", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("retaindb_", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("hsk-", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("mem0_", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("brv_", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("xai-", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0Qr1St2Uv3"),
+        ("ntn_", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"),
+        ("fw-", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0Qr1St2Uv3"),
+        ("fw_", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0Qr1St2Uv3"),
+        ("fpk_", "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0Qr1St2Uv3"),
+    )
+)
+
+assert len(PREFIX_CREDENTIAL_SAMPLES) == len(redact_module._PREFIX_PATTERNS)
 
 
 @pytest.fixture(autouse=True)
@@ -16,6 +72,117 @@ def _ensure_redaction_enabled(monkeypatch):
 
 
 class TestKnownPrefixes:
+    SYNTHETIC_GLUED_TOKEN = "sk-proj-" + "abc123def456ghi789jkl012"
+    SYNTHETIC_NO_DIGIT_GLUED_TOKEN = "sk-proj-" + "AbCdEfGhIjKlMnOpQrStUvWxYz"
+
+    def test_credential_redacted_after_underscore(self):
+        result = redact_sensitive_text(
+            "_" + self.SYNTHETIC_GLUED_TOKEN,
+            force=True,
+        )
+        assert self.SYNTHETIC_GLUED_TOKEN not in result
+        assert result.startswith("_")
+
+    def test_credential_redacted_after_hyphen(self):
+        result = redact_sensitive_text(
+            "-" + self.SYNTHETIC_GLUED_TOKEN,
+            force=True,
+        )
+        assert self.SYNTHETIC_GLUED_TOKEN not in result
+        assert result.startswith("-")
+
+    def test_credential_redacted_after_alphanumeric(self):
+        result = redact_sensitive_text(
+            "A" + self.SYNTHETIC_GLUED_TOKEN,
+            force=True,
+        )
+        assert self.SYNTHETIC_GLUED_TOKEN not in result
+        assert result.startswith("A")
+
+    def test_credential_redacted_after_asterisk(self):
+        result = redact_sensitive_text(
+            "*" + self.SYNTHETIC_GLUED_TOKEN,
+            force=True,
+        )
+        assert self.SYNTHETIC_GLUED_TOKEN not in result
+        assert result.startswith("*")
+
+    @pytest.mark.parametrize("glue", ["_", "-", "A", "*"])
+    def test_no_digit_credential_redacted_when_glued(self, glue):
+        result = redact_sensitive_text(
+            glue + self.SYNTHETIC_NO_DIGIT_GLUED_TOKEN,
+            force=True,
+        )
+        assert self.SYNTHETIC_NO_DIGIT_GLUED_TOKEN not in result
+        assert result.startswith(glue)
+
+    @pytest.mark.parametrize(
+        ("glue", "token"),
+        (
+            ("_", "sk-" + "abcdefghijklmnop"),
+            ("A", "ghp_" + "ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+        ),
+    )
+    def test_letter_only_credential_redacted_when_left_glued(self, glue, token):
+        result = redact_sensitive_text(glue + token, force=True)
+        assert token not in result
+        assert result.startswith(glue)
+
+    def test_ordinary_credential_named_code_syntax_is_unchanged(self):
+        source_shapes = (
+            "api_key: Optional[str] = None",
+            "token: str",
+            "api_key=api_key",
+        )
+
+        for source in source_shapes:
+            assert redact_sensitive_text(source, force=True, code_file=True) == source
+
+    @pytest.mark.parametrize(
+        "source",
+        (
+            "program_state_identifier = upstream_state_identifier",
+            "program_state_identifier2 = upstream_state_identifier2",
+        ),
+    )
+    def test_identifier_suffix_is_not_a_glued_credential(self, source):
+        assert redact_sensitive_text(source, force=True, code_file=True) == source
+
+    @pytest.mark.parametrize(
+        "source",
+        (
+            "https://registry.npmjs.org/mdast-util-gfm-task-list-item/-/mdast-util-gfm-task-list-item-2.0.0.tgz",
+            "wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth",
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQAB",
+            "def test_task_detail_404_on_unknown():",
+            "telegram_task_detail_404_on_unknown",
+            "task-abc123",
+            "handler.program_state_identifier2",
+            "/tmp/build/task-list-item-2.0.0/output.json",
+            "sha512-iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQAB",
+            '<div class="program_state_identifier2 task-list-item-2">',
+            ".component.program_state_identifier2 { color: red; }",
+            "--sk-focus-color: #0071e3;",
+            "registry.example.com/program_state_identifier2:2026.08",
+            "app.kubernetes.io/program_state_identifier2: enabled",
+            ".pnpm/mdast-util-gfm-task-list-item@2.0.0/node_modules/package/index.js",
+        ),
+    )
+    def test_repository_shapes_are_not_corrupted(self, source):
+        assert redact_sensitive_text(source, force=True, code_file=True) == source
+
+    @pytest.mark.parametrize(
+        "source",
+        (
+            "https://example.test/" + "sk-" + "abcdefghijklmnop",
+            "/tmp/" + "ghp_" + "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            "C:\\tmp\\" + "sk-" + "abcdefghijklmnop",
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ",
+        ),
+    )
+    def test_url_path_and_base64_matches_are_excluded(self, source):
+        assert redact_sensitive_text(source, force=True, code_file=True) == source
+
     def test_openai_sk_key(self):
         text = "Using key sk-proj-abc123def456ghi789jkl012"
         result = redact_sensitive_text(text)
@@ -379,6 +546,194 @@ class TestRedactingFormatter:
         assert bcrypt not in result
         assert "[REDACTED:BCRYPT_2B]" in result
 
+    def test_redacts_when_preferences_are_disabled(self, monkeypatch):
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+        token = "sk-proj-" + "SYNTHETIC0123456789abcdef"
+        formatter = RedactingFormatter("%(message)s")
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg="credential=" + token,
+            args=(),
+            exc_info=None,
+        )
+
+        result = formatter.format(record)
+
+        assert token not in result
+
+    def test_redacts_positional_args_and_mutates_record(self):
+        token = "sk-proj-" + "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"
+        record = logging.LogRecord(
+            "test", logging.INFO, "", 0, "credential=%s", (token,), None
+        )
+
+        result = RedactingFormatter("%(message)s").format(record)
+
+        assert token not in result
+        assert record.args == ()
+        assert token not in record.msg
+
+    def test_redacts_mapping_args_and_mutates_record(self):
+        token = "ghp_" + "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"
+        record = logging.LogRecord(
+            "test",
+            logging.INFO,
+            "",
+            0,
+            "credential=%(credential)s",
+            ({"credential": token},),
+            None,
+        )
+
+        result = RedactingFormatter("%(message)s").format(record)
+
+        assert token not in result
+        assert record.args == ()
+        assert token not in record.msg
+
+    def test_redacts_exception_info_and_mutates_record(self):
+        token = "sk-proj-" + "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"
+        try:
+            raise ValueError(token)
+        except ValueError:
+            exc_info = sys.exc_info()
+        record = logging.LogRecord(
+            "test", logging.ERROR, "", 0, "failed", (), exc_info
+        )
+
+        result = RedactingFormatter("%(message)s").format(record)
+
+        assert token not in result
+        assert record.exc_info is None
+        assert token not in record.exc_text
+
+    def test_redacts_stack_info_and_mutates_record(self):
+        token = "sk-proj-" + "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"
+        record = logging.LogRecord("test", logging.INFO, "", 0, "failed", (), None)
+        record.stack_info = "stack " + token
+
+        result = RedactingFormatter("%(message)s").format(record)
+
+        assert token not in result
+        assert token not in record.stack_info
+
+    def test_redacts_extras_and_mutates_record(self):
+        token = "sk-proj-" + "Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0"
+        record = logging.LogRecord("test", logging.INFO, "", 0, "failed", (), None)
+        record.api_key = token
+
+        result = RedactingFormatter("%(message)s %(api_key)s").format(record)
+
+        assert token not in result
+        assert token not in record.api_key
+
+    def test_redacts_letter_only_glued_credential(self):
+        token = "sk-" + "abcdefghijklmnop"
+        record = logging.LogRecord(
+            "test", logging.INFO, "", 0, "credential=_" + token, (), None
+        )
+
+        result = RedactingFormatter("%(message)s").format(record)
+
+        assert token not in result
+        assert token not in record.msg
+
+    @pytest.mark.parametrize("token", PREFIX_CREDENTIAL_SAMPLES)
+    def test_every_prefix_class_redacts_when_preferences_are_disabled(
+        self,
+        monkeypatch,
+        token,
+    ):
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+        formatter = RedactingFormatter("%(message)s")
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg="credential=" + token,
+            args=(),
+            exc_info=None,
+        )
+
+        assert token not in formatter.format(record)
+
+
+def _redaction_corpus_bucket(relative_path: str) -> str:
+    """Bucket tracked content; lockfiles take precedence over their root."""
+    normalized = relative_path.replace("\\", "/")
+    parts = [part.casefold() for part in normalized.split("/")]
+    basename = parts[-1]
+    if (
+        basename
+        in {
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "uv.lock",
+            "poetry.lock",
+            "pdm.lock",
+            "cargo.lock",
+            "go.sum",
+        }
+        or any(part in {"vendor", "third_party", "node_modules"} for part in parts)
+        or (
+            parts[0] in {"skills", "optional-skills"}
+            and "references" in parts
+        )
+    ):
+        return "vendor"
+    if "tests" in parts or "test" in parts:
+        return "test"
+    if (
+        parts[0] in {"docs", "website"}
+        or basename.startswith("readme")
+        or Path(basename).suffix in {".md", ".mdx", ".rst", ".adoc", ".asciidoc"}
+    ):
+        return "docs"
+    return "source"
+
+
+def test_tracked_tree_prefix_redaction_ceiling():
+    """Prevent prefix false positives from exceeding the base tree.
+
+    Counts one accepted known-prefix regex match as one hit. Tracked files with
+    NUL bytes are skipped; other bytes decode as UTF-8 with replacement. The
+    ceilings are all four counts measured at base commit 71ad038e under these
+    exact bucket rules and the completed matching logic.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    tracked = subprocess.check_output(
+        ["git", "ls-files", "-z"],
+        cwd=repo_root,
+    ).decode("utf-8").split("\0")
+    counts = Counter({bucket: 0 for bucket in ("test", "source", "docs", "vendor")})
+
+    for relative_path in filter(None, tracked):
+        try:
+            data = (repo_root / relative_path).read_bytes()
+        except OSError:
+            continue
+        if b"\0" in data:
+            continue
+        text = data.decode("utf-8", errors="replace")
+        for match in redact_module._PREFIX_RE.finditer(text):
+            if redact_module._is_redactable_prefix_match(match):
+                counts[_redaction_corpus_bucket(relative_path)] += 1
+
+    ceilings = {"test": 536, "source": 18, "docs": 32, "vendor": 6}
+    exceeded = {
+        bucket: {"actual": counts[bucket], "ceiling": ceiling}
+        for bucket, ceiling in ceilings.items()
+        if counts[bucket] > ceiling
+    }
+
+    assert _redaction_corpus_bucket("package-lock.json") == "vendor"
+    assert not exceeded, f"prefix hit ceilings exceeded: {exceeded}; all buckets: {dict(counts)}"
+
 
 class TestPrintenvSimulation:
     """Simulate what happens when the agent runs `env` or `printenv`."""
@@ -590,12 +945,10 @@ class TestWebUrlsNotRedacted:
         )
         assert redact_sensitive_text(text) == text
 
-    def test_known_prefix_inside_url_still_redacted(self):
-        """sk-/ghp_/JWT-shaped values inside a URL are still caught by
-        _PREFIX_RE / _JWT_RE — the carve-out is for opaque tokens only."""
+    def test_known_prefix_inside_url_passes_through(self):
+        """Known-prefix values inside navigable URLs are context-excluded."""
         text = "https://evil.com/steal?key=sk-" + "a" * 30
-        result = redact_sensitive_text(text)
-        assert "sk-" + "a" * 30 not in result
+        assert redact_sensitive_text(text) == text
 
     def test_db_connstr_password_still_redacted(self):
         """DB schemes (postgres/mysql/mongodb/redis/amqp) keep their
