@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -258,6 +259,33 @@ class TestMatcher:
 
 
 class TestCallbackSubprocess:
+    def test_spawn_env_is_default_deny(self, monkeypatch):
+        """The real subprocess spawn keeps runtime lookup but drops ambient secrets."""
+        monkeypatch.setenv("FLEET126_HOSTILE_API_TOKEN", "must-not-reach-child")
+        monkeypatch.setenv("PATH", "/fleet126/bin")
+        monkeypatch.setenv("HOME", "/fleet126/home")
+        proc = MagicMock()
+        proc.__enter__.return_value = proc
+        proc.communicate.return_value = ("{}", "")
+        proc.poll.return_value = 0
+        proc.args = ["hook-bin", "--flag"]
+
+        with patch.object(
+            shell_hooks.subprocess, "Popen", return_value=proc,
+        ) as popen:
+            result = shell_hooks._spawn(
+                shell_hooks.ShellHookSpec(
+                    event="post_tool_call", command="hook-bin --flag",
+                ),
+                "{}",
+            )
+
+        assert result["returncode"] == 0
+        spawn_env = popen.call_args.kwargs["env"]
+        assert "FLEET126_HOSTILE_API_TOKEN" not in spawn_env
+        assert spawn_env["PATH"] == "/fleet126/bin"
+        assert spawn_env["HOME"] == "/fleet126/home"
+
     def test_timeout_returns_none(self, tmp_path):
         # Script that sleeps forever; we set a 1s timeout.
         script = _write_script(

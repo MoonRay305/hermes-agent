@@ -2,7 +2,7 @@
 
 import os
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -794,6 +794,30 @@ class TestInlineShellExpansion:
         assert msg is not None
         assert "Marker: INLINE_RAN." in msg
         assert "!`echo INLINE_RAN`" not in msg
+
+    def test_inline_shell_spawn_env_is_default_deny(self, monkeypatch):
+        """The real subprocess spawn keeps runtime lookup but drops ambient secrets."""
+        from agent import skill_preprocessing
+
+        monkeypatch.setenv("FLEET126_HOSTILE_API_TOKEN", "must-not-reach-child")
+        monkeypatch.setenv("PATH", "/fleet126/bin")
+        proc = MagicMock()
+        proc.__enter__.return_value = proc
+        proc.communicate.return_value = ("ok\n", "")
+        proc.poll.return_value = 0
+        proc.args = ["bash", "-c", "printf ok"]
+
+        with patch.object(
+            skill_preprocessing.subprocess, "Popen", return_value=proc,
+        ) as popen:
+            result = skill_preprocessing.run_inline_shell(
+                "printf ok", cwd=None, timeout=5,
+            )
+
+        assert result == "ok"
+        spawn_env = popen.call_args.kwargs["env"]
+        assert "FLEET126_HOSTILE_API_TOKEN" not in spawn_env
+        assert spawn_env["PATH"] == "/fleet126/bin"
 
     def test_inline_shell_runs_in_skill_directory(self, tmp_path):
         """Inline snippets get the skill dir as CWD so relative paths work."""

@@ -123,6 +123,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
+from tools.environments.local import hermes_subprocess_env
 
 try:
     import fcntl  # POSIX only; Windows falls back to best-effort without flock.
@@ -466,6 +467,7 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
             timeout=spec.timeout,
             text=True,
             shell=False,
+            env=hermes_subprocess_env(),
             **_popen_kwargs,
         )
     except subprocess.TimeoutExpired:

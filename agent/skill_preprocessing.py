@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
+from tools.environments.local import hermes_subprocess_env
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,7 @@ def run_inline_shell(command: str, cwd: Path | None, timeout: int) -> str:
             timeout=max(1, int(timeout)),
             check=False,
             stdin=subprocess.DEVNULL,
+            env=hermes_subprocess_env(),
             **_popen_kwargs,
         )
     except subprocess.TimeoutExpired:
