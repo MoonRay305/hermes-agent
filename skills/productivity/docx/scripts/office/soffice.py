@@ -22,6 +22,8 @@ import subprocess
 import tempfile
 from collections.abc import Iterable
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
+from urllib.request import url2pathname
 
 
 def get_soffice_env() -> dict:
@@ -35,16 +37,72 @@ def get_soffice_env() -> dict:
     return env
 
 
+_USER_INSTALLATION_OPTION = "-env:UserInstallation"
+_USER_INSTALLATION_PREFIX = f"{_USER_INSTALLATION_OPTION}="
+
+
+def _validate_user_installation_arg(arg: str) -> None:
+    if not arg.startswith(_USER_INSTALLATION_PREFIX):
+        raise ValueError(
+            "Refusing unsafe LibreOffice user profile: expected "
+            f"{_USER_INSTALLATION_PREFIX}<absolute-file-URI>"
+        )
+
+    uri = arg[len(_USER_INSTALLATION_PREFIX) :]
+    try:
+        parsed = urlsplit(uri)
+    except ValueError as exc:
+        raise ValueError(
+            f"Refusing unsafe LibreOffice user profile: invalid URI ({exc})"
+        ) from exc
+
+    if parsed.scheme != "file" or parsed.netloc or parsed.query or parsed.fragment:
+        raise ValueError(
+            "Refusing unsafe LibreOffice user profile: expected a local file URI"
+        )
+
+    decoded_path = unquote(parsed.path)
+    if not decoded_path:
+        raise ValueError(
+            "Refusing unsafe LibreOffice user profile: profile path is empty"
+        )
+
+    try:
+        profile_path = Path(url2pathname(decoded_path)).resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(
+            f"Refusing unsafe LibreOffice user profile: cannot resolve path ({exc})"
+        ) from exc
+
+    if not profile_path.is_absolute() or profile_path.parent == profile_path:
+        raise ValueError(
+            "Refusing unsafe LibreOffice user profile: path must be absolute and non-root"
+        )
+
+
 def run_soffice(args: Iterable[str], **kwargs) -> subprocess.CompletedProcess:
     args = list(args)
-    with contextlib.ExitStack() as stack:
-        if not any(str(a).startswith("-env:UserInstallation") for a in args):
-            profile = stack.enter_context(
-                tempfile.TemporaryDirectory(prefix="lo_profile_", ignore_cleanup_errors=True)
-            )
-            args = [f"-env:UserInstallation={Path(profile).as_uri()}"] + args
-        return subprocess.run(["soffice"] + args, env=get_soffice_env(), **kwargs)
+    profile_args = [
+        str(arg) for arg in args if str(arg).startswith(_USER_INSTALLATION_OPTION)
+    ]
+    if len(profile_args) > 1:
+        raise ValueError(
+            "Refusing unsafe LibreOffice user profile: expected exactly one profile"
+        )
 
+    with contextlib.ExitStack() as stack:
+        if profile_args:
+            _validate_user_installation_arg(profile_args[0])
+        else:
+            profile = stack.enter_context(
+                tempfile.TemporaryDirectory(
+                    prefix="lo_profile_", ignore_cleanup_errors=True
+                )
+            )
+            profile_arg = f"{_USER_INSTALLATION_PREFIX}{Path(profile).as_uri()}"
+            _validate_user_installation_arg(profile_arg)
+            args = [profile_arg] + args
+        return subprocess.run(["soffice"] + args, env=get_soffice_env(), **kwargs)
 
 
 _SHIM_SO = Path(tempfile.gettempdir()) / "lo_socket_shim.so"
@@ -72,7 +130,6 @@ def _ensure_shim() -> Path:
     )
     src.unlink()
     return _SHIM_SO
-
 
 
 _SHIM_SOURCE = r"""
@@ -185,8 +242,8 @@ int close(int fd) {
 """
 
 
-
 if __name__ == "__main__":
     import sys
+
     result = run_soffice(sys.argv[1:])
     sys.exit(result.returncode)

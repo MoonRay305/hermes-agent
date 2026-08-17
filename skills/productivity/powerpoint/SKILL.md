@@ -31,6 +31,13 @@ which pdftoppm || sudo apt install -y poppler-utils  # PDF → images
 
 macOS: `brew install libreoffice poppler`. Icons in generated decks additionally use `react-icons react react-dom sharp` (npm).
 
+
+> **LibreOffice safety (mandatory):** Invoke LibreOffice only through
+> `python scripts/office/soffice.py ...`. Never invoke `libreoffice`/`soffice`
+> directly and never hand-build `-env:UserInstallation`; the wrapper creates an
+> absolute temporary profile and refuses empty, relative, duplicate, or
+> root-resolving profiles before LibreOffice starts.
+
 ## Quick Reference
 
 | Task | Approach |
