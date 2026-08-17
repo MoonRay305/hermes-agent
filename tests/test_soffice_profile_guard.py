@@ -1,7 +1,9 @@
 import importlib.util
+import os
 import subprocess
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
+from urllib.request import url2pathname
 
 import pytest
 
@@ -37,6 +39,9 @@ def wrapper(request):
         "-env:UserInstallation=file:///",
         "-env:UserInstallation=file:///%2F",
         "-env:UserInstallation=relative-profile",
+        "-env:UserInstallation=file:relative-profile",
+        "-env:UserInstallation=file:./relative-profile",
+        "-env:UserInstallation=file:../relative-profile",
         "-env:UserInstallation",
     ],
 )
@@ -132,7 +137,7 @@ def test_run_soffice_generates_non_root_temporary_profile(wrapper, monkeypatch):
         captured["argv"] = argv
         profile_arg = argv[1]
         uri = profile_arg.split("=", 1)[1]
-        path = Path(unquote(urlsplit(uri).path)).resolve()
+        path = Path(url2pathname(unquote(urlsplit(uri).path))).resolve()
         assert path.is_absolute()
         assert path.parent != path
         assert path.is_dir()
@@ -145,5 +150,25 @@ def test_run_soffice_generates_non_root_temporary_profile(wrapper, monkeypatch):
 
     assert result.returncode == 0
     profile_uri = captured["argv"][1].split("=", 1)[1]
-    profile_path = Path(unquote(urlsplit(profile_uri).path))
+    profile_path = Path(url2pathname(unquote(urlsplit(profile_uri).path)))
     assert not profile_path.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows drive-root URI semantics")
+def test_run_soffice_refuses_windows_drive_root(wrapper, monkeypatch):
+    called = False
+
+    def fake_run(*args, **kwargs):
+        nonlocal called
+        called = True
+        return subprocess.CompletedProcess(args[0], 0)
+
+    monkeypatch.setattr(wrapper.subprocess, "run", fake_run)
+
+    with pytest.raises(ValueError, match="absolute and non-root"):
+        wrapper.run_soffice([
+            "-env:UserInstallation=file:///C:/",
+            "--headless",
+        ])
+
+    assert not called

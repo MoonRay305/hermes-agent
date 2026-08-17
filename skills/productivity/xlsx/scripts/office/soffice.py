@@ -67,14 +67,20 @@ def _validate_user_installation_arg(arg: str) -> None:
             "Refusing unsafe LibreOffice user profile: profile path is empty"
         )
 
+    raw_profile_path = Path(url2pathname(decoded_path))
+    if not raw_profile_path.is_absolute():
+        raise ValueError(
+            "Refusing unsafe LibreOffice user profile: path must be absolute and non-root"
+        )
+
     try:
-        profile_path = Path(url2pathname(decoded_path)).resolve(strict=False)
-    except (OSError, RuntimeError) as exc:
+        profile_path = raw_profile_path.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as exc:
         raise ValueError(
             f"Refusing unsafe LibreOffice user profile: cannot resolve path ({exc})"
         ) from exc
 
-    if not profile_path.is_absolute() or profile_path.parent == profile_path:
+    if profile_path.parent == profile_path:
         raise ValueError(
             "Refusing unsafe LibreOffice user profile: path must be absolute and non-root"
         )
