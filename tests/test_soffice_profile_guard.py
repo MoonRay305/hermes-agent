@@ -43,6 +43,7 @@ def wrapper(request):
         "-env:UserInstallation=file:./relative-profile",
         "-env:UserInstallation=file:../relative-profile",
         "-env:UserInstallation",
+        "/env:UserInstallation=file:///",
     ],
 )
 def test_run_soffice_refuses_unsafe_explicit_profile(
@@ -83,6 +84,51 @@ def test_run_soffice_refuses_multiple_explicit_profiles(wrapper, monkeypatch, tm
         ])
 
     assert not called
+
+
+def test_run_soffice_refuses_mixed_prefix_root_first_profile_override(
+    wrapper, monkeypatch, tmp_path
+):
+    called = False
+
+    def fake_run(*args, **kwargs):
+        nonlocal called
+        called = True
+        return subprocess.CompletedProcess(args[0], 0)
+
+    monkeypatch.setattr(wrapper.subprocess, "run", fake_run)
+    safe_profile = (tmp_path / "safe-profile").as_uri()
+
+    with pytest.raises(ValueError, match="exactly one"):
+        wrapper.run_soffice([
+            "/env:UserInstallation=file:///",
+            f"-env:UserInstallation={safe_profile}",
+            "--headless",
+        ])
+
+    assert not called
+
+
+def test_run_soffice_accepts_safe_slash_prefixed_profile(
+    wrapper, monkeypatch, tmp_path
+):
+    captured = {}
+    profile = tmp_path / "profile"
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(wrapper, "get_soffice_env", lambda: {})
+    monkeypatch.setattr(wrapper.subprocess, "run", fake_run)
+
+    result = wrapper.run_soffice([
+        f"/env:UserInstallation={profile.as_uri()}",
+        "--headless",
+    ])
+
+    assert result.returncode == 0
+    assert captured["argv"][1] == f"/env:UserInstallation={profile.as_uri()}"
 
 
 def test_run_soffice_refuses_profile_symlink_resolving_to_root(
