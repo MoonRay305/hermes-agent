@@ -38,17 +38,38 @@ def get_soffice_env() -> dict:
 
 
 _USER_INSTALLATION_OPTION = "-env:UserInstallation"
+_USER_INSTALLATION_OPTIONS = (
+    _USER_INSTALLATION_OPTION,
+    "/env:UserInstallation",
+)
 _USER_INSTALLATION_PREFIX = f"{_USER_INSTALLATION_OPTION}="
+_USER_INSTALLATION_PREFIXES = tuple(
+    f"{option}=" for option in _USER_INSTALLATION_OPTIONS
+)
+
+
+def _user_installation_prefix(arg: str) -> str | None:
+    for prefix in _USER_INSTALLATION_PREFIXES:
+        if arg.startswith(prefix):
+            return prefix
+    return None
+
+
+def _is_user_installation_arg(arg: str) -> bool:
+    return arg in _USER_INSTALLATION_OPTIONS or _user_installation_prefix(arg) is not None
 
 
 def _validate_user_installation_arg(arg: str) -> None:
-    if not arg.startswith(_USER_INSTALLATION_PREFIX):
+    prefix = _user_installation_prefix(arg)
+    if prefix is None:
+        expected = " or ".join(
+            f"{option}=<absolute-file-URI>" for option in _USER_INSTALLATION_OPTIONS
+        )
         raise ValueError(
-            "Refusing unsafe LibreOffice user profile: expected "
-            f"{_USER_INSTALLATION_PREFIX}<absolute-file-URI>"
+            f"Refusing unsafe LibreOffice user profile: expected {expected}"
         )
 
-    uri = arg[len(_USER_INSTALLATION_PREFIX) :]
+    uri = arg[len(prefix) :]
     try:
         parsed = urlsplit(uri)
     except ValueError as exc:
@@ -88,9 +109,7 @@ def _validate_user_installation_arg(arg: str) -> None:
 
 def run_soffice(args: Iterable[str], **kwargs) -> subprocess.CompletedProcess:
     args = list(args)
-    profile_args = [
-        str(arg) for arg in args if str(arg).startswith(_USER_INSTALLATION_OPTION)
-    ]
+    profile_args = [str(arg) for arg in args if _is_user_installation_arg(str(arg))]
     if len(profile_args) > 1:
         raise ValueError(
             "Refusing unsafe LibreOffice user profile: expected exactly one profile"
