@@ -29,6 +29,13 @@ which soffice || sudo apt install -y libreoffice   # formula recalculation (scri
 
 macOS: `brew install libreoffice`.
 
+
+> **LibreOffice safety (mandatory):** Invoke LibreOffice only through
+> `python scripts/office/soffice.py ...`. Never invoke `libreoffice`/`soffice`
+> directly and never hand-build `-env:UserInstallation`; the wrapper creates an
+> absolute temporary profile and refuses empty, relative, duplicate, or
+> root-resolving profiles before LibreOffice starts.
+
 ## Quick Reference
 
 | Task | Approach |
