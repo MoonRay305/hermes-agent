@@ -46,6 +46,7 @@ _USER_INSTALLATION_PREFIX = f"{_USER_INSTALLATION_OPTION}="
 _USER_INSTALLATION_PREFIXES = tuple(
     f"{option}=" for option in _USER_INSTALLATION_OPTIONS
 )
+_APPROVED_PROFILE_ROOT = Path("/var/tmp/lo-profiles")
 
 
 def _user_installation_prefix(arg: str) -> str | None:
@@ -57,6 +58,47 @@ def _user_installation_prefix(arg: str) -> str | None:
 
 def _is_user_installation_arg(arg: str) -> bool:
     return arg in _USER_INSTALLATION_OPTIONS or _user_installation_prefix(arg) is not None
+
+
+def _normalised_resolved_path(path: Path) -> tuple[Path, str]:
+    resolved = path.resolve(strict=False)
+    normalised = os.path.normcase(os.path.normpath(str(resolved)))
+    return resolved, normalised
+
+
+def _approved_profile_root() -> tuple[Path, str]:
+    try:
+        return _normalised_resolved_path(_APPROVED_PROFILE_ROOT)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(
+            "Refusing unsafe LibreOffice user profile: "
+            f"cannot resolve approved root ({exc})"
+        ) from exc
+
+
+def _ensure_approved_profile_root() -> Path:
+    try:
+        if _APPROVED_PROFILE_ROOT.is_symlink():
+            raise ValueError("approved profile root must not be a symlink")
+        _APPROVED_PROFILE_ROOT.mkdir(parents=True, mode=0o700, exist_ok=True)
+        if _APPROVED_PROFILE_ROOT.is_symlink():
+            raise ValueError("approved profile root must not be a symlink")
+        if hasattr(os, "geteuid"):
+            owner_uid = _APPROVED_PROFILE_ROOT.stat().st_uid
+            if owner_uid != os.geteuid():
+                raise ValueError("approved profile root must be owned by the current user")
+            _APPROVED_PROFILE_ROOT.chmod(0o700)
+        root, _ = _approved_profile_root()
+        return root
+    except ValueError as exc:
+        raise ValueError(
+            f"Refusing unsafe LibreOffice user profile: {exc}"
+        ) from exc
+    except OSError as exc:
+        raise ValueError(
+            "Refusing unsafe LibreOffice user profile: "
+            f"cannot prepare approved root ({exc})"
+        ) from exc
 
 
 def _validate_user_installation_arg(arg: str) -> None:
@@ -95,15 +137,22 @@ def _validate_user_installation_arg(arg: str) -> None:
         )
 
     try:
-        profile_path = raw_profile_path.resolve(strict=False)
+        profile_path, normalised_profile = _normalised_resolved_path(raw_profile_path)
+        approved_root, normalised_root = _approved_profile_root()
     except (OSError, RuntimeError, ValueError) as exc:
         raise ValueError(
             f"Refusing unsafe LibreOffice user profile: cannot resolve path ({exc})"
         ) from exc
 
-    if profile_path.parent == profile_path:
+    try:
+        common_root = os.path.commonpath((normalised_root, normalised_profile))
+    except ValueError:
+        common_root = ""
+
+    if normalised_profile == normalised_root or common_root != normalised_root:
         raise ValueError(
-            "Refusing unsafe LibreOffice user profile: path must be absolute and non-root"
+            "Refusing unsafe LibreOffice user profile: path must be a strict "
+            f"subdirectory of {approved_root} (resolved to {profile_path})"
         )
 
 
@@ -118,10 +167,14 @@ def run_soffice(args: Iterable[str], **kwargs) -> subprocess.CompletedProcess:
     with contextlib.ExitStack() as stack:
         if profile_args:
             _validate_user_installation_arg(profile_args[0])
+            _ensure_approved_profile_root()
         else:
+            approved_root = _ensure_approved_profile_root()
             profile = stack.enter_context(
                 tempfile.TemporaryDirectory(
-                    prefix="lo_profile_", ignore_cleanup_errors=True
+                    prefix="lo_profile_",
+                    dir=approved_root,
+                    ignore_cleanup_errors=True,
                 )
             )
             profile_arg = f"{_USER_INSTALLATION_PREFIX}{Path(profile).as_uri()}"
