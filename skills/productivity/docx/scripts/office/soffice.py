@@ -8,11 +8,9 @@ Usage:
 
     result = run_soffice(["--headless", "--convert-to", "pdf", "input.docx"])
 
-Call soffice through run_soffice, not through subprocess with get_soffice_env():
-the env dict carries the shim but names no user profile, and a non-root sandbox
-cannot bootstrap the default one -- soffice aborts with "User installation could
-not be completed" and converts nothing. get_soffice_env() stays public for the
-callers that build their own argv (they must pass -env:UserInstallation too).
+Call soffice through run_soffice, which creates the LibreOffice profile inside
+the guarded API. Callers that need to reuse a profile receive an opaque profile
+identifier from managed_soffice_profile(); they never provide a filesystem path.
 """
 
 import contextlib
@@ -20,14 +18,16 @@ import os
 import socket
 import subprocess
 import tempfile
+import uuid
 from collections.abc import Iterable
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
-from urllib.request import url2pathname
 
 
 def get_soffice_env() -> dict:
     env = os.environ.copy()
+    for key in tuple(env):
+        if key.casefold() == "userinstallation":
+            env.pop(key, None)
     env["SAL_USE_VCLPLUGIN"] = "svp"
 
     if _needs_shim():
@@ -43,37 +43,15 @@ _USER_INSTALLATION_OPTIONS = (
     "/env:UserInstallation",
 )
 _USER_INSTALLATION_PREFIX = f"{_USER_INSTALLATION_OPTION}="
-_USER_INSTALLATION_PREFIXES = tuple(
-    f"{option}=" for option in _USER_INSTALLATION_OPTIONS
-)
 _APPROVED_PROFILE_ROOT = Path("/var/tmp/lo-profiles")
-
-
-def _user_installation_prefix(arg: str) -> str | None:
-    for prefix in _USER_INSTALLATION_PREFIXES:
-        if arg.startswith(prefix):
-            return prefix
-    return None
+_MANAGED_PROFILES: dict[str, Path] = {}
 
 
 def _is_user_installation_arg(arg: str) -> bool:
-    return arg in _USER_INSTALLATION_OPTIONS or _user_installation_prefix(arg) is not None
-
-
-def _normalised_resolved_path(path: Path) -> tuple[Path, str]:
-    resolved = path.resolve(strict=False)
-    normalised = os.path.normcase(os.path.normpath(str(resolved)))
-    return resolved, normalised
-
-
-def _approved_profile_root() -> tuple[Path, str]:
-    try:
-        return _normalised_resolved_path(_APPROVED_PROFILE_ROOT)
-    except (OSError, RuntimeError, ValueError) as exc:
-        raise ValueError(
-            "Refusing unsafe LibreOffice user profile: "
-            f"cannot resolve approved root ({exc})"
-        ) from exc
+    return any(
+        arg == option or arg.startswith(f"{option}=")
+        for option in _USER_INSTALLATION_OPTIONS
+    )
 
 
 def _ensure_approved_profile_root() -> Path:
@@ -88,8 +66,7 @@ def _ensure_approved_profile_root() -> Path:
             if owner_uid != os.geteuid():
                 raise ValueError("approved profile root must be owned by the current user")
             _APPROVED_PROFILE_ROOT.chmod(0o700)
-        root, _ = _approved_profile_root()
-        return root
+        return _APPROVED_PROFILE_ROOT.resolve(strict=True)
     except ValueError as exc:
         raise ValueError(
             f"Refusing unsafe LibreOffice user profile: {exc}"
@@ -101,85 +78,77 @@ def _ensure_approved_profile_root() -> Path:
         ) from exc
 
 
-def _validate_user_installation_arg(arg: str) -> None:
-    prefix = _user_installation_prefix(arg)
-    if prefix is None:
-        expected = " or ".join(
-            f"{option}=<absolute-file-URI>" for option in _USER_INSTALLATION_OPTIONS
-        )
-        raise ValueError(
-            f"Refusing unsafe LibreOffice user profile: expected {expected}"
-        )
+@contextlib.contextmanager
+def managed_soffice_profile():
+    approved_root = _ensure_approved_profile_root()
+    with tempfile.TemporaryDirectory(
+        prefix="lo_profile_",
+        dir=approved_root,
+        ignore_cleanup_errors=True,
+    ) as profile_directory:
+        profile_id = uuid.uuid4().hex
+        _MANAGED_PROFILES[profile_id] = Path(profile_directory)
+        try:
+            yield profile_id
+        finally:
+            _MANAGED_PROFILES.pop(profile_id, None)
 
-    uri = arg[len(prefix) :]
+
+def _managed_profile_path(profile_id: str) -> Path:
     try:
-        parsed = urlsplit(uri)
+        return _MANAGED_PROFILES[profile_id]
+    except (KeyError, TypeError) as exc:
+        raise ValueError("Unknown or expired LibreOffice profile identifier") from exc
+
+
+def _managed_profile_entry(profile_id: str, relative_path: str | Path) -> Path:
+    profile = _managed_profile_path(profile_id)
+    relative = Path(relative_path)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("LibreOffice profile entry must be a relative path")
+    entry = (profile / relative).resolve(strict=False)
+    try:
+        entry.relative_to(profile.resolve(strict=True))
     except ValueError as exc:
-        raise ValueError(
-            f"Refusing unsafe LibreOffice user profile: invalid URI ({exc})"
-        ) from exc
-
-    if parsed.scheme != "file" or parsed.netloc or parsed.query or parsed.fragment:
-        raise ValueError(
-            "Refusing unsafe LibreOffice user profile: expected a local file URI"
-        )
-
-    decoded_path = unquote(parsed.path)
-    if not decoded_path:
-        raise ValueError(
-            "Refusing unsafe LibreOffice user profile: profile path is empty"
-        )
-
-    raw_profile_path = Path(url2pathname(decoded_path))
-    if not raw_profile_path.is_absolute():
-        raise ValueError(
-            "Refusing unsafe LibreOffice user profile: path must be absolute and non-root"
-        )
-
-    try:
-        profile_path, normalised_profile = _normalised_resolved_path(raw_profile_path)
-        approved_root, normalised_root = _approved_profile_root()
-    except (OSError, RuntimeError, ValueError) as exc:
-        raise ValueError(
-            f"Refusing unsafe LibreOffice user profile: cannot resolve path ({exc})"
-        ) from exc
-
-    try:
-        common_root = os.path.commonpath((normalised_root, normalised_profile))
-    except ValueError:
-        common_root = ""
-
-    if normalised_profile == normalised_root or common_root != normalised_root:
-        raise ValueError(
-            "Refusing unsafe LibreOffice user profile: path must be a strict "
-            f"subdirectory of {approved_root} (resolved to {profile_path})"
-        )
+        raise ValueError("LibreOffice profile entry escapes the managed profile") from exc
+    return entry
 
 
-def run_soffice(args: Iterable[str], **kwargs) -> subprocess.CompletedProcess:
+def soffice_profile_entry_exists(profile_id: str, relative_path: str | Path) -> bool:
+    return _managed_profile_entry(profile_id, relative_path).exists()
+
+
+def write_soffice_profile_file(
+    profile_id: str,
+    relative_path: str | Path,
+    content: str,
+    *,
+    encoding: str = "utf-8",
+) -> None:
+    destination = _managed_profile_entry(profile_id, relative_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(content, encoding=encoding)
+
+
+def run_soffice(
+    args: Iterable[str],
+    *,
+    profile_id: str | None = None,
+    **kwargs,
+) -> subprocess.CompletedProcess:
     args = list(args)
     profile_args = [str(arg) for arg in args if _is_user_installation_arg(str(arg))]
-    if len(profile_args) > 1:
+    if profile_args:
         raise ValueError(
-            "Refusing unsafe LibreOffice user profile: expected exactly one profile"
+            "Refusing caller-supplied LibreOffice user profile; use an opaque profile identifier"
         )
 
     with contextlib.ExitStack() as stack:
-        if profile_args:
-            _validate_user_installation_arg(profile_args[0])
-            _ensure_approved_profile_root()
-        else:
-            approved_root = _ensure_approved_profile_root()
-            profile = stack.enter_context(
-                tempfile.TemporaryDirectory(
-                    prefix="lo_profile_",
-                    dir=approved_root,
-                    ignore_cleanup_errors=True,
-                )
-            )
-            profile_arg = f"{_USER_INSTALLATION_PREFIX}{Path(profile).as_uri()}"
-            _validate_user_installation_arg(profile_arg)
-            args = [profile_arg] + args
+        if profile_id is None:
+            profile_id = stack.enter_context(managed_soffice_profile())
+        profile = _managed_profile_path(profile_id)
+        profile_arg = f"{_USER_INSTALLATION_PREFIX}{profile.as_uri()}"
+        args = [profile_arg] + args
         return subprocess.run(["soffice"] + args, env=get_soffice_env(), **kwargs)
 
 

@@ -9,12 +9,15 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from office.soffice import get_soffice_env
+from office.soffice import (
+    managed_soffice_profile,
+    run_soffice,
+    write_soffice_profile_file,
+)
 
 logger = logging.getLogger(__name__)
 
-LIBREOFFICE_PROFILE = "/tmp/libreoffice_docx_profile"
-MACRO_DIR = f"{LIBREOFFICE_PROFILE}/user/basic/Standard"
+MACRO_FILE = "user/basic/Standard/Module1.xba"
 
 ACCEPT_CHANGES_MACRO = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE script:module PUBLIC "-//OpenOffice.org//DTD OfficeDocument 1.0//EN" "module.dtd">
@@ -52,32 +55,31 @@ def accept_changes(
     except Exception as e:
         return None, f"Error: Failed to copy input file to output location: {e}"
 
-    if not _setup_libreoffice_macro():
-        return None, "Error: Failed to setup LibreOffice macro"
+    with managed_soffice_profile() as profile_id:
+        if not _setup_libreoffice_macro(profile_id):
+            return None, "Error: Failed to setup LibreOffice macro"
 
-    cmd = [
-        "soffice",
-        "--headless",
-        f"-env:UserInstallation=file://{LIBREOFFICE_PROFILE}",
-        "--norestore",
-        "vnd.sun.star.script:Standard.Module1.AcceptAllTrackedChanges?language=Basic&location=application",
-        str(output_path.absolute()),
-    ]
-
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            timeout=30,
-            check=False,
-            env=get_soffice_env(),
-        )
-    except subprocess.TimeoutExpired:
-        return (
-            None,
-            f"Successfully accepted all tracked changes: {input_file} -> {output_file}",
-        )
+        try:
+            result = run_soffice(
+                [
+                    "--headless",
+                    "--norestore",
+                    "vnd.sun.star.script:Standard.Module1.AcceptAllTrackedChanges?language=Basic&location=application",
+                    str(output_path.absolute()),
+                ],
+                profile_id=profile_id,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return (
+                None,
+                f"Successfully accepted all tracked changes: {input_file} -> {output_file}",
+            )
 
     if result.returncode != 0:
         return None, f"Error: LibreOffice failed: {result.stderr}"
@@ -88,30 +90,20 @@ def accept_changes(
     )
 
 
-def _setup_libreoffice_macro() -> bool:
-    macro_dir = Path(MACRO_DIR)
-    macro_file = macro_dir / "Module1.xba"
-
-    if macro_file.exists() and "AcceptAllTrackedChanges" in macro_file.read_text(encoding="utf-8"):
-        return True
-
-    if not macro_dir.exists():
-        subprocess.run(
-            [
-                "soffice",
-                "--headless",
-                f"-env:UserInstallation=file://{LIBREOFFICE_PROFILE}",
-                "--terminate_after_init",
-            ],
+def _setup_libreoffice_macro(profile_id: str) -> bool:
+    try:
+        run_soffice(
+            ["--headless", "--terminate_after_init"],
+            profile_id=profile_id,
             capture_output=True,
             timeout=10,
             check=False,
-            env=get_soffice_env(),
         )
-        macro_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        macro_file.write_text(ACCEPT_CHANGES_MACRO, encoding="utf-8")
+        write_soffice_profile_file(
+            profile_id,
+            MACRO_FILE,
+            ACCEPT_CHANGES_MACRO,
+        )
         return True
     except Exception as e:
         logger.warning(f"Failed to setup LibreOffice macro: {e}")
