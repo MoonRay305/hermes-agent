@@ -107,6 +107,7 @@ const identities = (rows: RowFixture[]) => rows.map(row => `${row.connectionId}:
 
 beforeEach(() => {
   vi.clearAllMocks()
+  hostMock.profileRoutes = undefined
   $lastRoster.set([])
 })
 
@@ -134,6 +135,49 @@ describe('no union roster', () => {
 
     unmount()
     expect(release).toHaveBeenCalledOnce()
+  })
+
+  it('retains every union-roster source for the query observer lifetime', async () => {
+    const releaseDefault = vi.fn()
+    const releaseResearch = vi.fn()
+    const releaseRemote = vi.fn()
+
+    const remoteRoute = {
+      connectionId: 'fresh-squiddy',
+      mode: 'remote' as const,
+      profile: 'default',
+      targetProfile: 'default'
+    }
+
+    hostMock.profileRoutes = vi.fn(async () => [
+      { connectionId: 'local', mode: 'local' as const, profile: 'default', targetProfile: 'default' },
+      { connectionId: 'local', mode: 'local' as const, profile: 'research', targetProfile: 'research' },
+      remoteRoute
+    ])
+    hostMock.retainProfileSocket
+      .mockReturnValueOnce(releaseDefault)
+      .mockReturnValueOnce(releaseResearch)
+      .mockReturnValueOnce(releaseRemote)
+    hostMock.request.mockResolvedValue({ profiles: [] })
+    hostMock.agents.mockResolvedValue({ agents: [], sources: [] })
+
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    )
+
+    const { result, unmount } = renderHook(() => useRoster(), { wrapper })
+
+    await waitFor(() => expect(result.current.data).toBeTruthy())
+    await waitFor(() => expect(hostMock.retainProfileSocket).toHaveBeenCalledWith(remoteRoute))
+
+    expect(hostMock.retainProfileSocket.mock.calls.map(([route]) => route)).toEqual(['default', 'research', remoteRoute])
+
+    unmount()
+    expect(releaseDefault).toHaveBeenCalledOnce()
+    expect(releaseResearch).toHaveBeenCalledOnce()
+    expect(releaseRemote).toHaveBeenCalledOnce()
   })
 
   it('leaves the local list exactly as it was', async () => {
