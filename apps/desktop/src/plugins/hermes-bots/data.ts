@@ -639,21 +639,71 @@ export function useRoster() {
   // The five-second roster refresh is recurring ownership, not a succession
   // of unrelated one-shot requests. Keep its profile socket leased for this
   // query observer's lifetime so a background profile does not dial and tear
-  // down a fresh WebSocket on every tick. Explicit remote sources retain their
-  // composite route; the local/legacy path uses the bare-profile pool.
+  // down a fresh WebSocket on every tick. The union roster enumerates every
+  // registered source/profile, so retain every current route while this query
+  // observer exists — not only the active profile that profiles.list reads.
+  // Explicit remote sources retain their composite route; local routes retain
+  // the bare-profile pool so spawned local profile sockets are not exempted as
+  // registry-local idle-reaper entries.
   useEffect(() => {
     if (typeof host.retainProfileSocket !== 'function') {
       return undefined
     }
 
-    const connectionId = String(activeConnectionId || '').trim()
+    const releases: Array<() => void> = []
+    const retained = new Set<string>()
+    let disposed = false
 
-    const route: ProfileRoute | string =
+    const retain = (route: ProfileRoute | string) => {
+      const key =
+        typeof route === 'string'
+          ? `local:${route.trim() || 'default'}`
+          : route.connectionId === 'local'
+            ? `local:${route.profile.trim() || 'default'}`
+            : `${route.connectionId}:${route.profile}`
+
+      if (retained.has(key)) {
+        return
+      }
+
+      retained.add(key)
+
+      const release = host.retainProfileSocket(typeof route !== 'string' && route.connectionId === 'local' ? route.profile : route)
+
+      if (typeof release === 'function') {
+        releases.push(release)
+      }
+    }
+
+    const connectionId = String(activeConnectionId || '').trim()
+    retain(
       connectionId && connectionId !== 'local'
         ? { connectionId, mode: 'remote', profile: activeProfile, targetProfile: activeProfile }
         : activeProfile
+    )
 
-    return host.retainProfileSocket(route)
+    if (typeof host.profileRoutes === 'function') {
+      void host
+        .profileRoutes()
+        .then(routes => {
+          if (disposed || !Array.isArray(routes)) {
+            return
+          }
+
+          for (const route of routes) {
+            retain(route)
+          }
+        })
+        .catch(() => undefined)
+    }
+
+    return () => {
+      disposed = true
+
+      for (const release of releases.splice(0).reverse()) {
+        release()
+      }
+    }
   }, [activeConnectionId, activeProfile])
 
   return useQuery({
