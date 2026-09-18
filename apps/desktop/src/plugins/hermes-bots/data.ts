@@ -632,75 +632,74 @@ interface UnionRoster {
   sources?: GatewaySource[]
 }
 
+const UNION_ROSTER_CACHE_MS = 60_000
+let unionRosterCache: null | { fetchedAt: number; value: UnionRoster } = null
+let unionRosterInflight: null | Promise<UnionRoster> = null
+
+async function readUnionRoster(): Promise<UnionRoster> {
+  if (typeof host.agents !== 'function') {
+    throw new Error('This Desktop build cannot enumerate multi-source agents. Update Hermes Desktop.')
+  }
+
+  const now = Date.now()
+
+  if (unionRosterCache && now - unionRosterCache.fetchedAt < UNION_ROSTER_CACHE_MS) {
+    return unionRosterCache.value
+  }
+
+  if (unionRosterInflight) {
+    return unionRosterInflight
+  }
+
+  unionRosterInflight = host
+    .agents()
+    .then(roster => {
+      unionRosterCache = { fetchedAt: Date.now(), value: roster || {} }
+
+      return unionRosterCache.value
+    })
+    .catch(error => {
+      if (unionRosterCache) {
+        return unionRosterCache.value
+      }
+
+      throw error
+    })
+    .finally(() => {
+      unionRosterInflight = null
+    })
+
+  return unionRosterInflight
+}
+
 export function useRoster() {
   const activeConnectionId = useValue(host.state.connectionId)
   const activeProfile = String(useValue(host.state.profile) || 'default').trim() || 'default'
 
-  // The five-second roster refresh is recurring ownership, not a succession
-  // of unrelated one-shot requests. Keep its profile socket leased for this
-  // query observer's lifetime so a background profile does not dial and tear
-  // down a fresh WebSocket on every tick. The union roster enumerates every
-  // registered source/profile, so retain every current route while this query
-  // observer exists — not only the active profile that profiles.list reads.
-  // Explicit remote sources retain their composite route; local routes retain
-  // the bare-profile pool so spawned local profile sockets are not exempted as
-  // registry-local idle-reaper entries.
+  // The five-second roster refresh owns only the ACTIVE profiles.list socket.
+  // The union source inventory is cached below and must never retain every
+  // profile route: doing so converts Bot Mode idleness into one socket/tunnel
+  // lifecycle per local/SSH profile. Keep registry-local routes explicit so
+  // the SDK's local idle-reaper exemption still applies.
   useEffect(() => {
     if (typeof host.retainProfileSocket !== 'function') {
       return undefined
     }
 
-    const releases: Array<() => void> = []
-    const retained = new Set<string>()
-    let disposed = false
-
-    const retain = (route: ProfileRoute | string) => {
-      const key =
-        typeof route === 'string'
-          ? `local:${route.trim() || 'default'}`
-          : route.connectionId === 'local'
-            ? `local:${route.profile.trim() || 'default'}`
-            : `${route.connectionId}:${route.profile}`
-
-      if (retained.has(key)) {
-        return
-      }
-
-      retained.add(key)
-
-      const release = host.retainProfileSocket(typeof route !== 'string' && route.connectionId === 'local' ? route.profile : route)
-
-      if (typeof release === 'function') {
-        releases.push(release)
-      }
-    }
-
     const connectionId = String(activeConnectionId || '').trim()
-    retain(
-      connectionId && connectionId !== 'local'
-        ? { connectionId, mode: 'remote', profile: activeProfile, targetProfile: activeProfile }
+    const release = host.retainProfileSocket(
+      connectionId
+        ? {
+            connectionId,
+            mode: connectionId === 'local' ? 'local' : 'remote',
+            profile: activeProfile,
+            targetProfile: activeProfile
+          }
         : activeProfile
     )
 
-    if (typeof host.profileRoutes === 'function') {
-      void host
-        .profileRoutes()
-        .then(routes => {
-          if (disposed || !Array.isArray(routes)) {
-            return
-          }
-
-          for (const route of routes) {
-            retain(route)
-          }
-        })
-        .catch(() => undefined)
-    }
-
     return () => {
-      disposed = true
-
-      for (const release of releases.splice(0).reverse()) {
+      if (typeof release === 'function') {
         release()
       }
     }
@@ -751,7 +750,7 @@ export function useRoster() {
       // the local list exactly as it was.
       if (typeof host.agents === 'function') {
         try {
-          const union = await host.agents()
+          const union = await readUnionRoster()
           const previous: RosterRow[] = $lastRoster.get().filter(row => !row?.ghost)
           const merged = mergeMultiSourceRoster(local, union, activeConnectionId, previous)
           const sources = Array.isArray(union?.sources) ? union.sources : []
