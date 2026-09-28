@@ -220,14 +220,13 @@ center.font = BOLD
 
 openpyxl 写入公式字符串但不计算结果。Excel 打开时会重新计算，但下游消费者（自动检查脚本、CI）需要已计算的值。
 
-交付前运行 LibreOffice 或专用重新计算步骤：
+交付前使用本 skill 的辅助脚本重新计算：
 
 ```bash
-# LibreOffice 无头重新计算
-libreoffice --headless --calc --convert-to xlsx ./out/model.xlsx --outdir ./out/
+python ${HERMES_SKILL_DIR}/scripts/recalc.py ./out/model.xlsx 30
 ```
 
-或使用 Python 重新计算辅助工具（参见本 skill 中的 `scripts/recalc.py`）。
+`recalc.py` 通过共享包装器（内置 `powerpoint` skill 中的 `scripts/office/soffice.py`）启动 LibreOffice，每次运行都使用一个私有的临时配置文件目录。切勿直接从终端启动 LibreOffice：直接启动会把配置文件写到它被指向的任何目录，并可能改动该目录的权限。
 
 ## 模型布局规划
 

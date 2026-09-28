@@ -253,5 +253,5 @@ pdftoppm -jpeg -r 150 -f N -l N output.pdf slide-fixed
 - `pip install "markitdown[pptx]"` - 文本提取
 - `pip install Pillow` - 缩略图网格
 - `npm install -g pptxgenjs` - 从零创建
-- LibreOffice（`soffice`）- PDF 转换（通过 `scripts/office/soffice.py` 为沙箱环境自动配置）
+- LibreOffice - PDF 转换；始终通过 `scripts/office/soffice.py` 启动，每次运行都使用私有的临时配置文件目录（并自动适配沙箱环境）
 - Poppler（`pdftoppm`）- PDF 转图片
