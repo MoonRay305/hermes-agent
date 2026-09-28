@@ -393,20 +393,43 @@ def _build_shim(shim_dir: Path, dir_fd: int, name: str) -> bytes:
             _unlink_quietly(dir_fd, leftover)
 
 
+# Linux ABI values (uapi memfd.h / fcntl.h). Some Python builds -- the
+# standalone CPython that uv installs, for one -- are compiled without
+# os.memfd_create or the fcntl seal constants, although the kernel has both.
+_MFD_CLOEXEC, _MFD_ALLOW_SEALING = 0x1, 0x2
+_F_ADD_SEALS = 1024 + 9
+_F_SEAL_ALL = 0x1 | 0x2 | 0x4 | 0x8  # SEAL, SHRINK, GROW, WRITE
+
+
+def _memfd_create(name: str) -> int | None:
+    flags = _MFD_CLOEXEC | _MFD_ALLOW_SEALING
+    create = getattr(os, "memfd_create", None)
+    try:
+        if create is not None:
+            return create(name, flags)
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        fd = libc.memfd_create(name.encode("ascii"), flags)
+    except (ImportError, AttributeError, OSError):
+        return None
+    return fd if fd >= 0 else None
+
+
 def _sealed_copy(data: bytes) -> int | None:
     """A memfd holding *data*, sealed against every further change (Linux)."""
     try:
         import fcntl
-
-        seals = fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SEAL
-        fd = os.memfd_create("lo_socket_shim", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
-    except (ImportError, AttributeError, OSError):
+    except ImportError:
+        return None
+    fd = _memfd_create("lo_socket_shim")
+    if fd is None:
         return None
     try:
         view = memoryview(data)
         while view:
             view = view[os.write(fd, view):]
-        fcntl.fcntl(fd, fcntl.F_ADD_SEALS, seals)
+        fcntl.fcntl(fd, _F_ADD_SEALS, _F_SEAL_ALL)
     except BaseException:
         os.close(fd)
         raise

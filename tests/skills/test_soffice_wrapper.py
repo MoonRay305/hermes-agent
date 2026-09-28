@@ -438,6 +438,22 @@ def test_shim_writable_by_others_is_never_preloaded(shim_wrapper, fake, home):
 
 
 @linux_only
+def test_shim_is_sealed_even_when_python_lacks_memfd_support(shim_wrapper, fake, monkeypatch):
+    # uv's standalone CPython can be built without these; the kernel still has them.
+    import fcntl
+
+    monkeypatch.delattr(os, "memfd_create", raising=False)
+    for name in ("F_ADD_SEALS", "F_SEAL_SEAL", "F_SEAL_SHRINK", "F_SEAL_GROW", "F_SEAL_WRITE"):
+        monkeypatch.delattr(fcntl, name, raising=False)
+
+    shim_wrapper.run_soffice(["--headless"])
+
+    preload = fake.launches[0]["env"]["LD_PRELOAD"]
+    assert preload.startswith(f"/proc/{os.getpid()}/fd/")
+    assert fake.launches[0]["preload_bytes"] == FAKE_SHIM
+
+
+@linux_only
 def test_preloaded_shim_is_sealed(shim_wrapper, monkeypatch):
     def try_to_modify(launch):
         preload = launch["env"]["LD_PRELOAD"]

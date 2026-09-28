@@ -158,6 +158,14 @@ MUTATIONS = (
         (UNIT,),
     ),
     Mutation(
+        "memfd-needs-python-support",
+        "the shim is sealed in memory even when Python lacks os.memfd_create",
+        WRAPPER,
+        (("            return create(name, flags)\n        import ctypes\n",
+          "            return create(name, flags)\n        return None\n"),),
+        (UNIT,),
+    ),
+    Mutation(
         "shim-exits-on-listener-close",
         "the shim lets LibreOffice's first-start restart run (no early exit)",
         WRAPPER,
