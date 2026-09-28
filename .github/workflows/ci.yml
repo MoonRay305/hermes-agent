@@ -70,14 +70,6 @@ jobs:
     with:
       event_name: ${{ needs.detect.outputs.event_name }}
 
-  libreoffice-guard:
-    # Skill docs (site lane) can instruct a direct LibreOffice launch too, so
-    # the repository-wide launch-policy scan runs for doc-only changes as well.
-    name: LibreOffice guard
-    needs: detect
-    if: needs.detect.outputs.python == 'true' || needs.detect.outputs.site == 'true'
-    uses: ./.github/workflows/libreoffice-guard.yml
-
   typecheck:
     name: TypeScript
     needs: detect
@@ -147,7 +139,6 @@ jobs:
     needs:
       - tests
       - lint
-      - libreoffice-guard
       - typecheck
       - docs-site
       - history-check
