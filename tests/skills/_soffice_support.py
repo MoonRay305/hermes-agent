@@ -159,7 +159,12 @@ def as_root(argv: list[str], **kwargs) -> subprocess.CompletedProcess:
 
 
 def run_as(user: pwd.struct_passwd, argv: list[str], env: dict[str, str], **kwargs):
-    """Run *argv* as *user* with exactly *env* (no inherited variables)."""
+    """Run *argv* as *user* with exactly *env* (no inherited variables).
+
+    The working directory defaults to "/": the caller's (a checkout under a
+    0750 home, say) may be unreadable to *user*, and soffice cds back to it.
+    """
+    kwargs.setdefault("cwd", "/")
     assignments = [f"{key}={value}" for key, value in env.items()]
     if os.geteuid() == 0:
         command = ["setpriv", f"--reuid={user.pw_uid}", f"--regid={user.pw_gid}", "--clear-groups", "env", "-i", *assignments, *argv]
@@ -169,6 +174,7 @@ def run_as(user: pwd.struct_passwd, argv: list[str], env: dict[str, str], **kwar
 
 
 def popen_as(user: pwd.struct_passwd, argv: list[str], env: dict[str, str], **kwargs):
+    kwargs.setdefault("cwd", "/")
     assignments = [f"{key}={value}" for key, value in env.items()]
     if os.geteuid() == 0:
         command = ["setpriv", f"--reuid={user.pw_uid}", f"--regid={user.pw_gid}", "--clear-groups", "env", "-i", *assignments, *argv]
