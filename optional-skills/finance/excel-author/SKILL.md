@@ -8,7 +8,7 @@ platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [excel, openpyxl, finance, spreadsheet, modeling]
-    related_skills: [pptx-author, dcf-model, comps-analysis, lbo-model, 3-statement-model]
+    related_skills: [pptx-author, dcf-model, comps-analysis, lbo-model, 3-statement-model, powerpoint]
 ---
 
 # excel-author
@@ -208,7 +208,7 @@ Recalculate with this skill's helper before delivery:
 python ${HERMES_SKILL_DIR}/scripts/recalc.py ./out/model.xlsx 30
 ```
 
-`recalc.py` starts LibreOffice through the shared wrapper (`scripts/office/soffice.py` in the bundled `powerpoint` skill), which gives every run a private, throwaway profile. Never start LibreOffice directly from the terminal: a direct launch writes its profile wherever it is pointed, and can take over the permissions of that directory.
+`recalc.py` starts LibreOffice through the shared wrapper (`scripts/office/soffice.py` in the bundled `powerpoint` skill, which ships with every Hermes install, so it works even when bundled skills are not synced into the profile), which gives every run a private, throwaway profile. Never start LibreOffice directly from the terminal: a direct launch writes its profile wherever it is pointed, and can take over the permissions of that directory.
 
 ## Model layout planning
 

@@ -21,7 +21,7 @@ Build auditable Excel workbooks headless with openpyxl — blue/black/green cell
 | License | Apache-2.0 |
 | Platforms | linux, macos, windows |
 | Tags | `excel`, `openpyxl`, `finance`, `spreadsheet`, `modeling` |
-| Related skills | [`pptx-author`](/docs/user-guide/skills/optional/finance/finance-pptx-author), [`dcf-model`](/docs/user-guide/skills/optional/finance/finance-dcf-model), [`comps-analysis`](/docs/user-guide/skills/optional/finance/finance-comps-analysis), [`lbo-model`](/docs/user-guide/skills/optional/finance/finance-lbo-model), [`3-statement-model`](/docs/user-guide/skills/optional/finance/finance-3-statement-model) |
+| Related skills | [`pptx-author`](/docs/user-guide/skills/optional/finance/finance-pptx-author), [`dcf-model`](/docs/user-guide/skills/optional/finance/finance-dcf-model), [`comps-analysis`](/docs/user-guide/skills/optional/finance/finance-comps-analysis), [`lbo-model`](/docs/user-guide/skills/optional/finance/finance-lbo-model), [`3-statement-model`](/docs/user-guide/skills/optional/finance/finance-3-statement-model), [`powerpoint`](/docs/user-guide/skills/bundled/productivity/productivity-powerpoint) |
 
 ## Reference: full SKILL.md
 
@@ -226,7 +226,7 @@ Recalculate with this skill's helper before delivery:
 python ${HERMES_SKILL_DIR}/scripts/recalc.py ./out/model.xlsx 30
 ```
 
-`recalc.py` starts LibreOffice through the shared wrapper (`scripts/office/soffice.py` in the bundled `powerpoint` skill), which gives every run a private, throwaway profile. Never start LibreOffice directly from the terminal: a direct launch writes its profile wherever it is pointed, and can take over the permissions of that directory.
+`recalc.py` starts LibreOffice through the shared wrapper (`scripts/office/soffice.py` in the bundled `powerpoint` skill, which ships with every Hermes install, so it works even when bundled skills are not synced into the profile), which gives every run a private, throwaway profile. Never start LibreOffice directly from the terminal: a direct launch writes its profile wherever it is pointed, and can take over the permissions of that directory.
 
 ## Model layout planning
 

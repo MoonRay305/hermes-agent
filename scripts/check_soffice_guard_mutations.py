@@ -158,6 +158,14 @@ MUTATIONS = (
         (UNIT,),
     ),
     Mutation(
+        "shim-exits-on-listener-close",
+        "the shim lets LibreOffice's first-start restart run (no early exit)",
+        WRAPPER,
+        (("        if (was_listener)\n            listener_fd = -1;\n",
+          "        if (was_listener)\n            _exit(0);\n"),),
+        (REAL,),
+    ),
+    Mutation(
         "recalc-direct-launch",
         "recalc.py starts LibreOffice only through the wrapper",
         RECALC,
@@ -169,6 +177,13 @@ MUTATIONS = (
         "recalc.py looks for the wrapper only in fixed places",
         RECALC,
         (("    candidates = []\n", "    candidates = [p / _WRAPPER for p in parents]\n"),),
+        (RECALC_TESTS,),
+    ),
+    Mutation(
+        "recalc-profile-only",
+        "recalc.py finds the wrapper in the Hermes install, not only the profile",
+        RECALC,
+        (("    candidates += [bundled / _WRAPPER for bundled in _bundled_skills_dirs()]\n", ""),),
         (RECALC_TESTS,),
     ),
 )

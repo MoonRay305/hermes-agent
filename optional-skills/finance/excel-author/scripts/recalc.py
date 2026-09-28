@@ -43,7 +43,20 @@ def _wrapper_candidates() -> list[Path]:
     hermes_home = os.environ.get("HERMES_HOME", "").strip()
     home = Path(hermes_home) if hermes_home else Path.home() / ".hermes"
     candidates.append(home / "skills" / _WRAPPER)
+    # The Hermes installation's own bundled tree: there even when bundled
+    # skills are not synced into the profile (Blank Slate, a deleted copy).
+    candidates += [bundled / _WRAPPER for bundled in _bundled_skills_dirs()]
     return candidates
+
+
+def _bundled_skills_dirs() -> list[Path]:
+    override = os.environ.get("HERMES_BUNDLED_SKILLS", "").strip()
+    try:
+        import hermes_constants
+    except ImportError:
+        return [Path(override)] if override else []
+    source_tree = Path(hermes_constants.__file__).resolve().parent / "skills"
+    return [hermes_constants.get_bundled_skills_dir(source_tree)]
 
 
 def load_soffice_wrapper():
@@ -65,8 +78,9 @@ def recalc(xlsx_path: str, timeout: int = 60) -> dict:
     if wrapper is None:
         return {
             "status": "error",
-            "error": "LibreOffice wrapper not found (the bundled powerpoint skill's "
-            "scripts/office/soffice.py); refusing to start LibreOffice without it",
+            "error": "LibreOffice wrapper not found (it ships with Hermes as the bundled "
+            "powerpoint skill's scripts/office/soffice.py, but neither this profile's skills "
+            "nor the Hermes install is visible here); refusing to start LibreOffice without it",
         }
 
     with tempfile.TemporaryDirectory() as td:

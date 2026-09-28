@@ -337,28 +337,48 @@ def test_two_users_can_launch_on_the_same_host(world_traversable):
         assert owner_mode == [str(user.pw_uid), "700"]
 
 
-# ---- the socket shim, preloaded for real ------------------------------------
+# ---- the socket shim, in a sandbox that blocks AF_UNIX -----------------------
+
+# Preloaded after the shim, this makes socket(AF_UNIX, ...) fail the way a
+# sandbox does: the shim's real_socket (dlsym RTLD_NEXT) resolves to it, so the
+# shim's socketpair fallback is what LibreOffice actually runs on.
+_AF_UNIX_BLOCKER = r"""
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <sys/socket.h>
+int socket(int domain, int type, int protocol) {
+    static int (*next)(int, int, int);
+    if (!next) next = dlsym(RTLD_NEXT, "socket");
+    if (domain == AF_UNIX) { errno = EPERM; return -1; }
+    return next(domain, type, protocol);
+}
+"""
 
 
-@linux_only
-@pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
-def test_shim_is_checked_and_preloaded_from_sealed_memory(home, tmp_path, monkeypatch):
-    wrapper = load_wrapper()
-    monkeypatch.setattr(wrapper, "_needs_shim", lambda: True)
-    shared = tmp_path / "shared-tmp"
-    shared.mkdir()
-    monkeypatch.setattr(tempfile, "tempdir", str(shared))
-    doc = write_formula_xlsx(tmp_path / "doc.xlsx")
-    out = tmp_path / "out"
+@pytest.fixture
+def af_unix_blocker(tmp_path):
+    source = tmp_path / "block_af_unix.c"
+    source.write_text(_AF_UNIX_BLOCKER, encoding="utf-8")
+    library = tmp_path / "block_af_unix.so"
+    subprocess.run(["gcc", "-shared", "-fPIC", "-o", str(library), str(source), "-ldl"], check=True)
+    return str(library)
+
+
+def _convert_with_preload(wrapper, monkeypatch, tmp_path, label, extend_preload):
+    doc = write_formula_xlsx(tmp_path / f"{label}.xlsx")
+    out = tmp_path / f"out-{label}"
     out.mkdir()
     seen = {}
     real_run = subprocess.run
 
     def run(argv, **kwargs):
-        if "env" in kwargs and "LD_PRELOAD" in kwargs["env"]:
-            preload = kwargs["env"]["LD_PRELOAD"]
-            seen["preload"] = preload
-            seen["digest"] = hashlib.sha256(Path(preload).read_bytes()).hexdigest()
+        env = kwargs.get("env")
+        if env is not None and str(argv[0]).endswith(("soffice", "libreoffice")):
+            seen["shim"] = env.get("LD_PRELOAD")
+            if seen["shim"]:
+                seen["digest"] = hashlib.sha256(Path(seen["shim"]).read_bytes()).hexdigest()
+            kwargs["env"] = dict(env, LD_PRELOAD=extend_preload(env.get("LD_PRELOAD")))
         return real_run(argv, **kwargs)
 
     monkeypatch.setattr(wrapper.subprocess, "run", run)
@@ -367,11 +387,39 @@ def test_shim_is_checked_and_preloaded_from_sealed_memory(home, tmp_path, monkey
         capture_output=True,
         timeout=LAUNCH_TIMEOUT,
     )
+    return result, out / f"{label}.pdf", seen
+
+
+@linux_only
+@pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
+def test_blocked_af_unix_breaks_libreoffice_without_the_shim(home, tmp_path, monkeypatch, af_unix_blocker):
+    # Control: the blocker really takes away what LibreOffice needs.
+    wrapper = load_wrapper()
+    monkeypatch.setattr(wrapper, "_needs_shim", lambda: False)
+
+    result, pdf, seen = _convert_with_preload(wrapper, monkeypatch, tmp_path, "unshimmed", lambda _: af_unix_blocker)
+
+    assert seen["shim"] is None
+    assert not pdf.exists()
+
+
+@linux_only
+@pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
+def test_shim_converts_under_blocked_af_unix_from_sealed_memory(home, tmp_path, monkeypatch, af_unix_blocker):
+    wrapper = load_wrapper()
+    monkeypatch.setattr(wrapper, "_needs_shim", lambda: True)
+    shared = tmp_path / "shared-tmp"
+    shared.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(shared))
+
+    result, pdf, seen = _convert_with_preload(
+        wrapper, monkeypatch, tmp_path, "shimmed", lambda shim: f"{shim} {af_unix_blocker}"
+    )
 
     assert result.returncode == 0, result.stderr
-    assert _pdf_ok(out / "doc.pdf")
+    assert _pdf_ok(pdf), "soffice exited without converting under the shim"
     cached = private_root(home) / "shim" / wrapper._shim_name()
     recorded = cached.with_name(cached.name + ".sha256").read_text(encoding="ascii").strip()
-    assert seen["preload"].startswith(f"/proc/{os.getpid()}/fd/")
+    assert seen["shim"].startswith(f"/proc/{os.getpid()}/fd/")
     assert seen["digest"] == recorded == hashlib.sha256(cached.read_bytes()).hexdigest()
     assert list(shared.iterdir()) == []

@@ -526,9 +526,10 @@ int listen(int sockfd, int backlog) {
 int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
     if (sockfd >= 0 && sockfd < 1024 && is_shimmed[sockfd]) {
         /* Block until close() writes to the wake pipe. */
-        if (wake_r[sockfd] >= 0) {
+        int wake = wake_r[sockfd];
+        if (wake >= 0) {
             char buf;
-            real_read(wake_r[sockfd], &buf, 1);
+            real_read(wake, &buf, 1);
         }
         errno = ECONNABORTED;
         return -1;
@@ -548,11 +549,16 @@ int close(int fd) {
             real_close(wake_w[fd]);
             wake_w[fd] = -1;
         }
-        if (wake_r[fd] >= 0) { real_close(wake_r[fd]); wake_r[fd]  = -1; }
-        if (peer_of[fd] >= 0) { real_close(peer_of[fd]); peer_of[fd] = -1; }
-
+        /* accept() may still be reading a listener's wake pipe, so that end
+           stays open (one descriptor per listener). Exiting here instead cut
+           LibreOffice's first-start restart short: soffice exited 0 without
+           converting anything. */
         if (was_listener)
-            _exit(0);                        /* conversion done – exit */
+            listener_fd = -1;
+        else if (wake_r[fd] >= 0)
+            real_close(wake_r[fd]);
+        wake_r[fd] = -1;
+        if (peer_of[fd] >= 0) { real_close(peer_of[fd]); peer_of[fd] = -1; }
     }
     return real_close(fd);
 }
