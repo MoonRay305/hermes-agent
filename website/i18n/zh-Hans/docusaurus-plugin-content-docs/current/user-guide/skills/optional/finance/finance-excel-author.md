@@ -21,7 +21,7 @@ description: "使用 openpyxl 无头构建可审计的 Excel 工作簿——蓝/
 | 许可证 | Apache-2.0 |
 | 平台 | linux, macos, windows |
 | 标签 | `excel`, `openpyxl`, `finance`, `spreadsheet`, `modeling` |
-| 相关 skill | [`pptx-author`](/user-guide/skills/optional/finance/finance-pptx-author)、[`dcf-model`](/user-guide/skills/optional/finance/finance-dcf-model)、[`comps-analysis`](/user-guide/skills/optional/finance/finance-comps-analysis)、[`lbo-model`](/user-guide/skills/optional/finance/finance-lbo-model)、[`3-statement-model`](/user-guide/skills/optional/finance/finance-3-statement-model) |
+| 相关 skill | [`pptx-author`](/user-guide/skills/optional/finance/finance-pptx-author)、[`dcf-model`](/user-guide/skills/optional/finance/finance-dcf-model)、[`comps-analysis`](/user-guide/skills/optional/finance/finance-comps-analysis)、[`lbo-model`](/user-guide/skills/optional/finance/finance-lbo-model)、[`3-statement-model`](/user-guide/skills/optional/finance/finance-3-statement-model)、[`powerpoint`](/user-guide/skills/bundled/productivity/productivity-powerpoint) |
 
 ## 参考：完整 SKILL.md
 
@@ -220,14 +220,13 @@ center.font = BOLD
 
 openpyxl 写入公式字符串但不计算结果。Excel 打开时会重新计算，但下游消费者（自动检查脚本、CI）需要已计算的值。
 
-交付前运行 LibreOffice 或专用重新计算步骤：
+交付前使用本 skill 的辅助脚本重新计算：
 
 ```bash
-# LibreOffice 无头重新计算
-libreoffice --headless --calc --convert-to xlsx ./out/model.xlsx --outdir ./out/
+python ${HERMES_SKILL_DIR}/scripts/recalc.py ./out/model.xlsx 30
 ```
 
-或使用 Python 重新计算辅助工具（参见本 skill 中的 `scripts/recalc.py`）。
+`recalc.py` 通过共享包装器（内置 `powerpoint` skill 中的 `scripts/office/soffice.py`；它随每个 Hermes 安装一起提供，因此即使内置 skill 未同步到当前配置文件也能使用）启动 LibreOffice，每次运行都使用一个私有的临时配置文件目录。切勿直接从终端启动 LibreOffice：直接启动会把配置文件写到它被指向的任何目录，并可能改动该目录的权限。
 
 ## 模型布局规划
 
